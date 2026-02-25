@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import net from "node:net";
-import { Client as SSHClient } from "ssh2";
+import ssh2 from "ssh2";
+const { Client: SSHClient } = ssh2;
 
 import type { TunnelConfig, TunnelHandle } from "./types.js";
 
@@ -33,21 +34,27 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
       const srcAddr = socket.remoteAddress ?? "127.0.0.1";
       const srcPort = socket.remotePort ?? 0;
 
-      ssh.forwardOut(srcAddr, srcPort, config.remoteHost, config.remotePort, (err, stream) => {
-        if (err) {
-          logger.error(`SSH forwardOut failed: ${err.message}`, {
-            remoteHost: config.remoteHost,
-            remotePort: config.remotePort,
-          });
-          socket.destroy();
-          return;
+      ssh.forwardOut(
+        srcAddr,
+        srcPort,
+        config.remoteHost,
+        config.remotePort,
+        (err, stream) => {
+          if (err) {
+            logger.error(`SSH forwardOut failed: ${err.message}`, {
+              remoteHost: config.remoteHost,
+              remotePort: config.remotePort,
+            });
+            socket.destroy();
+            return;
+          }
+
+          socket.pipe(stream).pipe(socket);
+
+          stream.on("error", () => socket.destroy());
+          socket.on("error", () => stream.destroy());
         }
-
-        socket.pipe(stream).pipe(socket);
-
-        stream.on("error", () => socket.destroy());
-        socket.on("error", () => stream.destroy());
-      });
+      );
     });
 
     proxyServer.on("error", (err) => {
@@ -86,7 +93,9 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
     });
 
     ssh.on("error", (err) => {
-      reject(new Error(`SSH tunnel to ${config.sshHost} failed: ${err.message}`));
+      reject(
+        new Error(`SSH tunnel to ${config.sshHost} failed: ${err.message}`)
+      );
     });
 
     let privateKey: Buffer;
@@ -94,7 +103,11 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
       privateKey = fs.readFileSync(config.sshKeyPath);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      reject(new Error(`Failed to read SSH private key at ${config.sshKeyPath}: ${message}`));
+      reject(
+        new Error(
+          `Failed to read SSH private key at ${config.sshKeyPath}: ${message}`
+        )
+      );
       return;
     }
 

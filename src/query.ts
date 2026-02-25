@@ -1,4 +1,5 @@
-import { Parser } from "node-sql-parser";
+import NodeSqlParser from "node-sql-parser";
+const { Parser } = NodeSqlParser;
 import pg from "pg";
 
 export interface QueryResult {
@@ -31,7 +32,11 @@ const STARTS_WITH_EXPLAIN_RE = /^\s*EXPLAIN\b/i;
  * When allowMultiStatements is false, rejects multi-statement queries. On parse failure, falls back
  * to a regex-based LIMIT append rather than running unlimited queries.
  */
-export function ensureLimit(sql: string, limit: number, allowMultiStatements: boolean) {
+export function ensureLimit(
+  sql: string,
+  limit: number,
+  allowMultiStatements: boolean
+) {
   try {
     const raw = parser.astify(sql, PG_OPT);
 
@@ -56,7 +61,8 @@ export function ensureLimit(sql: string, limit: number, allowMultiStatements: bo
     return parser.sqlify(ast, PG_OPT);
   } catch (err) {
     // Re-throw our own multi-statement error
-    if (err instanceof Error && err.message.includes("Multi-statement")) throw err;
+    if (err instanceof Error && err.message.includes("Multi-statement"))
+      throw err;
 
     // Parser failed — apply regex fallback LIMIT instead of running unlimited
     if (!HAS_LIMIT_RE.test(sql) && !STARTS_WITH_EXPLAIN_RE.test(sql)) {
@@ -90,12 +96,18 @@ export async function executeQuery(
   maxRows: number,
   options: { readonly: boolean; allowMultiStatements: boolean }
 ): Promise<QueryResult> {
-  const limitedSql = ensureLimit(sql, maxRows + 1, options.allowMultiStatements);
+  const limitedSql = ensureLimit(
+    sql,
+    maxRows + 1,
+    options.allowMultiStatements
+  );
 
   const client = await pool.connect();
   try {
     if (options.readonly) {
-      await client.query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+      await client.query(
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+      );
     }
 
     const result = await client.query(limitedSql);
@@ -113,7 +125,9 @@ export async function executeQuery(
     if (!isPgError(err)) throw err;
 
     if (err.code === "57014") {
-      throw new Error("Query timed out. Simplify the query or add more specific WHERE conditions.");
+      throw new Error(
+        "Query timed out. Simplify the query or add more specific WHERE conditions."
+      );
     }
 
     if (err.code) {
