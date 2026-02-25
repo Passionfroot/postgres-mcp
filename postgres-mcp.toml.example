@@ -1,0 +1,26 @@
+# Path to your Prisma schema file (optional but recommended).
+# Enables Prisma model name resolution, field mappings, and relationship detection.
+# The MCP reads this file on startup — no build step needed.
+# prisma_schema_path = "~/work/myproject/prisma/schema.prisma"
+
+# Production: locked down, tunneled, read-only
+[[sources]]
+id = "production"
+dsn = "postgres://$DB_USER:$DB_PASS@db-host:5432/mydb?sslmode=require"
+readonly = true
+# ssh_host = "bastion.example.com"
+# ssh_user = "deploy"
+# ssh_key = "~/.ssh/key.pem"
+
+# Local: relaxed defaults for development
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/mydb"
+timeout = 30
+pool_max = 3
+allow_multi_statements = true
+
+# Audit log (optional) — logs all queries across all sources as JSONL
+# [audit_log]
+# log_file = "~/.local/share/postgres-mcp/audit.jsonl"
+# max_size = 10485760  # 10MB, omit for unlimited
