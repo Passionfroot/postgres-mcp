@@ -60,6 +60,8 @@ export function createServer(
         const result = await executeQuery(pool, query, source.maxRows, {
           readonly: source.readonly,
           allowMultiStatements: source.allowMultiStatements,
+          role: source.role,
+          sessionVars: source.sessionVars,
         });
 
         auditLog.log({
