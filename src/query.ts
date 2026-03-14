@@ -2,6 +2,8 @@ import NodeSqlParser from "node-sql-parser";
 const { Parser } = NodeSqlParser;
 import pg from "pg";
 
+import { logger } from "./logger.js";
+
 export interface QueryResult {
   rows: Record<string, unknown>[];
   rowCount: number;
@@ -185,8 +187,12 @@ export async function executeQuery(
       if (options.role) {
         await client.query("RESET ROLE");
       }
-    } catch {
-      // Best-effort cleanup; the pool will discard broken connections anyway
+    } catch (cleanupErr) {
+      logger.warn("Failed to reset RLS session state; connection may be discarded by pool", {
+        error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        role: options.role ?? "",
+        sessionVarKeys: options.sessionVars ? Object.keys(options.sessionVars).join(", ") : "",
+      });
     }
     client.release();
   }
