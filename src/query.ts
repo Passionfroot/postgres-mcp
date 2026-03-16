@@ -2,6 +2,8 @@ import NodeSqlParser from "node-sql-parser";
 const { Parser } = NodeSqlParser;
 import pg from "pg";
 
+import { logger } from "./logger.js";
+
 export interface QueryResult {
   rows: Record<string, unknown>[];
   rowCount: number;
@@ -21,6 +23,28 @@ function isPgError(err: unknown): err is PgErrorLike {
 }
 
 const parser = new Parser();
+
+/**
+ * Validate that a PostgreSQL configuration parameter name (GUC) is safe.
+ * Custom GUCs follow the pattern `extension.parameter` — only alphanumeric, underscores, and dots.
+ */
+const SAFE_GUC_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
+
+function assertSafeGucName(name: string): void {
+  if (!SAFE_GUC_NAME_RE.test(name)) {
+    throw new Error(`Invalid session variable name: ${JSON.stringify(name)}`);
+  }
+}
+
+/** Double-quote a SQL identifier (role name). Escapes embedded double quotes. */
+function escapeIdentifier(str: string): string {
+  return `"${str.replace(/"/g, '""')}"`;
+}
+
+/** Single-quote a SQL literal value. Escapes embedded single quotes. */
+function escapeLiteral(str: string): string {
+  return `'${str.replace(/'/g, "''")}'`;
+}
 const PG_OPT = { database: "PostgreSQL" } as const;
 
 const HAS_LIMIT_RE = /\bLIMIT\s+\d/i;
@@ -90,11 +114,18 @@ export function formatPgError(err: PgErrorLike) {
   return lines.join("\n");
 }
 
+export interface ExecuteQueryOptions {
+  readonly: boolean;
+  allowMultiStatements: boolean;
+  role?: string;
+  sessionVars?: Record<string, string>;
+}
+
 export async function executeQuery(
   pool: pg.Pool,
   sql: string,
   maxRows: number,
-  options: { readonly: boolean; allowMultiStatements: boolean }
+  options: ExecuteQueryOptions
 ): Promise<QueryResult> {
   const limitedSql = ensureLimit(
     sql,
@@ -104,6 +135,17 @@ export async function executeQuery(
 
   const client = await pool.connect();
   try {
+    if (options.role) {
+      await client.query(`SET ROLE ${escapeIdentifier(options.role)}`);
+    }
+
+    if (options.sessionVars) {
+      for (const [key, value] of Object.entries(options.sessionVars)) {
+        assertSafeGucName(key);
+        await client.query(`SET ${key} = ${escapeLiteral(value)}`);
+      }
+    }
+
     if (options.readonly) {
       await client.query(
         "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
@@ -136,6 +178,22 @@ export async function executeQuery(
 
     throw err;
   } finally {
+    try {
+      if (options.sessionVars) {
+        for (const key of Object.keys(options.sessionVars)) {
+          await client.query(`RESET ${key}`);
+        }
+      }
+      if (options.role) {
+        await client.query("RESET ROLE");
+      }
+    } catch (cleanupErr) {
+      logger.warn("Failed to reset RLS session state; connection may be discarded by pool", {
+        error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        role: options.role ?? "",
+        sessionVarKeys: options.sessionVars ? Object.keys(options.sessionVars).join(", ") : "",
+      });
+    }
     client.release();
   }
 }

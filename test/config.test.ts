@@ -53,6 +53,8 @@ ssh_key = "/absolute/path/to/key.pem"
       timeout: 60,
       poolMax: 1,
       allowMultiStatements: false,
+      role: undefined,
+      sessionVars: undefined,
       sshHost: "bastion.example.com",
       sshUser: "deploy",
       sshKey: "/absolute/path/to/key.pem",
@@ -178,6 +180,51 @@ ssh_key = "/path/to/key.pem"
     expect("ssh_host" in source).toBe(false);
     expect("ssh_user" in source).toBe(false);
     expect("ssh_key" in source).toBe(false);
+  });
+
+  it("parses role and session_vars", () => {
+    const toml = `
+[[sources]]
+id = "production"
+dsn = "postgres://localhost/db"
+readonly = true
+role = "app_mcp_readonly"
+session_vars = { "app.current_tenant_id" = "tenant_123", "app.env" = "production" }
+`;
+    const config = loadConfig(writeTempToml(toml));
+    const source = config.sources[0];
+
+    expect(source.role).toBe("app_mcp_readonly");
+    expect(source.sessionVars).toEqual({
+      "app.current_tenant_id": "tenant_123",
+      "app.env": "production",
+    });
+  });
+
+  it("expands env vars in session_vars values", () => {
+    process.env.TEST_TENANT_ID = "t_abc";
+    const toml = `
+[[sources]]
+id = "test"
+dsn = "postgres://localhost/db"
+session_vars = { "app.current_tenant_id" = "$TEST_TENANT_ID" }
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].sessionVars).toEqual({
+      "app.current_tenant_id": "t_abc",
+    });
+    delete process.env.TEST_TENANT_ID;
+  });
+
+  it("omits role and sessionVars when not configured", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/db"
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].role).toBeUndefined();
+    expect(config.sources[0].sessionVars).toBeUndefined();
   });
 
   it("parses multiple sources", () => {

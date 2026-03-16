@@ -247,6 +247,57 @@ describe("executeQuery", () => {
     );
   });
 
+  it("sets role before executing query and resets after", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT 1", 10, {
+      ...defaultOptions,
+      role: "app_mcp_readonly",
+    });
+
+    // SET ROLE, query, RESET ROLE
+    expect(queryFn.mock.calls[0][0]).toBe('SET ROLE "app_mcp_readonly"');
+    expect(queryFn.mock.calls[1][0]).toMatch(/SELECT/);
+    // Cleanup calls happen in finally
+    expect(queryFn.mock.calls[2][0]).toBe("RESET ROLE");
+  });
+
+  it("sets session vars before executing query and resets after", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT 1", 10, {
+      ...defaultOptions,
+      sessionVars: { "app.current_tenant_id": "tenant_123" },
+    });
+
+    expect(queryFn.mock.calls[0][0]).toBe("SET app.current_tenant_id = 'tenant_123'");
+    expect(queryFn.mock.calls[1][0]).toMatch(/SELECT/);
+    expect(queryFn.mock.calls[2][0]).toBe("RESET app.current_tenant_id");
+  });
+
+  it("sets role and session vars together with readonly", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT 1", 10, {
+      readonly: true,
+      allowMultiStatements: false,
+      role: "mcp_reader",
+      sessionVars: { "app.tenant_id": "t_1" },
+    });
+
+    // Order: SET ROLE, SET session var, SET readonly, query
+    expect(queryFn.mock.calls[0][0]).toBe('SET ROLE "mcp_reader"');
+    expect(queryFn.mock.calls[1][0]).toBe("SET app.tenant_id = 't_1'");
+    expect(queryFn.mock.calls[2][0]).toBe("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+    expect(queryFn.mock.calls[3][0]).toMatch(/SELECT/);
+    // Cleanup: RESET session var, RESET ROLE
+    expect(queryFn.mock.calls[4][0]).toBe("RESET app.tenant_id");
+    expect(queryFn.mock.calls[5][0]).toBe("RESET ROLE");
+  });
+
   it("identifies timeout errors with actionable message", async () => {
     const timeoutError = Object.assign(new Error("canceling statement due to statement timeout"), {
       code: "57014",

@@ -14,6 +14,8 @@ export const sourceConfigSchema = z.object({
   timeout: z.number().positive().optional().default(10),
   pool_max: z.number().int().positive().optional().default(1),
   allow_multi_statements: z.boolean().optional().default(false),
+  role: z.string().min(1).optional(),
+  session_vars: z.record(z.string().min(1), z.string()).optional(),
   ssh_host: z.string().optional(),
   ssh_user: z.string().optional(),
   ssh_key: z.string().optional(),
@@ -52,6 +54,12 @@ function toSourceConfig(raw: z.infer<typeof sourceConfigSchema>): SourceConfig {
   const dsn = expandEnvVars(raw.dsn);
   const sshKey = raw.ssh_key ? expandTilde(raw.ssh_key) : undefined;
 
+  const sessionVars = raw.session_vars
+    ? Object.fromEntries(
+        Object.entries(raw.session_vars).map(([k, v]) => [k, expandEnvVars(v)])
+      )
+    : undefined;
+
   return {
     id: raw.id,
     dsn,
@@ -60,6 +68,8 @@ function toSourceConfig(raw: z.infer<typeof sourceConfigSchema>): SourceConfig {
     timeout: raw.timeout,
     poolMax: raw.pool_max,
     allowMultiStatements: raw.allow_multi_statements,
+    role: raw.role,
+    sessionVars,
     sshHost: raw.ssh_host,
     sshUser: raw.ssh_user,
     sshKey,
