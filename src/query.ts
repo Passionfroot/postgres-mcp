@@ -153,6 +153,14 @@ export async function executeQuery(
       );
     }
 
+    if (err.code === "42501") {
+      throw new Error(
+        formatPgError(err) +
+        "\n\nPermission denied. Use search_objects to check which columns are accessible, " +
+        "then list them explicitly in your query."
+      );
+    }
+
     if (err.code) {
       throw new Error(formatPgError(err));
     }

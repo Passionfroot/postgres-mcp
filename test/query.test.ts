@@ -309,4 +309,17 @@ describe("executeQuery", () => {
       "Query timed out. Simplify the query or add more specific WHERE conditions."
     );
   });
+
+  it("provides actionable hint on column-level permission denied (42501)", async () => {
+    const permError = Object.assign(
+      new Error('permission denied for column "vatId" of relation "creators"'),
+      { code: "42501" }
+    );
+    const queryFn = vi.fn().mockRejectedValue(permError);
+    const pool = createMockPool(queryFn);
+
+    await expect(
+      executeQuery(pool, "SELECT * FROM creators", 100, defaultOptions)
+    ).rejects.toThrow("search_objects");
+  });
 });
