@@ -3,6 +3,7 @@ const { Parser } = NodeSqlParser;
 import pg from "pg";
 
 import { logger } from "./logger.js";
+import { assertSafeGucName, escapeIdentifier, escapeLiteral } from "./sql-helpers.js";
 
 export interface QueryResult {
   rows: Record<string, unknown>[];
@@ -23,28 +24,6 @@ function isPgError(err: unknown): err is PgErrorLike {
 }
 
 const parser = new Parser();
-
-/**
- * Validate that a PostgreSQL configuration parameter name (GUC) is safe.
- * Custom GUCs follow the pattern `extension.parameter` — only alphanumeric, underscores, and dots.
- */
-const SAFE_GUC_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_.]*$/;
-
-function assertSafeGucName(name: string): void {
-  if (!SAFE_GUC_NAME_RE.test(name)) {
-    throw new Error(`Invalid session variable name: ${JSON.stringify(name)}`);
-  }
-}
-
-/** Double-quote a SQL identifier (role name). Escapes embedded double quotes. */
-function escapeIdentifier(str: string): string {
-  return `"${str.replace(/"/g, '""')}"`;
-}
-
-/** Single-quote a SQL literal value. Escapes embedded single quotes. */
-function escapeLiteral(str: string): string {
-  return `'${str.replace(/'/g, "''")}'`;
-}
 const PG_OPT = { database: "PostgreSQL" } as const;
 
 const HAS_LIMIT_RE = /\bLIMIT\s+\d/i;

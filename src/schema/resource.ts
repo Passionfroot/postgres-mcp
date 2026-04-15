@@ -43,7 +43,10 @@ export function registerSchemaResource(
       }
 
       const pool = await connectionManager.getPool(database);
-      const schema = await schemaCache.get(database, pool);
+      const schema = await schemaCache.get(database, pool, {
+        role: source.role,
+        sessionVars: source.sessionVars,
+      });
       const text = formatRelationshipMap(schema, database);
 
       return {
