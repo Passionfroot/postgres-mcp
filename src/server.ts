@@ -6,6 +6,7 @@ import type { ConnectionManager } from "./connections.js";
 import type { SchemaCache } from "./schema/cache.js";
 import type { Config } from "./types.js";
 
+import { expandStarColumns } from "./expand-star.js";
 import { logger } from "./logger.js";
 import { mcpErrorResult, mcpTextResult, resolveSource } from "./mcp-helpers.js";
 import { executeQuery } from "./query.js";
@@ -57,11 +58,16 @@ export function createServer(
 
         const { source } = resolved;
         const pool = await connectionManager.getPool(database);
+        const schema = await schemaCache.get(database, pool, {
+          role: source.role,
+          sessionVars: source.sessionVars,
+        });
         const result = await executeQuery(pool, query, source.maxRows, {
           readonly: source.readonly,
           allowMultiStatements: source.allowMultiStatements,
           role: source.role,
           sessionVars: source.sessionVars,
+          expandStar: (sql) => expandStarColumns(sql, schema),
         });
 
         auditLog.log({

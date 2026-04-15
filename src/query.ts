@@ -98,6 +98,7 @@ export interface ExecuteQueryOptions {
   allowMultiStatements: boolean;
   role?: string;
   sessionVars?: Record<string, string>;
+  expandStar?: (sql: string) => string;
 }
 
 export async function executeQuery(
@@ -106,8 +107,9 @@ export async function executeQuery(
   maxRows: number,
   options: ExecuteQueryOptions
 ): Promise<QueryResult> {
+  const expandedSql = options.expandStar ? options.expandStar(sql) : sql;
   const limitedSql = ensureLimit(
-    sql,
+    expandedSql,
     maxRows + 1,
     options.allowMultiStatements
   );
