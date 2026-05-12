@@ -29,6 +29,7 @@ const auditLogSchema = z.object({
 const configSchema = z.object({
   sources: z.array(sourceConfigSchema).min(1, "At least one source is required"),
   prisma_schema_path: z.string().optional(),
+  include_prisma_info: z.boolean().optional().default(true),
   audit_log: auditLogSchema.optional(),
 });
 
@@ -112,7 +113,8 @@ export function loadConfig(filePath: string): Config {
   const prismaSchemaPath = result.data.prisma_schema_path
     ? expandTilde(result.data.prisma_schema_path)
     : undefined;
+  const includePrismaInfo = result.data.include_prisma_info;
   const auditLog = result.data.audit_log ? toAuditLogConfig(result.data.audit_log) : undefined;
 
-  return { sources, prismaSchemaPath, auditLog };
+  return { sources, prismaSchemaPath, includePrismaInfo, auditLog };
 }

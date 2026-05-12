@@ -44,7 +44,9 @@ export function registerSchemaResource(
 
       const pool = await connectionManager.getPool(database);
       const schema = await schemaCache.get(database, pool);
-      const text = formatRelationshipMap(schema, database);
+      const text = formatRelationshipMap(schema, database, {
+        includePrismaInfo: config.includePrismaInfo,
+      });
 
       return {
         contents: [
