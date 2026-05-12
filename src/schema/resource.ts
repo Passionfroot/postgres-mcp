@@ -27,7 +27,9 @@ export function registerSchemaResource(
     }),
     {
       title: "Database Schema",
-      description: "Lean relationship map showing tables, Prisma model names, and FK relationships",
+      description: config.includePrismaInfo
+        ? "Lean relationship map showing tables, Prisma model names, and FK relationships"
+        : "Lean relationship map showing tables and FK relationships",
       mimeType: "text/plain",
     },
     async (uri, variables) => {

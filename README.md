@@ -111,7 +111,7 @@ Returns a lean relationship map: all tables, their Prisma model names, and FK co
 | Field                  | Default | Description                                                                                                                                                                                            |
 | ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `prisma_schema_path`   | —       | Path to your `.prisma` schema file. Also discovers `models/*.prisma` files.                                                                                                                            |
-| `include_prisma_info`  | `true`  | Whether to render Prisma annotations (`(Prisma: ModelName)` on table headers and `(Prisma: fieldName)` on column lines). Set to `false` to drop the annotations and save tokens for SQL-only consumers. |
+| `include_prisma_info`  | `true`  | Whether to render Prisma annotations: `(Prisma: ModelName)` and `(no Prisma model)` on table headers, and `(Prisma: fieldName)` on column lines. Set to `false` to drop the annotations and save tokens for SQL-only consumers. |
 
 ### Audit log options
 
@@ -140,7 +140,7 @@ The MCP reads your Prisma schema file at runtime via `prisma_schema_path`. It us
 - Missing columns (Prisma field exists, DB column doesn't)
 - Type mismatches (Prisma says `String`, DB has `integer`)
 
-**Suppressing the annotations:** If the MCP consumer only writes raw SQL (e.g. a tightly-budgeted production LLM agent), the `(Prisma: …)` annotations are pure tokens. Set `include_prisma_info = false` in the config to drop them from `search_objects` output and the `schema://` resource. The schema is still parsed, so drift detection and the in-memory mapping remain available for any future tooling — only the rendered text changes.
+**Suppressing the annotations:** If the MCP consumer only writes raw SQL (e.g. a tightly-budgeted production LLM agent), the `(Prisma: ModelName)`, `(no Prisma model)`, and `(Prisma: fieldName)` annotations are pure tokens. Set `include_prisma_info = false` in the config to drop them from `search_objects` output and the `schema://` resource. The schema is still parsed, so drift detection and the in-memory mapping remain available for any future tooling - only the rendered text changes.
 
 ## Using a Skill
 
