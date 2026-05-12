@@ -206,7 +206,7 @@ describe("formatRelationshipMap", () => {
   });
 
   describe("includePrismaInfo: false", () => {
-    it("omits (Prisma: X) suffix and renders all DB tables, not just mapped ones", () => {
+    it("omits (Prisma: X) suffix but still filters to Prisma-mapped tables", () => {
       const schema = makeSchema([
         makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
         makeTable({ sqlName: "_prisma_migrations", prismaModelName: null }),
@@ -216,7 +216,7 @@ describe("formatRelationshipMap", () => {
 
       expect(output).not.toContain("(Prisma:");
       expect(output).toContain("\ncreators");
-      expect(output).toContain("\n_prisma_migrations");
+      expect(output).not.toContain("_prisma_migrations");
     });
 
     it("renders missing_table warnings without the Prisma model suffix", () => {

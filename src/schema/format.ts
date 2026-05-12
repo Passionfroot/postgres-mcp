@@ -36,18 +36,14 @@ export function formatRelationshipMap(
 ) {
   const { includePrismaInfo = true } = options;
 
-  // When Prisma info is included, the resource only renders tables with a Prisma model
-  // mapping (its historic purpose). When excluded, render every DB table.
-  const visibleTables = includePrismaInfo
-    ? schema.tables.filter((t) => t.prismaModelName !== null)
-    : schema.tables;
-  const sortedTables = [...visibleTables].sort((a, b) => a.sqlName.localeCompare(b.sqlName));
+  const mappedTables = schema.tables.filter((t) => t.prismaModelName !== null);
+  const sortedTables = [...mappedTables].sort((a, b) => a.sqlName.localeCompare(b.sqlName));
 
   const totalFks = schema.tables.reduce((sum, t) => sum + t.outgoingFks.length, 0);
 
   const lines: string[] = [];
   lines.push(
-    `# Schema: ${databaseId} (${visibleTables.length} tables, ${totalFks} FK relationships)`
+    `# Schema: ${databaseId} (${mappedTables.length} tables, ${totalFks} FK relationships)`
   );
   lines.push("");
   lines.push("Use search_objects to look up column detail for specific tables.");
