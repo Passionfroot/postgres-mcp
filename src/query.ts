@@ -98,6 +98,7 @@ export interface ExecuteQueryOptions {
   allowMultiStatements: boolean;
   role?: string;
   sessionVars?: Record<string, string>;
+  expandStar?: (sql: string) => string;
 }
 
 export async function executeQuery(
@@ -106,8 +107,9 @@ export async function executeQuery(
   maxRows: number,
   options: ExecuteQueryOptions
 ): Promise<QueryResult> {
+  const expandedSql = options.expandStar ? options.expandStar(sql) : sql;
   const limitedSql = ensureLimit(
-    sql,
+    expandedSql,
     maxRows + 1,
     options.allowMultiStatements
   );
@@ -148,6 +150,14 @@ export async function executeQuery(
     if (err.code === "57014") {
       throw new Error(
         "Query timed out. Simplify the query or add more specific WHERE conditions."
+      );
+    }
+
+    if (err.code === "42501") {
+      throw new Error(
+        formatPgError(err) +
+        "\n\nPermission denied. Use search_objects to check which columns are accessible, " +
+        "then list them explicitly in your query."
       );
     }
 
