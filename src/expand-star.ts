@@ -37,9 +37,11 @@ function buildColumnNode(columnName: string, tableAlias: string | null) {
 }
 
 function resolveTableColumns(
-  tableName: string,
+  tableName: unknown,
   schema: MergedSchema
 ): string[] | null {
+  // Subqueries and table functions in FROM carry no string table name
+  if (typeof tableName !== "string") return null;
   const table = schema.tables.find(
     (t) => t.sqlName.toLowerCase() === tableName.toLowerCase()
   );
@@ -70,8 +72,22 @@ function resolveAliasToTable(
  * - The query can't be parsed
  * - The referenced table isn't in the schema
  * - The query is not a single SELECT
+ * - The FROM item is a subquery or table function
+ * - Expansion fails for any other reason — rewriting is best-effort and must
+ *   never turn an executable query into an error
  */
 export function expandStarColumns(
+  sql: string,
+  schema: MergedSchema
+): string {
+  try {
+    return expandStarColumnsUnsafe(sql, schema);
+  } catch {
+    return sql;
+  }
+}
+
+function expandStarColumnsUnsafe(
   sql: string,
   schema: MergedSchema
 ): string {

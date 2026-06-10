@@ -142,6 +142,16 @@ describe("expandStarColumns", () => {
       const sql = "THIS IS NOT VALID SQL %%%";
       expect(expandStarColumns(sql, schema)).toBe(sql);
     });
+
+    it("returns original SQL for a subquery in FROM", () => {
+      const sql = "SELECT * FROM (SELECT 1 AS x) sub";
+      expect(expandStarColumns(sql, schema)).toBe(sql);
+    });
+
+    it("returns original SQL for a table function in FROM", () => {
+      const sql = "SELECT * FROM generate_series(1,5)";
+      expect(expandStarColumns(sql, schema)).toBe(sql);
+    });
   });
 
   describe("edge cases", () => {
