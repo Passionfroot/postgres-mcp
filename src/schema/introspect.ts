@@ -2,19 +2,38 @@ import pg from "pg";
 
 import type { DbColumn, DbEnumValue, DbForeignKey, DbMetadata, DbPrimaryKey } from "./types.js";
 
+import { assertSafeGucName, escapeIdentifier, escapeLiteral } from "../sql-helpers.js";
+import { logger } from "../logger.js";
+
+/**
+ * Only return columns where the connected user (or effective role) has SELECT privilege.
+ * This filters out columns hidden by column-level security. (RLS does not affect these
+ * checks — it filters rows at query time, not privileges.)
+ *
+ * Without this filter, information_schema.columns returns columns where the user has ANY
+ * privilege (e.g. REFERENCES from FK constraints), which misleads schema consumers into
+ * thinking those columns are queryable.
+ */
 const COLUMNS_QUERY = `
 SELECT table_name, column_name, data_type, udt_name, is_nullable, column_default, ordinal_position
 FROM information_schema.columns
 WHERE table_schema = 'public'
+  AND has_column_privilege(format('%I.%I', table_schema, table_name), column_name, 'SELECT')
 ORDER BY table_name, ordinal_position
 `;
 
+/**
+ * Key queries check the key column itself with has_column_privilege so PK/FK metadata stays
+ * consistent with the filtered columns query. has_table_privilege would be wrong here: it only
+ * considers table-level ACLs and returns false for users with column-level grants only.
+ */
 const PRIMARY_KEYS_QUERY = `
 SELECT tc.table_name, kcu.column_name, kcu.ordinal_position
 FROM information_schema.table_constraints tc
 JOIN information_schema.key_column_usage kcu
   ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
 WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
+  AND has_column_privilege(format('%I.%I', tc.table_schema, tc.table_name), kcu.column_name, 'SELECT')
 ORDER BY tc.table_name, kcu.ordinal_position
 `;
 
@@ -27,6 +46,7 @@ JOIN information_schema.key_column_usage kcu
 JOIN information_schema.constraint_column_usage ccu
   ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
 WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+  AND has_column_privilege(format('%I.%I', tc.table_schema, kcu.table_name), kcu.column_name, 'SELECT')
 ORDER BY kcu.table_name, kcu.column_name
 `;
 
@@ -68,8 +88,30 @@ interface EnumRow {
   sort_order: number;
 }
 
-/** Run 4 information_schema queries and return structured database metadata. */
-export async function introspectDatabase(pool: pg.Pool): Promise<DbMetadata> {
+export interface IntrospectOptions {
+  role?: string;
+  sessionVars?: Record<string, string>;
+}
+
+/**
+ * Run information_schema queries and return structured database metadata.
+ *
+ * When role or sessionVars are provided, applies them via SET ROLE / SET before querying
+ * so the schema reflects the effective permissions during actual query execution.
+ *
+ * Columns, PKs, and FKs are filtered by SELECT privilege so the schema only contains
+ * objects the user can actually query.
+ */
+export async function introspectDatabase(
+  pool: pg.Pool,
+  options?: IntrospectOptions
+): Promise<DbMetadata> {
+  const needsSession = Boolean(options?.role || options?.sessionVars);
+
+  if (needsSession) {
+    return introspectWithSession(pool, options!);
+  }
+
   const [columnsResult, pksResult, fksResult, enumsResult] = await Promise.all([
     pool.query<ColumnRow>(COLUMNS_QUERY),
     pool.query<PkRow>(PRIMARY_KEYS_QUERY),
@@ -77,7 +119,62 @@ export async function introspectDatabase(pool: pg.Pool): Promise<DbMetadata> {
     pool.query<EnumRow>(ENUM_VALUES_QUERY),
   ]);
 
-  const columns: DbColumn[] = columnsResult.rows.map((r) => ({
+  return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows);
+}
+
+async function introspectWithSession(
+  pool: pg.Pool,
+  options: IntrospectOptions
+): Promise<DbMetadata> {
+  const client = await pool.connect();
+  try {
+    if (options.role) {
+      await client.query(`SET ROLE ${escapeIdentifier(options.role)}`);
+    }
+
+    if (options.sessionVars) {
+      for (const [key, value] of Object.entries(options.sessionVars)) {
+        assertSafeGucName(key);
+        await client.query(`SET ${key} = ${escapeLiteral(value)}`);
+      }
+    }
+
+    const [columnsResult, pksResult, fksResult, enumsResult] = await Promise.all([
+      client.query<ColumnRow>(COLUMNS_QUERY),
+      client.query<PkRow>(PRIMARY_KEYS_QUERY),
+      client.query<FkRow>(FOREIGN_KEYS_QUERY),
+      client.query<EnumRow>(ENUM_VALUES_QUERY),
+    ]);
+
+    return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows);
+  } finally {
+    try {
+      if (options.sessionVars) {
+        for (const key of Object.keys(options.sessionVars)) {
+          await client.query(`RESET ${key}`);
+        }
+      }
+      if (options.role) {
+        await client.query("RESET ROLE");
+      }
+    } catch (cleanupErr) {
+      logger.warn("Failed to reset introspection session state", {
+        error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        role: options.role ?? "",
+        sessionVarKeys: options.sessionVars ? Object.keys(options.sessionVars).join(", ") : "",
+      });
+    }
+    client.release();
+  }
+}
+
+function buildMetadata(
+  columnRows: ColumnRow[],
+  pkRows: PkRow[],
+  fkRows: FkRow[],
+  enumRows: EnumRow[]
+): DbMetadata {
+  const columns: DbColumn[] = columnRows.map((r) => ({
     tableName: r.table_name,
     columnName: r.column_name,
     dataType: r.data_type,
@@ -87,20 +184,20 @@ export async function introspectDatabase(pool: pg.Pool): Promise<DbMetadata> {
     ordinalPosition: r.ordinal_position,
   }));
 
-  const primaryKeys: DbPrimaryKey[] = pksResult.rows.map((r) => ({
+  const primaryKeys: DbPrimaryKey[] = pkRows.map((r) => ({
     tableName: r.table_name,
     columnName: r.column_name,
     ordinalPosition: r.ordinal_position,
   }));
 
-  const foreignKeys: DbForeignKey[] = fksResult.rows.map((r) => ({
+  const foreignKeys: DbForeignKey[] = fkRows.map((r) => ({
     fromTable: r.from_table,
     fromColumn: r.from_column,
     toTable: r.to_table,
     toColumn: r.to_column,
   }));
 
-  const enumValues: DbEnumValue[] = enumsResult.rows.map((r) => ({
+  const enumValues: DbEnumValue[] = enumRows.map((r) => ({
     enumName: r.enum_name,
     enumValue: r.enum_value,
     sortOrder: r.sort_order,

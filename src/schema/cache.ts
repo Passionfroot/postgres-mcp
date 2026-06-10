@@ -7,6 +7,7 @@ import type { MergedSchema, PrismaMapping } from "./types.js";
 
 import { logger } from "../logger.js";
 import { introspectDatabase } from "./introspect.js";
+import type { IntrospectOptions } from "./introspect.js";
 import { mergeSchemas } from "./merge.js";
 import { parsePrismaFiles } from "./prisma-parser.js";
 
@@ -23,12 +24,12 @@ export class SchemaCache {
 
   constructor(private prismaMapping: PrismaMapping) {}
 
-  async get(database: string, pool: pg.Pool): Promise<MergedSchema> {
+  async get(database: string, pool: pg.Pool, options?: IntrospectOptions): Promise<MergedSchema> {
     const cached = this.cache.get(database);
     if (cached) return cached;
 
     logger.debug(`Cache miss for "${database}", introspecting...`);
-    const dbMetadata = await introspectDatabase(pool);
+    const dbMetadata = await introspectDatabase(pool, options);
     const merged = mergeSchemas(this.prismaMapping, dbMetadata);
     this.cache.set(database, merged);
     logger.info(
