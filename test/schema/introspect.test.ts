@@ -32,25 +32,28 @@ describe("introspectDatabase", () => {
       expect(columnsSql).toContain("'SELECT'");
     });
 
-    it("uses has_table_privilege in the primary keys query", async () => {
+    it("uses column-level has_column_privilege in the primary keys query", async () => {
       const queryFn = vi.fn().mockResolvedValue(emptyResult);
       const pool = createMockPool(queryFn);
 
       await introspectDatabase(pool);
 
       const pkSql = queryFn.mock.calls[1][0] as string;
-      expect(pkSql).toContain("has_table_privilege");
+      expect(pkSql).toContain("has_column_privilege");
+      // has_table_privilege ignores column-level grants and must not be used here
+      expect(pkSql).not.toContain("has_table_privilege");
       expect(pkSql).toContain("'SELECT'");
     });
 
-    it("uses has_table_privilege in the foreign keys query", async () => {
+    it("uses column-level has_column_privilege in the foreign keys query", async () => {
       const queryFn = vi.fn().mockResolvedValue(emptyResult);
       const pool = createMockPool(queryFn);
 
       await introspectDatabase(pool);
 
       const fkSql = queryFn.mock.calls[2][0] as string;
-      expect(fkSql).toContain("has_table_privilege");
+      expect(fkSql).toContain("has_column_privilege");
+      expect(fkSql).not.toContain("has_table_privilege");
       expect(fkSql).toContain("'SELECT'");
     });
 

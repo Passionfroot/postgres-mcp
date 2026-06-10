@@ -7,7 +7,8 @@ import { logger } from "../logger.js";
 
 /**
  * Only return columns where the connected user (or effective role) has SELECT privilege.
- * This filters out columns hidden by column-level security and tables hidden by RLS.
+ * This filters out columns hidden by column-level security. (RLS does not affect these
+ * checks — it filters rows at query time, not privileges.)
  *
  * Without this filter, information_schema.columns returns columns where the user has ANY
  * privilege (e.g. REFERENCES from FK constraints), which misleads schema consumers into
@@ -21,13 +22,18 @@ WHERE table_schema = 'public'
 ORDER BY table_name, ordinal_position
 `;
 
+/**
+ * Key queries check the key column itself with has_column_privilege so PK/FK metadata stays
+ * consistent with the filtered columns query. has_table_privilege would be wrong here: it only
+ * considers table-level ACLs and returns false for users with column-level grants only.
+ */
 const PRIMARY_KEYS_QUERY = `
 SELECT tc.table_name, kcu.column_name, kcu.ordinal_position
 FROM information_schema.table_constraints tc
 JOIN information_schema.key_column_usage kcu
   ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
 WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
-  AND has_table_privilege(format('%I.%I', tc.table_schema, tc.table_name), 'SELECT')
+  AND has_column_privilege(format('%I.%I', tc.table_schema, tc.table_name), kcu.column_name, 'SELECT')
 ORDER BY tc.table_name, kcu.ordinal_position
 `;
 
@@ -40,7 +46,7 @@ JOIN information_schema.key_column_usage kcu
 JOIN information_schema.constraint_column_usage ccu
   ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
 WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
-  AND has_table_privilege(format('%I.%I', tc.table_schema, tc.table_name), 'SELECT')
+  AND has_column_privilege(format('%I.%I', tc.table_schema, kcu.table_name), kcu.column_name, 'SELECT')
 ORDER BY kcu.table_name, kcu.column_name
 `;
 
