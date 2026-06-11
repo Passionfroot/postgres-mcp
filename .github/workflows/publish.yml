@@ -4,6 +4,10 @@ on:
   release:
     types: [published]
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -14,14 +18,12 @@ jobs:
         uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 22
-          cache: npm
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false # https://docs.npmjs.com/trusted-publishers#step-2-configure-your-cicd-workflow
 
       - run: npm ci
       - run: npm run build
       - run: npm test -- run
 
       - name: Publish
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
