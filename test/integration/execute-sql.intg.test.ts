@@ -96,6 +96,25 @@ describe.skipIf(!isDbAvailable)("execute_sql integration", () => {
     expect(result.truncated).toBe(false);
   });
 
+  it("returns tz-naive timestamps and dates as literal strings", async () => {
+    const pool = await connectionManager.getPool("local");
+    const result = await executeQuery(
+      pool,
+      `SELECT
+        '2026-07-02 11:43:00.875'::timestamp as naive_ts,
+        '2026-07-02'::date as naive_date,
+        ARRAY['2026-07-02 11:43:00.875'::timestamp] as naive_ts_array`,
+      10,
+      defaultOptions
+    );
+
+    expect(result.rows[0]).toEqual({
+      naive_ts: "2026-07-02 11:43:00.875",
+      naive_date: "2026-07-02",
+      naive_ts_array: ["2026-07-02 11:43:00.875"],
+    });
+  });
+
   it("returns empty result", async () => {
     const pool = await connectionManager.getPool("local");
     const result = await executeQuery(pool, "SELECT 1 WHERE false", 10, defaultOptions);

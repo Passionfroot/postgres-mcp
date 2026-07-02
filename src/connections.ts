@@ -1,9 +1,20 @@
 import pg from "pg";
+import type { TypeId } from "pg-types";
+import { parse as parsePgArray } from "postgres-array";
 
 import type { SourceConfig, TunnelHandle } from "./types.js";
 
 import { logger } from "./logger.js";
 import { createTunnel, parseDsnHostPort } from "./tunnel.js";
+
+// pg's default parsers turn tz-naive timestamp/date values into JS Dates interpreted in the
+// server's local timezone, so JSON output silently shifts them (e.g. UTC-stored "11:43" becomes
+// "09:43Z" on a UTC+2 machine, and dates can move a whole day). Return the literal strings instead.
+pg.types.setTypeParser(pg.types.builtins.DATE, (value) => value);
+pg.types.setTypeParser(pg.types.builtins.TIMESTAMP, (value) => value);
+// Array OIDs are missing from pg-types' TypeId enum, hence the casts.
+pg.types.setTypeParser(1182 as TypeId, (value) => parsePgArray(value)); // date[]
+pg.types.setTypeParser(1115 as TypeId, (value) => parsePgArray(value)); // timestamp[]
 
 function getErrorMessage(err: unknown) {
   return err instanceof Error ? err.message : String(err);
