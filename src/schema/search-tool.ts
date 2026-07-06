@@ -38,8 +38,12 @@ export function registerSearchTool(
         const resolved = resolveSource(database, config);
         if (!resolved.ok) return resolved.error;
 
+        const { source } = resolved;
         const pool = await connectionManager.getPool(database);
-        const schema = await schemaCache.get(database, pool);
+        const schema = await schemaCache.get(database, pool, {
+          role: source.role,
+          sessionVars: source.sessionVars,
+        });
         const results = searchTables(schema, pattern);
         const enumResolver = (udtName: string) => schemaCache.getEnumValues(udtName);
         const formatted = formatSearchResults(results, {
