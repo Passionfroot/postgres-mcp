@@ -29,6 +29,16 @@ export function searchTables(schema: MergedSchema, pattern: string): MergedTable
   return [...exact, ...partial];
 }
 
+// Full label list for typical enums; huge ones (e.g. Country, 245 labels) get a sample + count.
+const ENUM_FULL_RENDER_MAX = 24;
+const ENUM_SAMPLE_SIZE = 8;
+
+function formatEnumValues(values: { label: string; dbValue: string }[]) {
+  const labels = values.map((v) => v.dbValue);
+  if (labels.length <= ENUM_FULL_RENDER_MAX) return labels.join(", ");
+  return `${labels.slice(0, ENUM_SAMPLE_SIZE).join(", ")}, … (${labels.length} values total)`;
+}
+
 function formatColumn(col: MergedColumn) {
   const parts = [`    ${col.sqlName}`, col.dataType, col.isNullable ? "NULL" : "NOT NULL"];
 
@@ -69,7 +79,7 @@ export function formatSearchResults(
         if (col.dataType === "USER-DEFINED" && enumResolver) {
           const values = enumResolver(col.udtName);
           if (values && values.length > 0) {
-            lines.push(`      enum ${col.udtName}: ${values.map((v) => v.dbValue).join(", ")}`);
+            lines.push(`      enum ${col.udtName}: ${formatEnumValues(values)}`);
           }
         }
       }
