@@ -83,8 +83,17 @@ export function formatSearchResults(
     }
 
     if (table.incomingFks.length > 0) {
-      const sources = [...new Set(table.incomingFks.map((fk) => fk.fromTable))].sort();
-      lines.push(`  FK in:  <- ${sources.join(", ")}`);
+      const seen = new Set<string>();
+      const fkParts: string[] = [];
+      for (const fk of table.incomingFks) {
+        const key = `${fk.fromTable}.${fk.fromColumn}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const cardinality = fk.isUnique ? "1:1" : "1:many";
+        const warning = fk.isUnique ? "" : " - JOIN duplicates rows, use subquery or DISTINCT";
+        fkParts.push(`<- ${fk.fromTable} via ${fk.fromColumn} [${cardinality}${warning}]`);
+      }
+      lines.push(`  FK in:  ${fkParts.join(", ")}`);
     }
 
     sections.push(lines.join("\n"));

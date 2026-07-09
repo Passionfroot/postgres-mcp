@@ -404,7 +404,7 @@ describe("mergeSchemas", () => {
     expect(invoicesTable.outgoingFks).toEqual([
       { toTable: "collabs", toColumn: "id", viaColumn: "collabId" },
     ]);
-    expect(collabsTable.incomingFks).toEqual([{ fromTable: "invoices", fromColumn: "collabId" }]);
+    expect(collabsTable.incomingFks).toEqual([{ fromTable: "invoices", fromColumn: "collabId", isUnique: false }]);
   });
 
   it("marks primary key columns correctly (including composite PKs)", () => {
@@ -498,7 +498,7 @@ describe("mergeSchemas", () => {
       expect(invoicesTable.outgoingFks).toEqual([
         { toTable: "collabs", toColumn: "id", viaColumn: "collabId" },
       ]);
-      expect(collabsTable.incomingFks).toEqual([{ fromTable: "invoices", fromColumn: "collabId" }]);
+      expect(collabsTable.incomingFks).toEqual([{ fromTable: "invoices", fromColumn: "collabId", isUnique: false }]);
     });
 
     it("deduplicates when both DB and Prisma provide the same FK", () => {

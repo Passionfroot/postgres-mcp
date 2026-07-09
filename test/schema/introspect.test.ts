@@ -77,8 +77,8 @@ describe("introspectDatabase", () => {
 
       await introspectDatabase(pool);
 
-      // Should use pool.query (4 parallel queries), not pool.connect
-      expect(queryFn).toHaveBeenCalledTimes(4);
+      // Should use pool.query (5 parallel queries), not pool.connect
+      expect(queryFn).toHaveBeenCalledTimes(5);
       expect(pool.connect).not.toHaveBeenCalled();
     });
 
@@ -108,6 +108,7 @@ describe("introspectDatabase", () => {
         })
         .mockResolvedValueOnce(emptyResult)
         .mockResolvedValueOnce(emptyResult)
+        .mockResolvedValueOnce(emptyResult)
         .mockResolvedValueOnce(emptyResult);
 
       const pool = createMockPool(queryFn);
@@ -134,6 +135,7 @@ describe("introspectDatabase", () => {
             { table_name: "users", column_name: "id", ordinal_position: 1 },
           ],
         })
+        .mockResolvedValueOnce(emptyResult)
         .mockResolvedValueOnce(emptyResult)
         .mockResolvedValueOnce(emptyResult);
 
@@ -162,6 +164,7 @@ describe("introspectDatabase", () => {
             },
           ],
         })
+        .mockResolvedValueOnce(emptyResult)
         .mockResolvedValueOnce(emptyResult);
 
       const pool = createMockPool(queryFn);
@@ -186,7 +189,8 @@ describe("introspectDatabase", () => {
             { enum_name: "Status", enum_value: "ACTIVE", sort_order: 1 },
             { enum_name: "Status", enum_value: "INACTIVE", sort_order: 2 },
           ],
-        });
+        })
+        .mockResolvedValueOnce(emptyResult);
 
       const pool = createMockPool(queryFn);
       const result = await introspectDatabase(pool);

@@ -64,6 +64,7 @@ export interface DbMetadata {
   primaryKeys: DbPrimaryKey[];
   foreignKeys: DbForeignKey[];
   enumValues: DbEnumValue[];
+  uniqueColumns?: Set<string>;
 }
 
 export interface DriftWarning {
@@ -87,7 +88,7 @@ export interface MergedTable {
   prismaModelName: string | null;
   columns: MergedColumn[];
   primaryKeys: string[];
-  incomingFks: { fromTable: string; fromColumn: string }[];
+  incomingFks: { fromTable: string; fromColumn: string; isUnique: boolean }[];
   outgoingFks: { toTable: string; toColumn: string; viaColumn: string }[];
   driftWarnings: DriftWarning[];
 }
