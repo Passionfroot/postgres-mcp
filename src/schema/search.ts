@@ -90,10 +90,13 @@ export function formatSearchResults(
         if (seen.has(key)) continue;
         seen.add(key);
         const cardinality = fk.isUnique ? "1:1" : "1:many";
-        const warning = fk.isUnique ? "" : " - JOIN duplicates rows, use subquery or DISTINCT";
-        fkParts.push(`<- ${fk.fromTable} via ${fk.fromColumn} [${cardinality}${warning}]`);
+        fkParts.push(`<- ${fk.fromTable} via ${fk.fromColumn} [${cardinality}]`);
       }
+      const hasOneToMany = table.incomingFks.some((fk) => !fk.isUnique);
       lines.push(`  FK in:  ${fkParts.join(", ")}`);
+      if (hasOneToMany) {
+        lines.push(`  ⚠ 1:many FKs above will duplicate rows on JOIN. Use a subquery, LATERAL JOIN, or DISTINCT ON to avoid fan-out.`);
+      }
     }
 
     sections.push(lines.join("\n"));
