@@ -45,7 +45,10 @@ export function registerSearchTool(
           sessionVars: source.sessionVars,
         });
         const results = searchTables(schema, pattern);
-        const enumResolver = (udtName: string) => schemaCache.getEnumValues(udtName);
+        const enumResolver = (udtName: string) =>
+          schemaCache.getEnumValues(udtName) ??
+          schema.dbEnums[udtName]?.map((value) => ({ label: value, dbValue: value })) ??
+          null;
         const formatted = formatSearchResults(results, enumResolver);
 
         return mcpTextResult(formatted);

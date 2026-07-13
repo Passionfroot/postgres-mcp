@@ -35,6 +35,7 @@ function makeSchema(tables: MergedTable[], overrides?: Partial<MergedSchema>): M
     tables,
     unmappedTables: [],
     driftWarnings: [],
+    dbEnums: {},
     ...overrides,
   };
 }
@@ -231,6 +232,28 @@ describe("formatSearchResults", () => {
 
     expect(output).toContain("enum CollaborationStatus:");
     expect(output).toContain("DRAFT, ACTIVE, completed");
+  });
+
+  it("caps huge enums to a sample plus total count", () => {
+    const tables = [
+      makeTable({
+        sqlName: "creators",
+        columns: [
+          makeColumn({ sqlName: "country", dataType: "USER-DEFINED", udtName: "Country" }),
+        ],
+      }),
+    ];
+
+    const values = Array.from({ length: 245 }, (_, i) => {
+      const label = `C${String(i).padStart(3, "0")}`;
+      return { label, dbValue: label };
+    });
+    const enumResolver = () => values;
+
+    const output = formatSearchResults(tables, enumResolver);
+
+    expect(output).toContain("enum Country: C000, C001, C002, C003, C004, C005, C006, C007, … (245 values total)");
+    expect(output).not.toContain("C008");
   });
 
   it("returns 'No matching tables found.' when no tables", () => {
