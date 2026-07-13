@@ -3,6 +3,14 @@
 # The MCP reads this file on startup — no build step needed.
 # prisma_schema_path = "~/work/myproject/prisma/schema.prisma"
 
+# Include Prisma annotations in tool output. Default: true. When false, drops
+# `(Prisma: ModelName)`, `(no Prisma model)`, and per-column `(Prisma: fieldName)`
+# tags from search_objects and the schema:// resource. The Prisma schema is still
+# loaded if a path is set, so future tooling can use the mapping - only the
+# rendered output changes. Useful for SQL-only consumers (e.g. token-budgeted
+# LLM agents).
+# include_prisma_info = true
+
 # Production: locked down, tunneled, read-only
 [[sources]]
 id = "production"

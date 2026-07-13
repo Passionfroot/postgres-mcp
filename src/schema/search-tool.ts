@@ -46,7 +46,10 @@ export function registerSearchTool(
         });
         const results = searchTables(schema, pattern);
         const enumResolver = (udtName: string) => schemaCache.getEnumValues(udtName);
-        const formatted = formatSearchResults(results, enumResolver);
+        const formatted = formatSearchResults(results, {
+          enumResolver,
+          includePrismaInfo: config.includePrismaInfo,
+        });
 
         return mcpTextResult(formatted);
       } catch (err: unknown) {

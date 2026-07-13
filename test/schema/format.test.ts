@@ -204,4 +204,39 @@ describe("formatRelationshipMap", () => {
       "Use search_objects to look up column detail for specific tables."
     );
   });
+
+  describe("includePrismaInfo: false", () => {
+    it("omits (Prisma: X) suffix but still filters to Prisma-mapped tables", () => {
+      const schema = makeSchema([
+        makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
+        makeTable({ sqlName: "_prisma_migrations", prismaModelName: null }),
+      ]);
+
+      const output = formatRelationshipMap(schema, "local", { includePrismaInfo: false });
+
+      expect(output).not.toContain("(Prisma:");
+      expect(output).toContain("\ncreators");
+      expect(output).not.toContain("_prisma_migrations");
+    });
+
+    it("renders missing_table warnings without the Prisma model suffix", () => {
+      const schema = makeSchema(
+        [makeTable({ sqlName: "creators", prismaModelName: "Creator" })],
+        {
+          driftWarnings: [
+            {
+              type: "missing_table",
+              tableName: "ghostTable",
+              detail: 'Prisma model "GhostModel" maps to table "ghostTable" which does not exist',
+            },
+          ],
+        }
+      );
+
+      const output = formatRelationshipMap(schema, "local", { includePrismaInfo: false });
+
+      expect(output).toContain("ghostTable -- TABLE MISSING IN DATABASE");
+      expect(output).not.toContain("(Prisma: GhostModel)");
+    });
+  });
 });

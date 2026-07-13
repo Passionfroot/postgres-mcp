@@ -19,7 +19,23 @@ function renderIncomingFks(table: MergedTable) {
   return `  <- ${sources.join(", ")}`;
 }
 
-export function formatRelationshipMap(schema: MergedSchema, databaseId: string) {
+export interface FormatRelationshipMapOptions {
+  includePrismaInfo?: boolean;
+}
+
+function renderTableHeader(table: MergedTable, includePrismaInfo: boolean) {
+  if (!includePrismaInfo) return table.sqlName;
+  if (table.prismaModelName) return `${table.sqlName} (Prisma: ${table.prismaModelName})`;
+  return table.sqlName;
+}
+
+export function formatRelationshipMap(
+  schema: MergedSchema,
+  databaseId: string,
+  options: FormatRelationshipMapOptions = {}
+) {
+  const { includePrismaInfo = true } = options;
+
   const mappedTables = schema.tables.filter((t) => t.prismaModelName !== null);
   const sortedTables = [...mappedTables].sort((a, b) => a.sqlName.localeCompare(b.sqlName));
 
@@ -40,14 +56,13 @@ export function formatRelationshipMap(schema: MergedSchema, databaseId: string) 
     lines.push("");
 
     const isMissingTable = missingTableNames.has(table.sqlName);
+    const header = renderTableHeader(table, includePrismaInfo);
     if (isMissingTable) {
-      lines.push(
-        `${table.sqlName} (Prisma: ${table.prismaModelName}) -- TABLE MISSING IN DATABASE`
-      );
+      lines.push(`${header} -- TABLE MISSING IN DATABASE`);
       continue;
     }
 
-    lines.push(`${table.sqlName} (Prisma: ${table.prismaModelName})`);
+    lines.push(header);
 
     const outgoing = renderOutgoingFks(table);
     if (outgoing) lines.push(outgoing);
@@ -64,11 +79,14 @@ export function formatRelationshipMap(schema: MergedSchema, databaseId: string) 
   for (const warning of missingTableWarnings) {
     const alreadyRendered = sortedTables.some((t) => t.sqlName === warning.tableName);
     if (!alreadyRendered) {
-      // Find the Prisma model name from the warning detail
-      const modelNameMatch = warning.detail.match(/Prisma model "(\w+)"/);
-      const modelName = modelNameMatch ? modelNameMatch[1] : warning.tableName;
       lines.push("");
-      lines.push(`${warning.tableName} (Prisma: ${modelName}) -- TABLE MISSING IN DATABASE`);
+      if (includePrismaInfo) {
+        const modelNameMatch = warning.detail.match(/Prisma model "(\w+)"/);
+        const modelName = modelNameMatch ? modelNameMatch[1] : warning.tableName;
+        lines.push(`${warning.tableName} (Prisma: ${modelName}) -- TABLE MISSING IN DATABASE`);
+      } else {
+        lines.push(`${warning.tableName} -- TABLE MISSING IN DATABASE`);
+      }
     }
   }
 
