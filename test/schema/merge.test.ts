@@ -404,7 +404,7 @@ describe("mergeSchemas", () => {
     expect(invoicesTable.outgoingFks).toEqual([
       { toTable: "collabs", toColumn: "id", viaColumn: "collabId" },
     ]);
-    expect(collabsTable.incomingFks).toEqual([{ fromTable: "invoices", fromColumn: "collabId" }]);
+    expect(collabsTable.incomingFks).toEqual([{ fromTable: "invoices", fromColumn: "collabId", isUnique: false }]);
   });
 
   it("marks primary key columns correctly (including composite PKs)", () => {
@@ -498,7 +498,7 @@ describe("mergeSchemas", () => {
       expect(invoicesTable.outgoingFks).toEqual([
         { toTable: "collabs", toColumn: "id", viaColumn: "collabId" },
       ]);
-      expect(collabsTable.incomingFks).toEqual([{ fromTable: "invoices", fromColumn: "collabId" }]);
+      expect(collabsTable.incomingFks).toEqual([{ fromTable: "invoices", fromColumn: "collabId", isUnique: false }]);
     });
 
     it("deduplicates when both DB and Prisma provide the same FK", () => {
@@ -698,6 +698,50 @@ describe("mergeSchemas", () => {
       const invoicesTable = result.tables.find((t) => t.sqlName === "invoices")!;
 
       expect(invoicesTable.outgoingFks).toEqual([]);
+    });
+  });
+
+  describe("incoming FK cardinality", () => {
+    it("marks an incoming FK as 1:1 when its source column is unique", () => {
+      const db = makeDbMetadata({
+        columns: [
+          makeDbColumn({ tableName: "children", columnName: "id", ordinalPosition: 1 }),
+          makeDbColumn({ tableName: "children", columnName: "parentId", ordinalPosition: 2 }),
+          makeDbColumn({ tableName: "parents", columnName: "id", ordinalPosition: 1 }),
+        ],
+        foreignKeys: [
+          { fromTable: "children", fromColumn: "parentId", toTable: "parents", toColumn: "id" },
+        ],
+        uniqueColumns: new Set(["children.parentId"]),
+      });
+
+      const result = mergeSchemas(makePrismaMapping(), db);
+      const parents = result.tables.find((t) => t.sqlName === "parents")!;
+
+      expect(parents.incomingFks).toEqual([
+        { fromTable: "children", fromColumn: "parentId", isUnique: true },
+      ]);
+    });
+
+    it("marks an incoming FK as 1:many when its source column is not unique", () => {
+      const db = makeDbMetadata({
+        columns: [
+          makeDbColumn({ tableName: "children", columnName: "id", ordinalPosition: 1 }),
+          makeDbColumn({ tableName: "children", columnName: "parentId", ordinalPosition: 2 }),
+          makeDbColumn({ tableName: "parents", columnName: "id", ordinalPosition: 1 }),
+        ],
+        foreignKeys: [
+          { fromTable: "children", fromColumn: "parentId", toTable: "parents", toColumn: "id" },
+        ],
+        uniqueColumns: new Set(),
+      });
+
+      const result = mergeSchemas(makePrismaMapping(), db);
+      const parents = result.tables.find((t) => t.sqlName === "parents")!;
+
+      expect(parents.incomingFks).toEqual([
+        { fromTable: "children", fromColumn: "parentId", isUnique: false },
+      ]);
     });
   });
 

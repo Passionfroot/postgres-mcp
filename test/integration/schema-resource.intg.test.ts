@@ -38,18 +38,38 @@ async function checkDbAvailable() {
 
 const isDbAvailable = await checkDbAvailable();
 
+// Self-provisioned fixtures so the pipeline assertions (tables/columns/PKs > 0) hold against
+// any target DB, rather than assuming the public schema is already populated.
+const FIXTURE_PARENT = "pgmcp_res_parent";
+const FIXTURE_CHILD = "pgmcp_res_child";
+
 let connectionManager: ConnectionManager;
 
-beforeAll(() => {
-  if (isDbAvailable) {
-    connectionManager = new ConnectionManager([localSource]);
-  }
+async function createFixtures(pool: pg.Pool) {
+  await dropFixtures(pool);
+  await pool.query(`CREATE TABLE "${FIXTURE_PARENT}" (id text PRIMARY KEY, name text)`);
+  await pool.query(
+    `CREATE TABLE "${FIXTURE_CHILD}" (id text PRIMARY KEY, parent_id text REFERENCES "${FIXTURE_PARENT}"(id))`
+  );
+}
+
+async function dropFixtures(pool: pg.Pool) {
+  await pool.query(`DROP TABLE IF EXISTS "${FIXTURE_CHILD}" CASCADE`);
+  await pool.query(`DROP TABLE IF EXISTS "${FIXTURE_PARENT}" CASCADE`);
+}
+
+beforeAll(async () => {
+  if (!isDbAvailable) return;
+  connectionManager = new ConnectionManager([localSource]);
+  const pool = await connectionManager.getPool("local");
+  await createFixtures(pool);
 });
 
 afterAll(async () => {
-  if (connectionManager) {
-    await connectionManager.shutdown();
-  }
+  if (!connectionManager) return;
+  const pool = await connectionManager.getPool("local");
+  await dropFixtures(pool);
+  await connectionManager.shutdown();
 });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

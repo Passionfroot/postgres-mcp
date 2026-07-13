@@ -112,7 +112,8 @@ function dbColToMergedColumn(dbCol: DbColumn, pkColNames: Set<string>): MergedCo
 function buildMergedTable(
   tableName: string,
   model: PrismaModelMapping | null,
-  lookups: TableLookups
+  lookups: TableLookups,
+  uniqueColumns: Set<string>
 ): { table: MergedTable; warnings: DriftWarning[] } {
   const dbCols = lookups.columnsByTable.get(tableName) ?? [];
   const pks = lookups.pksByTable.get(tableName) ?? [];
@@ -167,6 +168,7 @@ function buildMergedTable(
       incomingFks: incomingFks.map((fk) => ({
         fromTable: fk.fromTable,
         fromColumn: fk.fromColumn,
+        isUnique: uniqueColumns.has(`${fk.fromTable}.${fk.fromColumn}`),
       })),
       outgoingFks: outgoingFks.map((fk) => ({
         toTable: fk.toTable,
@@ -180,9 +182,11 @@ function buildMergedTable(
 }
 
 /** Merge Prisma schema mappings with live database metadata and detect drift. */
-export function mergeSchemas(prisma: PrismaMapping, db: DbMetadata): MergedSchema {
-  const prismaFks = deriveFksFromPrisma(prisma);
+export function mergeSchemas(prisma: PrismaMapping | null, db: DbMetadata): MergedSchema {
+  const mapping = prisma ?? { models: [], enums: [] };
+  const prismaFks = deriveFksFromPrisma(mapping);
   const allFks = deduplicateFks(db.foreignKeys, prismaFks);
+  const uniqueColumns = db.uniqueColumns ?? new Set<string>();
 
   const dbTableNames = new Set(db.columns.map((c) => c.tableName));
   const lookups: TableLookups = {
@@ -190,14 +194,14 @@ export function mergeSchemas(prisma: PrismaMapping, db: DbMetadata): MergedSchem
     pksByTable: groupBy(db.primaryKeys, (pk) => pk.tableName),
     fksByFromTable: groupBy(allFks, (fk) => fk.fromTable),
     fksByToTable: groupBy(allFks, (fk) => fk.toTable),
-    prismaEnumNames: new Set(prisma.enums.map((e) => e.enumName)),
+    prismaEnumNames: new Set(mapping.enums.map((e) => e.enumName)),
   };
 
   const tables: MergedTable[] = [];
   const topLevelWarnings: DriftWarning[] = [];
   const mappedTableNames = new Set<string>();
 
-  for (const model of prisma.models) {
+  for (const model of mapping.models) {
     mappedTableNames.add(model.tableName);
 
     if (!dbTableNames.has(model.tableName)) {
@@ -209,7 +213,7 @@ export function mergeSchemas(prisma: PrismaMapping, db: DbMetadata): MergedSchem
       continue;
     }
 
-    const { table } = buildMergedTable(model.tableName, model, lookups);
+    const { table } = buildMergedTable(model.tableName, model, lookups, uniqueColumns);
     tables.push(table);
   }
 
@@ -218,7 +222,7 @@ export function mergeSchemas(prisma: PrismaMapping, db: DbMetadata): MergedSchem
     if (mappedTableNames.has(tableName)) continue;
     unmappedTables.push(tableName);
 
-    const { table } = buildMergedTable(tableName, null, lookups);
+    const { table } = buildMergedTable(tableName, null, lookups, uniqueColumns);
     tables.push(table);
   }
 

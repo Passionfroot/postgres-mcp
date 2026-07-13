@@ -37,17 +37,51 @@ WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
 ORDER BY tc.table_name, kcu.ordinal_position
 `;
 
+/**
+ * Use pg_constraint instead of information_schema for FK discovery. The information_schema
+ * views (constraint_column_usage) require ownership or REFERENCES privilege on the referenced
+ * table, so roles with only column-level SELECT grants (like zest_mcp_reader) see zero FKs.
+ * pg_constraint is visible to all roles and filtered by has_column_privilege on the FK column.
+ */
 const FOREIGN_KEYS_QUERY = `
-SELECT kcu.table_name AS from_table, kcu.column_name AS from_column,
-       ccu.table_name AS to_table, ccu.column_name AS to_column
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-JOIN information_schema.constraint_column_usage ccu
-  ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
-WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
-  AND has_column_privilege(format('%I.%I', tc.table_schema, kcu.table_name), kcu.column_name, 'SELECT')
-ORDER BY kcu.table_name, kcu.column_name
+SELECT
+  rel.relname AS from_table,
+  a.attname AS from_column,
+  frel.relname AS to_table,
+  af.attname AS to_column
+FROM pg_constraint con
+JOIN pg_class rel ON rel.oid = con.conrelid
+JOIN pg_class frel ON frel.oid = con.confrelid
+JOIN pg_namespace n ON n.oid = con.connamespace
+JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(conkey, confkey, ord) ON true
+JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = cols.conkey
+JOIN pg_attribute af ON af.attrelid = con.confrelid AND af.attnum = cols.confkey
+WHERE con.contype = 'f' AND n.nspname = 'public'
+  AND has_column_privilege(con.conrelid, a.attnum, 'SELECT')
+ORDER BY from_table, from_column, cols.ord
+`;
+
+/**
+ * Single-column uniqueness. Used to determine FK cardinality: if the FK source column is
+ * unique the relationship is 1:1, otherwise 1:many.
+ *
+ * Sourced from pg_index, not pg_constraint: Prisma emits @unique as a UNIQUE INDEX rather
+ * than a UNIQUE constraint, so constraint-only discovery misses every Prisma 1:1 relation.
+ * pg_index covers both (PKs and UNIQUE constraints are backed by unique indexes too).
+ * Excludes multi-column indexes (indnatts = 1), partial indexes (indpred), and
+ * expression indexes (indkey[0] = 0), none of which guarantee single-column uniqueness.
+ */
+const UNIQUE_COLUMNS_QUERY = `
+SELECT
+  rel.relname AS table_name,
+  a.attname AS column_name
+FROM pg_index idx
+JOIN pg_class rel ON rel.oid = idx.indrelid
+JOIN pg_namespace n ON n.oid = rel.relnamespace
+JOIN pg_attribute a ON a.attrelid = idx.indrelid AND a.attnum = idx.indkey[0]
+WHERE idx.indisunique AND idx.indnatts = 1 AND idx.indpred IS NULL
+  AND idx.indkey[0] <> 0 AND n.nspname = 'public'
+ORDER BY table_name, column_name
 `;
 
 const ENUM_VALUES_QUERY = `
@@ -88,6 +122,11 @@ interface EnumRow {
   sort_order: number;
 }
 
+interface UniqueColumnRow {
+  table_name: string;
+  column_name: string;
+}
+
 export interface IntrospectOptions {
   role?: string;
   sessionVars?: Record<string, string>;
@@ -112,14 +151,15 @@ export async function introspectDatabase(
     return introspectWithSession(pool, options!);
   }
 
-  const [columnsResult, pksResult, fksResult, enumsResult] = await Promise.all([
+  const [columnsResult, pksResult, fksResult, enumsResult, uniqueResult] = await Promise.all([
     pool.query<ColumnRow>(COLUMNS_QUERY),
     pool.query<PkRow>(PRIMARY_KEYS_QUERY),
     pool.query<FkRow>(FOREIGN_KEYS_QUERY),
     pool.query<EnumRow>(ENUM_VALUES_QUERY),
+    pool.query<UniqueColumnRow>(UNIQUE_COLUMNS_QUERY),
   ]);
 
-  return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows);
+  return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows, uniqueResult.rows);
 }
 
 async function introspectWithSession(
@@ -139,14 +179,15 @@ async function introspectWithSession(
       }
     }
 
-    const [columnsResult, pksResult, fksResult, enumsResult] = await Promise.all([
+    const [columnsResult, pksResult, fksResult, enumsResult, uniqueResult] = await Promise.all([
       client.query<ColumnRow>(COLUMNS_QUERY),
       client.query<PkRow>(PRIMARY_KEYS_QUERY),
       client.query<FkRow>(FOREIGN_KEYS_QUERY),
       client.query<EnumRow>(ENUM_VALUES_QUERY),
+      client.query<UniqueColumnRow>(UNIQUE_COLUMNS_QUERY),
     ]);
 
-    return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows);
+    return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows, uniqueResult.rows);
   } finally {
     try {
       if (options.sessionVars) {
@@ -172,7 +213,8 @@ function buildMetadata(
   columnRows: ColumnRow[],
   pkRows: PkRow[],
   fkRows: FkRow[],
-  enumRows: EnumRow[]
+  enumRows: EnumRow[],
+  uniqueRows: UniqueColumnRow[]
 ): DbMetadata {
   const columns: DbColumn[] = columnRows.map((r) => ({
     tableName: r.table_name,
@@ -203,5 +245,7 @@ function buildMetadata(
     sortOrder: r.sort_order,
   }));
 
-  return { columns, primaryKeys, foreignKeys, enumValues };
+  const uniqueColumns = new Set(uniqueRows.map((r) => `${r.table_name}.${r.column_name}`));
+
+  return { columns, primaryKeys, foreignKeys, enumValues, uniqueColumns };
 }
