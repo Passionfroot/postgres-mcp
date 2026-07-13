@@ -187,6 +187,35 @@ describe("formatSearchResults", () => {
     expect(output).toContain("messages");
   });
 
+  it("annotates a unique incoming FK as [1:1] and omits the fan-out warning", () => {
+    const tables = [
+      makeTable({
+        sqlName: "parents",
+        incomingFks: [{ fromTable: "children", fromColumn: "parentId", isUnique: true }],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    expect(output).toContain("<- children via parentId [1:1]");
+    expect(output).not.toContain("[1:many]");
+    expect(output).not.toContain("fan-out");
+  });
+
+  it("annotates a non-unique incoming FK as [1:many] and warns about fan-out", () => {
+    const tables = [
+      makeTable({
+        sqlName: "parents",
+        incomingFks: [{ fromTable: "children", fromColumn: "parentId", isUnique: false }],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    expect(output).toContain("<- children via parentId [1:many]");
+    expect(output).toContain("fan-out");
+  });
+
   it("shows 'no Prisma model' for unmapped tables", () => {
     const tables = [
       makeTable({

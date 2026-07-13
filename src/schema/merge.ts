@@ -182,8 +182,9 @@ function buildMergedTable(
 }
 
 /** Merge Prisma schema mappings with live database metadata and detect drift. */
-export function mergeSchemas(prisma: PrismaMapping, db: DbMetadata): MergedSchema {
-  const prismaFks = deriveFksFromPrisma(prisma);
+export function mergeSchemas(prisma: PrismaMapping | null, db: DbMetadata): MergedSchema {
+  const mapping = prisma ?? { models: [], enums: [] };
+  const prismaFks = deriveFksFromPrisma(mapping);
   const allFks = deduplicateFks(db.foreignKeys, prismaFks);
   const uniqueColumns = db.uniqueColumns ?? new Set<string>();
 
@@ -193,14 +194,14 @@ export function mergeSchemas(prisma: PrismaMapping, db: DbMetadata): MergedSchem
     pksByTable: groupBy(db.primaryKeys, (pk) => pk.tableName),
     fksByFromTable: groupBy(allFks, (fk) => fk.fromTable),
     fksByToTable: groupBy(allFks, (fk) => fk.toTable),
-    prismaEnumNames: new Set(prisma.enums.map((e) => e.enumName)),
+    prismaEnumNames: new Set(mapping.enums.map((e) => e.enumName)),
   };
 
   const tables: MergedTable[] = [];
   const topLevelWarnings: DriftWarning[] = [];
   const mappedTableNames = new Set<string>();
 
-  for (const model of prisma.models) {
+  for (const model of mapping.models) {
     mappedTableNames.add(model.tableName);
 
     if (!dbTableNames.has(model.tableName)) {

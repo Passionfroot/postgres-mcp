@@ -45,34 +45,42 @@ ORDER BY tc.table_name, kcu.ordinal_position
  */
 const FOREIGN_KEYS_QUERY = `
 SELECT
-  con.conrelid::regclass::text AS from_table,
+  rel.relname AS from_table,
   a.attname AS from_column,
-  con.confrelid::regclass::text AS to_table,
+  frel.relname AS to_table,
   af.attname AS to_column
 FROM pg_constraint con
-JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ANY(con.conkey)
-JOIN pg_attribute af ON af.attrelid = con.confrelid AND af.attnum = ANY(con.confkey)
+JOIN pg_class rel ON rel.oid = con.conrelid
+JOIN pg_class frel ON frel.oid = con.confrelid
 JOIN pg_namespace n ON n.oid = con.connamespace
+JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(conkey, confkey, ord) ON true
+JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = cols.conkey
+JOIN pg_attribute af ON af.attrelid = con.confrelid AND af.attnum = cols.confkey
 WHERE con.contype = 'f' AND n.nspname = 'public'
   AND has_column_privilege(con.conrelid, a.attnum, 'SELECT')
-ORDER BY from_table, from_column
+ORDER BY from_table, from_column, cols.ord
 `;
 
 /**
- * Single-column UNIQUE and PRIMARY KEY constraints. Used to determine FK cardinality:
- * if the FK source column has a UNIQUE constraint the relationship is 1:1, otherwise 1:many.
- * Multi-column constraints are excluded (array_length check) since they don't guarantee
- * single-column uniqueness.
+ * Single-column uniqueness. Used to determine FK cardinality: if the FK source column is
+ * unique the relationship is 1:1, otherwise 1:many.
+ *
+ * Sourced from pg_index, not pg_constraint: Prisma emits @unique as a UNIQUE INDEX rather
+ * than a UNIQUE constraint, so constraint-only discovery misses every Prisma 1:1 relation.
+ * pg_index covers both (PKs and UNIQUE constraints are backed by unique indexes too).
+ * Excludes multi-column indexes (indnatts = 1), partial indexes (indpred), and
+ * expression indexes (indkey[0] = 0), none of which guarantee single-column uniqueness.
  */
 const UNIQUE_COLUMNS_QUERY = `
 SELECT
-  con.conrelid::regclass::text AS table_name,
+  rel.relname AS table_name,
   a.attname AS column_name
-FROM pg_constraint con
-JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ANY(con.conkey)
-JOIN pg_namespace n ON n.oid = con.connamespace
-WHERE con.contype IN ('u', 'p') AND n.nspname = 'public'
-  AND array_length(con.conkey, 1) = 1
+FROM pg_index idx
+JOIN pg_class rel ON rel.oid = idx.indrelid
+JOIN pg_namespace n ON n.oid = rel.relnamespace
+JOIN pg_attribute a ON a.attrelid = idx.indrelid AND a.attnum = idx.indkey[0]
+WHERE idx.indisunique AND idx.indnatts = 1 AND idx.indpred IS NULL
+  AND idx.indkey[0] <> 0 AND n.nspname = 'public'
 ORDER BY table_name, column_name
 `;
 

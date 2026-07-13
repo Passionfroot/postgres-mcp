@@ -701,6 +701,50 @@ describe("mergeSchemas", () => {
     });
   });
 
+  describe("incoming FK cardinality", () => {
+    it("marks an incoming FK as 1:1 when its source column is unique", () => {
+      const db = makeDbMetadata({
+        columns: [
+          makeDbColumn({ tableName: "children", columnName: "id", ordinalPosition: 1 }),
+          makeDbColumn({ tableName: "children", columnName: "parentId", ordinalPosition: 2 }),
+          makeDbColumn({ tableName: "parents", columnName: "id", ordinalPosition: 1 }),
+        ],
+        foreignKeys: [
+          { fromTable: "children", fromColumn: "parentId", toTable: "parents", toColumn: "id" },
+        ],
+        uniqueColumns: new Set(["children.parentId"]),
+      });
+
+      const result = mergeSchemas(makePrismaMapping(), db);
+      const parents = result.tables.find((t) => t.sqlName === "parents")!;
+
+      expect(parents.incomingFks).toEqual([
+        { fromTable: "children", fromColumn: "parentId", isUnique: true },
+      ]);
+    });
+
+    it("marks an incoming FK as 1:many when its source column is not unique", () => {
+      const db = makeDbMetadata({
+        columns: [
+          makeDbColumn({ tableName: "children", columnName: "id", ordinalPosition: 1 }),
+          makeDbColumn({ tableName: "children", columnName: "parentId", ordinalPosition: 2 }),
+          makeDbColumn({ tableName: "parents", columnName: "id", ordinalPosition: 1 }),
+        ],
+        foreignKeys: [
+          { fromTable: "children", fromColumn: "parentId", toTable: "parents", toColumn: "id" },
+        ],
+        uniqueColumns: new Set(),
+      });
+
+      const result = mergeSchemas(makePrismaMapping(), db);
+      const parents = result.tables.find((t) => t.sqlName === "parents")!;
+
+      expect(parents.incomingFks).toEqual([
+        { fromTable: "children", fromColumn: "parentId", isUnique: false },
+      ]);
+    });
+  });
+
   it("sorts tables by sqlName and unmappedTables alphabetically", () => {
     const prisma = makePrismaMapping({
       models: [
