@@ -33,7 +33,7 @@
   },
   "devDependencies": {
     "@changesets/cli": "^2.27.0",
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.1.0",
     "@types/pg": "^8.16.0",
     "@types/ssh2": "^1.15.5",
     "typescript": "^5.7.0",
