@@ -3,7 +3,11 @@ const { Parser } = NodeSqlParser;
 import pg from "pg";
 
 import { logger } from "./logger.js";
-import { assertSafeGucName, escapeIdentifier, escapeLiteral } from "./sql-helpers.js";
+import {
+  assertSafeGucName,
+  escapeIdentifier,
+  escapeLiteral,
+} from "./sql-helpers.js";
 
 export interface QueryResult {
   rows: Record<string, unknown>[];
@@ -28,6 +32,88 @@ const PG_OPT = { database: "PostgreSQL" } as const;
 
 const HAS_LIMIT_RE = /\bLIMIT\s+\d/i;
 const STARTS_WITH_EXPLAIN_RE = /^\s*EXPLAIN\b/i;
+
+// Functions that change the session role or a GUC. Blocked when a source pins its
+// tenant scope via role/session_vars, because calling them from a submitted query
+// overrides that scope (e.g. set_config('app.partner_id', <other tenant>, false)).
+const SESSION_MUTATING_FUNCTIONS = new Set([
+  "set_config",
+  "set_role",
+  "set_user",
+]);
+
+// Backstop for what the AST walk can miss: SET ROLE / RESET ROLE do not parse at
+// all (so astify throws), and this catches the setter functions and the command
+// forms before we even reach the parser. String literals containing these tokens
+// fail closed, which is the safe direction for a read-only guard.
+const SESSION_MUTATION_RE =
+  /\b(?:set_config|set_role|set_user)\s*\(|^\s*(?:set|reset)\b/i;
+
+export class SessionMutationError extends Error {
+  constructor() {
+    super(
+      "This source only allows read-only SELECT queries. Statements that change " +
+        "the role or session settings (SET, RESET, SET ROLE, set_config, set_role) " +
+        "are not permitted. Rewrite it as a plain SELECT."
+    );
+    this.name = "SessionMutationError";
+  }
+}
+
+function collectFunctionNames(node: unknown, acc: Set<string>): void {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectFunctionNames(item, acc);
+    return;
+  }
+  const obj = node as Record<string, unknown>;
+  if (obj.type === "function") {
+    const nameNode = obj.name as
+      | { name?: Array<{ value?: string }> }
+      | undefined;
+    const parts = nameNode?.name;
+    const fnName = Array.isArray(parts)
+      ? parts[parts.length - 1]?.value
+      : undefined;
+    if (typeof fnName === "string") acc.add(fnName.toLowerCase());
+  }
+  for (const key of Object.keys(obj)) collectFunctionNames(obj[key], acc);
+}
+
+/**
+ * Reject any submitted SQL that could change the session's role or GUCs, so a
+ * source whose tenant scope rides on role/session_vars cannot have that scope
+ * rewritten from a query. Enforced independently of the AST-shape checks: the
+ * regex backstop catches the command forms the parser rejects, and a parse
+ * failure fails closed rather than falling through to the regex LIMIT path.
+ */
+export function assertReadOnlyQuery(sql: string): void {
+  if (SESSION_MUTATION_RE.test(sql)) {
+    throw new SessionMutationError();
+  }
+
+  let raw;
+  try {
+    raw = parser.astify(sql, PG_OPT);
+  } catch {
+    throw new Error(
+      "This source only allows read-only SELECT queries, and this statement could " +
+        "not be parsed to verify that. Rewrite it as a plain SELECT."
+    );
+  }
+
+  const statements = Array.isArray(raw) ? raw : [raw];
+  for (const ast of statements) {
+    if (!ast || (ast as { type?: string }).type !== "select") {
+      throw new SessionMutationError();
+    }
+    const fns = new Set<string>();
+    collectFunctionNames(ast, fns);
+    for (const fn of fns) {
+      if (SESSION_MUTATING_FUNCTIONS.has(fn)) throw new SessionMutationError();
+    }
+  }
+}
 
 /**
  * Parse the SQL, and if it's a single SELECT without a LIMIT, append one.
@@ -96,6 +182,7 @@ export function formatPgError(err: PgErrorLike) {
 export interface ExecuteQueryOptions {
   readonly: boolean;
   allowMultiStatements: boolean;
+  restrictSessionState?: boolean;
   role?: string;
   sessionVars?: Record<string, string>;
   expandStar?: (sql: string) => string;
@@ -107,6 +194,10 @@ export async function executeQuery(
   maxRows: number,
   options: ExecuteQueryOptions
 ): Promise<QueryResult> {
+  if (options.restrictSessionState) {
+    assertReadOnlyQuery(sql);
+  }
+
   const expandedSql = options.expandStar ? options.expandStar(sql) : sql;
   const limitedSql = ensureLimit(
     expandedSql,
@@ -156,8 +247,8 @@ export async function executeQuery(
     if (err.code === "42501") {
       throw new Error(
         formatPgError(err) +
-        "\n\nPermission denied. Use search_objects to check which columns are accessible, " +
-        "then list them explicitly in your query."
+          "\n\nPermission denied. Use search_objects to check which columns are accessible, " +
+          "then list them explicitly in your query."
       );
     }
 
@@ -177,11 +268,19 @@ export async function executeQuery(
         await client.query("RESET ROLE");
       }
     } catch (cleanupErr) {
-      logger.warn("Failed to reset RLS session state; connection may be discarded by pool", {
-        error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
-        role: options.role ?? "",
-        sessionVarKeys: options.sessionVars ? Object.keys(options.sessionVars).join(", ") : "",
-      });
+      logger.warn(
+        "Failed to reset RLS session state; connection may be discarded by pool",
+        {
+          error:
+            cleanupErr instanceof Error
+              ? cleanupErr.message
+              : String(cleanupErr),
+          role: options.role ?? "",
+          sessionVarKeys: options.sessionVars
+            ? Object.keys(options.sessionVars).join(", ")
+            : "",
+        }
+      );
     }
     client.release();
   }

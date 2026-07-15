@@ -34,7 +34,9 @@ export function createServer(
 
   const sourceIds = config.sources.map((s) => s.id);
 
-  const readonlySources = config.sources.filter((s) => s.readonly).map((s) => s.id);
+  const readonlySources = config.sources
+    .filter((s) => s.readonly)
+    .map((s) => s.id);
   const readonlyNote =
     readonlySources.length > 0
       ? ` Sources configured as read-only: ${readonlySources.join(", ")}.`
@@ -46,7 +48,9 @@ export function createServer(
       title: "Execute SQL",
       description: `Execute SQL against a configured PostgreSQL database. Returns JSON rows.${readonlyNote}`,
       inputSchema: {
-        database: z.string().describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
+        database: z
+          .string()
+          .describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
         query: z.string().describe("SQL query to execute"),
       },
     },
@@ -65,6 +69,7 @@ export function createServer(
         const result = await executeQuery(pool, query, source.maxRows, {
           readonly: source.readonly,
           allowMultiStatements: source.allowMultiStatements,
+          restrictSessionState: source.restrictSessionState,
           role: source.role,
           sessionVars: source.sessionVars,
           expandStar: (sql) => expandStarColumns(sql, schema),
@@ -81,7 +86,9 @@ export function createServer(
         return mcpTextResult(JSON.stringify(result, null, 2));
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        logger.error(`execute_sql error for database "${database}": ${message}`);
+        logger.error(
+          `execute_sql error for database "${database}": ${message}`
+        );
 
         auditLog.log({
           source: database,

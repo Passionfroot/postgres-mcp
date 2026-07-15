@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { ensureLimit, executeQuery, formatPgError } from "../src/query.js";
+import {
+  assertReadOnlyQuery,
+  ensureLimit,
+  executeQuery,
+  formatPgError,
+  SessionMutationError,
+} from "../src/query.js";
 
 describe("ensureLimit", () => {
   it("adds LIMIT to a simple SELECT", () => {
@@ -41,7 +47,8 @@ describe("ensureLimit", () => {
   });
 
   it("handles CTE (WITH) queries", () => {
-    const sql = "WITH active AS (SELECT * FROM users WHERE active = true) SELECT * FROM active";
+    const sql =
+      "WITH active AS (SELECT * FROM users WHERE active = true) SELECT * FROM active";
     const result = ensureLimit(sql, 100, false);
     expect(result).toMatch(/LIMIT 100/i);
   });
@@ -91,7 +98,9 @@ describe("formatPgError", () => {
       message: 'syntax error at or near "SELCT"',
     });
 
-    expect(result).toBe('PostgreSQL error 42601: syntax error at or near "SELCT"');
+    expect(result).toBe(
+      'PostgreSQL error 42601: syntax error at or near "SELCT"'
+    );
   });
 
   it("includes position when present", () => {
@@ -127,6 +136,92 @@ describe("formatPgError", () => {
   });
 });
 
+describe("assertReadOnlyQuery", () => {
+  it("allows a plain SELECT", () => {
+    expect(() =>
+      assertReadOnlyQuery("SELECT * FROM collaborations WHERE id = 1")
+    ).not.toThrow();
+  });
+
+  it("allows a CTE that only reads", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "WITH c AS (SELECT id FROM collaborations) SELECT count(*) FROM c"
+      )
+    ).not.toThrow();
+  });
+
+  it("allows current_setting (a read)", () => {
+    expect(() =>
+      assertReadOnlyQuery("SELECT current_setting('app.partner_id', true)")
+    ).not.toThrow();
+  });
+
+  it("blocks set_config()", () => {
+    expect(() =>
+      assertReadOnlyQuery("SELECT set_config('app.partner_id', 'other', false)")
+    ).toThrow(SessionMutationError);
+  });
+
+  it("blocks set_config() hidden inside a CTE", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "WITH x AS (SELECT set_config('app.partner_id', 'other', false)) SELECT count(*) FROM collaborations, x"
+      )
+    ).toThrow(SessionMutationError);
+  });
+
+  it("blocks set_config() in a subquery", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "SELECT * FROM t WHERE id = (SELECT set_role('postgres'))"
+      )
+    ).toThrow(SessionMutationError);
+  });
+
+  it("blocks schema-qualified pg_catalog.set_config()", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "SELECT pg_catalog.set_config('role', 'postgres', false)"
+      )
+    ).toThrow(SessionMutationError);
+  });
+
+  it("blocks the SET command", () => {
+    expect(() => assertReadOnlyQuery("SET app.partner_id = 'other'")).toThrow(
+      SessionMutationError
+    );
+  });
+
+  it("blocks SET ROLE (which the parser cannot parse)", () => {
+    expect(() => assertReadOnlyQuery("SET ROLE zest_mcp_reader")).toThrow(
+      SessionMutationError
+    );
+  });
+
+  it("blocks RESET ROLE", () => {
+    expect(() => assertReadOnlyQuery("RESET ROLE")).toThrow(
+      SessionMutationError
+    );
+  });
+
+  it("blocks RESET of a GUC", () => {
+    expect(() => assertReadOnlyQuery("RESET app.partner_id")).toThrow(
+      SessionMutationError
+    );
+  });
+
+  it("fails closed on unparseable SQL", () => {
+    expect(() => assertReadOnlyQuery("SELECT FROM WHERE ((")).toThrow();
+  });
+
+  it("rejects a non-SELECT statement", () => {
+    expect(() =>
+      assertReadOnlyQuery("UPDATE collaborations SET name = 'x'")
+    ).toThrow(SessionMutationError);
+  });
+});
+
 describe("executeQuery", () => {
   function createMockPool(queryFn: ReturnType<typeof vi.fn>) {
     const client = {
@@ -137,11 +232,50 @@ describe("executeQuery", () => {
       connect: vi.fn().mockResolvedValue(client),
       _client: client,
     } as unknown as import("pg").Pool & {
-      _client: { query: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> };
+      _client: {
+        query: ReturnType<typeof vi.fn>;
+        release: ReturnType<typeof vi.fn>;
+      };
     };
   }
 
   const defaultOptions = { readonly: false, allowMultiStatements: false };
+
+  it("rejects a session-mutating query before connecting when restrictSessionState is on", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [] });
+    const pool = createMockPool(queryFn);
+
+    await expect(
+      executeQuery(
+        pool,
+        "SELECT set_config('app.partner_id', 'other', false)",
+        100,
+        {
+          ...defaultOptions,
+          restrictSessionState: true,
+        }
+      )
+    ).rejects.toThrow(SessionMutationError);
+
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it("allows a session-mutating query when restrictSessionState is off", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(
+      pool,
+      "SELECT set_config('app.partner_id', 'other', false)",
+      100,
+      {
+        ...defaultOptions,
+        restrictSessionState: false,
+      }
+    );
+
+    expect(pool.connect).toHaveBeenCalled();
+  });
 
   it("adds LIMIT to queries without one", async () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
@@ -157,7 +291,12 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
     const pool = createMockPool(queryFn);
 
-    await executeQuery(pool, "SELECT * FROM users LIMIT 5", 100, defaultOptions);
+    await executeQuery(
+      pool,
+      "SELECT * FROM users LIMIT 5",
+      100,
+      defaultOptions
+    );
 
     const calledSql = queryFn.mock.calls[0][0] as string;
     expect(calledSql).toMatch(/LIMIT 5/i);
@@ -169,7 +308,12 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows });
     const pool = createMockPool(queryFn);
 
-    const result = await executeQuery(pool, "SELECT * FROM users", 10, defaultOptions);
+    const result = await executeQuery(
+      pool,
+      "SELECT * FROM users",
+      10,
+      defaultOptions
+    );
 
     expect(result.truncated).toBe(true);
     expect(result.rowCount).toBe(10);
@@ -181,7 +325,12 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows });
     const pool = createMockPool(queryFn);
 
-    const result = await executeQuery(pool, "SELECT * FROM users", 10, defaultOptions);
+    const result = await executeQuery(
+      pool,
+      "SELECT * FROM users",
+      10,
+      defaultOptions
+    );
 
     expect(result.truncated).toBe(false);
     expect(result.rowCount).toBe(3);
@@ -192,10 +341,15 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
     const pool = createMockPool(queryFn);
 
-    await executeQuery(pool, "SELECT 1", 10, { readonly: true, allowMultiStatements: false });
+    await executeQuery(pool, "SELECT 1", 10, {
+      readonly: true,
+      allowMultiStatements: false,
+    });
 
     expect(queryFn).toHaveBeenCalledTimes(2);
-    expect(queryFn.mock.calls[0][0]).toBe("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+    expect(queryFn.mock.calls[0][0]).toBe(
+      "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+    );
     expect(queryFn.mock.calls[1][0]).toMatch(/SELECT/);
   });
 
@@ -215,7 +369,8 @@ describe("executeQuery", () => {
     await executeQuery(pool, "SELECT 1", 10, defaultOptions);
 
     expect(
-      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client.release
+      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })
+        ._client.release
     ).toHaveBeenCalledTimes(1);
   });
 
@@ -227,10 +382,13 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockRejectedValue(pgError);
     const pool = createMockPool(queryFn);
 
-    await expect(executeQuery(pool, "SELECT * FROM xyz", 100, defaultOptions)).rejects.toThrow();
+    await expect(
+      executeQuery(pool, "SELECT * FROM xyz", 100, defaultOptions)
+    ).rejects.toThrow();
 
     expect(
-      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client.release
+      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })
+        ._client.release
     ).toHaveBeenCalledTimes(1);
   });
 
@@ -242,9 +400,9 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockRejectedValue(pgError);
     const pool = createMockPool(queryFn);
 
-    await expect(executeQuery(pool, "SELECT * FROM xyz", 100, defaultOptions)).rejects.toThrow(
-      'PostgreSQL error 42P01: relation "xyz" does not exist'
-    );
+    await expect(
+      executeQuery(pool, "SELECT * FROM xyz", 100, defaultOptions)
+    ).rejects.toThrow('PostgreSQL error 42P01: relation "xyz" does not exist');
   });
 
   it("sets role before executing query and resets after", async () => {
@@ -272,7 +430,9 @@ describe("executeQuery", () => {
       sessionVars: { "app.current_tenant_id": "tenant_123" },
     });
 
-    expect(queryFn.mock.calls[0][0]).toBe("SET app.current_tenant_id = 'tenant_123'");
+    expect(queryFn.mock.calls[0][0]).toBe(
+      "SET app.current_tenant_id = 'tenant_123'"
+    );
     expect(queryFn.mock.calls[1][0]).toMatch(/SELECT/);
     expect(queryFn.mock.calls[2][0]).toBe("RESET app.current_tenant_id");
   });
@@ -291,7 +451,9 @@ describe("executeQuery", () => {
     // Order: SET ROLE, SET session var, SET readonly, query
     expect(queryFn.mock.calls[0][0]).toBe('SET ROLE "mcp_reader"');
     expect(queryFn.mock.calls[1][0]).toBe("SET app.tenant_id = 't_1'");
-    expect(queryFn.mock.calls[2][0]).toBe("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+    expect(queryFn.mock.calls[2][0]).toBe(
+      "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+    );
     expect(queryFn.mock.calls[3][0]).toMatch(/SELECT/);
     // Cleanup: RESET session var, RESET ROLE
     expect(queryFn.mock.calls[4][0]).toBe("RESET app.tenant_id");
@@ -299,13 +461,18 @@ describe("executeQuery", () => {
   });
 
   it("identifies timeout errors with actionable message", async () => {
-    const timeoutError = Object.assign(new Error("canceling statement due to statement timeout"), {
-      code: "57014",
-    });
+    const timeoutError = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      {
+        code: "57014",
+      }
+    );
     const queryFn = vi.fn().mockRejectedValue(timeoutError);
     const pool = createMockPool(queryFn);
 
-    await expect(executeQuery(pool, "SELECT pg_sleep(999)", 100, defaultOptions)).rejects.toThrow(
+    await expect(
+      executeQuery(pool, "SELECT pg_sleep(999)", 100, defaultOptions)
+    ).rejects.toThrow(
       "Query timed out. Simplify the query or add more specific WHERE conditions."
     );
   });
