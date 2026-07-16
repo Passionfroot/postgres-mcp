@@ -241,6 +241,36 @@ describe("assertReadOnlyQuery", () => {
   ])("blocks %s in a SELECT", (_label, sql) => {
     expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
   });
+
+  // Writes that parse as a top-level `select` (data-modifying CTE, SELECT INTO).
+  it.each([
+    [
+      "UPDATE CTE",
+      "WITH x AS (UPDATE t SET a = 1 RETURNING id) SELECT * FROM x",
+    ],
+    [
+      "INSERT CTE",
+      "WITH x AS (INSERT INTO t(a) VALUES (1) RETURNING id) SELECT * FROM x",
+    ],
+    ["DELETE CTE", "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x"],
+    [
+      "write CTE among reads",
+      "WITH a AS (SELECT 1), b AS (UPDATE t SET x = 1 RETURNING id) SELECT * FROM a, b",
+    ],
+    ["SELECT INTO", "SELECT * INTO newtab FROM t"],
+  ])("blocks %s (write hidden in a SELECT)", (_label, sql) => {
+    // Blocked either by the write-statement walk or, for statements the parser can't
+    // parse (e.g. a DELETE CTE), by the fail-closed parse path.
+    expect(() => assertReadOnlyQuery(sql)).toThrow();
+  });
+
+  it("allows a read-only CTE with multiple SELECT clauses", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b"
+      )
+    ).not.toThrow();
+  });
 });
 
 describe("executeQuery", () => {

@@ -72,6 +72,41 @@ export class ReadOnlyQueryError extends Error {
   }
 }
 
+// Statement types that write. A top-level one is caught by the `type !== "select"` check, but they
+// also hide inside a SELECT: a data-modifying CTE (`WITH x AS (UPDATE ... RETURNING) SELECT * FROM x`)
+// parses as a top-level `select`, so we walk the whole tree for any of these.
+const WRITE_STATEMENT_TYPES = new Set([
+  "insert",
+  "update",
+  "delete",
+  "replace",
+  "merge",
+  "create",
+  "drop",
+  "alter",
+  "truncate",
+  "rename",
+  "grant",
+  "revoke",
+  "call",
+  "set",
+]);
+
+function hasWriteStatement(node: unknown): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (Array.isArray(node)) return node.some(hasWriteStatement);
+  const obj = node as Record<string, unknown>;
+  if (typeof obj.type === "string" && WRITE_STATEMENT_TYPES.has(obj.type)) {
+    return true;
+  }
+  // SELECT ... INTO <table> creates a table.
+  if (obj.type === "select") {
+    const into = obj.into as { expr?: unknown } | undefined;
+    if (into?.expr) return true;
+  }
+  return Object.keys(obj).some((key) => hasWriteStatement(obj[key]));
+}
+
 function collectFunctionNames(node: unknown, acc: Set<string>): void {
   if (!node || typeof node !== "object") return;
   if (Array.isArray(node)) {
@@ -120,6 +155,10 @@ export function assertReadOnlyQuery(sql: string): void {
   const statements = Array.isArray(raw) ? raw : [raw];
   for (const ast of statements) {
     if (!ast || (ast as { type?: string }).type !== "select") {
+      throw new ReadOnlyQueryError();
+    }
+    // Catch writes hidden inside a top-level SELECT: a data-modifying CTE or SELECT INTO.
+    if (hasWriteStatement(ast)) {
       throw new ReadOnlyQueryError();
     }
     const fns = new Set<string>();
