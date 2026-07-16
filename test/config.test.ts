@@ -53,7 +53,7 @@ ssh_key = "/absolute/path/to/key.pem"
       timeout: 60,
       poolMax: 1,
       allowMultiStatements: false,
-      restrictSessionState: false,
+      readOnlyQueries: false,
       role: undefined,
       sessionVars: undefined,
       sshHost: "bastion.example.com",
@@ -236,17 +236,17 @@ dsn = "postgres://localhost/db"
     expect(config.sources[0].sessionVars).toBeUndefined();
   });
 
-  it("defaults restrictSessionState off for a plain source", () => {
+  it("defaults readOnlyQueries off for a plain source", () => {
     const toml = `
 [[sources]]
 id = "local"
 dsn = "postgres://localhost/db"
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.sources[0].restrictSessionState).toBe(false);
+    expect(config.sources[0].readOnlyQueries).toBe(false);
   });
 
-  it("defaults restrictSessionState on when role pins the source", () => {
+  it("defaults readOnlyQueries on when role pins the source", () => {
     const toml = `
 [[sources]]
 id = "tenant"
@@ -254,10 +254,10 @@ dsn = "postgres://localhost/db"
 role = "zest_mcp_reader"
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.sources[0].restrictSessionState).toBe(true);
+    expect(config.sources[0].readOnlyQueries).toBe(true);
   });
 
-  it("defaults restrictSessionState on when session_vars pin the source", () => {
+  it("defaults readOnlyQueries on when session_vars pin the source", () => {
     const toml = `
 [[sources]]
 id = "tenant"
@@ -265,19 +265,19 @@ dsn = "postgres://localhost/db"
 session_vars = { "app.partner_id" = "p1" }
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.sources[0].restrictSessionState).toBe(true);
+    expect(config.sources[0].readOnlyQueries).toBe(true);
   });
 
-  it("lets an explicit restrict_session_state override the default", () => {
+  it("lets an explicit read_only_queries override the default", () => {
     const toml = `
 [[sources]]
 id = "tenant"
 dsn = "postgres://localhost/db"
 role = "zest_mcp_reader"
-restrict_session_state = false
+read_only_queries = false
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.sources[0].restrictSessionState).toBe(false);
+    expect(config.sources[0].readOnlyQueries).toBe(false);
   });
 
   it("parses multiple sources", () => {

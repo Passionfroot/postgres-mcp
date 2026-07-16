@@ -102,14 +102,14 @@ Returns a lean relationship map: all tables, their Prisma model names, and FK co
 | `max_rows`               | `1000`     | Maximum rows returned per query (auto-appended as LIMIT)                              |
 | `pool_max`               | `1`        | Maximum connections in the pool                                                       |
 | `allow_multi_statements` | `false`    | Allow semicolon-separated multi-statement queries                                     |
-| `restrict_session_state` | see below  | Reject submitted queries that run `SET` / `RESET` / `set_config` / `set_role`. Defaults to `true` when `role` or `session_vars` is set, else `false` |
+| `read_only_queries`      | see below  | Answer only read-only `SELECT` queries; reject everything else. Defaults to `true` when `role` or `session_vars` is set, else `false` |
 | `role`                   | —          | `SET ROLE` to this role for each query (e.g. a restricted RLS reader)                 |
 | `session_vars`           | —          | GUCs to `SET` per query, e.g. `{ "app.tenant_id" = "$TENANT_ID" }`, read by RLS policies |
 | `ssh_host`               | —          | SSH bastion hostname for tunneled connections                                         |
 | `ssh_user`               | —          | SSH username                                                                          |
 | `ssh_key`                | —          | Path to SSH private key (supports `~` expansion)                                      |
 
-#### Tenant isolation and `restrict_session_state`
+#### Tenant isolation and `read_only_queries`
 
 When a source scopes data to one tenant with `role` + `session_vars` (an RLS reader
 plus a GUC like `app.tenant_id` that the policies read), that scope is only as strong
@@ -124,12 +124,15 @@ RESET ROLE;  -- drops back to the connecting role
 ```
 
 Postgres cannot lock a custom GUC (parameter ACLs are not enforced on placeholder
-GUCs), so this is blocked at the query layer instead. With `restrict_session_state`
-on, the server parses each submitted query and rejects anything that is not a plain
-read: `SET`, `RESET`, `SET ROLE`, and `set_config` / `set_role` calls anywhere in the
-statement (including inside CTEs and subqueries). A query it cannot parse is rejected
-rather than run. It defaults on for any source that uses `role` or `session_vars`;
-set it to `false` for a local source where you want free-form session control.
+GUCs), so this is enforced at the query layer instead. `read_only_queries` is an
+allowlist: it answers only read-only `SELECT`s and rejects everything else — every
+non-SELECT statement (`SET`, `RESET`, `SET ROLE`, `COPY`, `DO`, `CALL`, DML, DDL,
+transaction control), any call to a role/GUC setter (`set_config`, `set_role`) or a
+server-side file/program/large-object function anywhere in the statement (including
+CTEs and subqueries), and any query it cannot parse (which fails closed rather than
+run). This is distinct from `readonly`, which only wraps each query in a read-only
+transaction. It defaults on for any source that uses `role` or `session_vars`; set it
+to `false` for a local source where you want free-form access.
 
 ### Global options
 

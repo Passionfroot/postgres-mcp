@@ -13,10 +13,10 @@ readonly = true
 # ssh_key = "~/.ssh/key.pem"
 
 # Per-tenant: RLS-scoped via a restricted role + a session GUC the policies read.
-# Because the tenant scope lives in role/session_vars, restrict_session_state
-# defaults to true here: submitted queries that run SET / RESET / set_config /
-# set_role are rejected, so a query cannot re-point app.tenant_id at another tenant
-# or escape the role. Leave it on for any tenant-scoped source.
+# Because the tenant scope lives in role/session_vars, read_only_queries defaults
+# to true here: only read-only SELECTs are answered, so a submitted query cannot
+# re-point app.tenant_id at another tenant, escape the role, or reach server-side
+# files. Leave it on for any tenant-scoped source.
 [[sources]]
 id = "tenant"
 dsn = "postgres://$DB_USER:$DB_PASS@db-host:5432/mydb?sslmode=require"
@@ -25,7 +25,7 @@ role = "tenant_reader"
 session_vars = { "app.tenant_id" = "$TENANT_ID" }
 
 # Local: relaxed defaults for development. No role/session_vars, so
-# restrict_session_state defaults to false and free-form SET is allowed. Set it
+# read_only_queries defaults to false and free-form SQL is allowed. Set it
 # explicitly to false to keep that even if you add a role locally.
 [[sources]]
 id = "local"
@@ -33,7 +33,7 @@ dsn = "postgres://localhost/mydb"
 timeout = 30
 pool_max = 3
 allow_multi_statements = true
-restrict_session_state = false
+read_only_queries = false
 
 # Audit log (optional) — logs all queries across all sources as JSONL
 # [audit_log]

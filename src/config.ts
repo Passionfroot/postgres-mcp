@@ -14,11 +14,12 @@ export const sourceConfigSchema = z.object({
   timeout: z.number().positive().optional().default(10),
   pool_max: z.number().int().positive().optional().default(1),
   allow_multi_statements: z.boolean().optional().default(false),
-  // Reject queries that change the role or session GUCs (SET, RESET, set_config,
-  // set_role). Defaults to on for any source that pins its tenant scope via role
-  // or session_vars, since a submitted query could otherwise rewrite that scope.
-  // Set false to allow free-form session control (e.g. a local dev source).
-  restrict_session_state: z.boolean().optional(),
+  // Answer only read-only SELECT queries: reject SET/RESET/SET ROLE, non-SELECT
+  // statements, and server-side file/program access. Defaults on for any source
+  // that pins its tenant scope via role or session_vars, since a submitted query
+  // could otherwise re-point that scope or leave the restricted role. Set false to
+  // allow free-form access (e.g. a local dev source).
+  read_only_queries: z.boolean().optional(),
   role: z.string().min(1).optional(),
   session_vars: z.record(z.string().min(1), z.string()).optional(),
   ssh_host: z.string().optional(),
@@ -80,8 +81,8 @@ function toSourceConfig(raw: z.infer<typeof sourceConfigSchema>): SourceConfig {
     timeout: raw.timeout,
     poolMax: raw.pool_max,
     allowMultiStatements: raw.allow_multi_statements,
-    restrictSessionState:
-      raw.restrict_session_state ?? Boolean(raw.role || raw.session_vars),
+    readOnlyQueries:
+      raw.read_only_queries ?? Boolean(raw.role || raw.session_vars),
     role: raw.role,
     sessionVars,
     sshHost: raw.ssh_host,

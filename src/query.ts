@@ -33,30 +33,42 @@ const PG_OPT = { database: "PostgreSQL" } as const;
 const HAS_LIMIT_RE = /\bLIMIT\s+\d/i;
 const STARTS_WITH_EXPLAIN_RE = /^\s*EXPLAIN\b/i;
 
-// Functions that change the session role or a GUC. Blocked when a source pins its
-// tenant scope via role/session_vars, because calling them from a submitted query
-// overrides that scope (e.g. set_config('app.partner_id', <other tenant>, false)).
-const SESSION_MUTATING_FUNCTIONS = new Set([
+// Functions that mutate session state or reach outside the row set, blocked even
+// inside an otherwise-valid SELECT (a plain-statement allowlist can't catch these,
+// since they hide in the projection or a subquery). The role/GUC setters are the
+// tenant-isolation ones (set_config('app.partner_id', <other tenant>, false)); the
+// rest are server-side file/program/large-object/remote-connection reach that an
+// unprivileged reader shouldn't be issuing regardless.
+const DANGEROUS_FUNCTIONS = new Set([
   "set_config",
   "set_role",
   "set_user",
+  "pg_read_file",
+  "pg_read_binary_file",
+  "pg_ls_dir",
+  "pg_stat_file",
+  "lo_import",
+  "lo_export",
+  "dblink",
+  "dblink_exec",
 ]);
 
 // Backstop for what the AST walk can miss: SET ROLE / RESET ROLE do not parse at
-// all (so astify throws), and this catches the setter functions and the command
-// forms before we even reach the parser. String literals containing these tokens
+// all (so astify throws), and this catches the role/GUC setter functions and the
+// command forms before the parser runs. String literals containing these tokens
 // fail closed, which is the safe direction for a read-only guard.
 const SESSION_MUTATION_RE =
   /\b(?:set_config|set_role|set_user)\s*\(|^\s*(?:set|reset)\b/i;
 
-export class SessionMutationError extends Error {
+export class ReadOnlyQueryError extends Error {
   constructor() {
     super(
-      "This source only allows read-only SELECT queries. Statements that change " +
-        "the role or session settings (SET, RESET, SET ROLE, set_config, set_role) " +
-        "are not permitted. Rewrite it as a plain SELECT."
+      "This source only answers read-only SELECT queries. Statements that change " +
+        "the role or session (SET, RESET, SET ROLE, set_config), non-SELECT " +
+        "statements, and server-side file/program access are not permitted. " +
+        "Rewrite it as a plain SELECT."
     );
-    this.name = "SessionMutationError";
+    this.name = "ReadOnlyQueryError";
   }
 }
 
@@ -81,15 +93,18 @@ function collectFunctionNames(node: unknown, acc: Set<string>): void {
 }
 
 /**
- * Reject any submitted SQL that could change the session's role or GUCs, so a
- * source whose tenant scope rides on role/session_vars cannot have that scope
- * rewritten from a query. Enforced independently of the AST-shape checks: the
- * regex backstop catches the command forms the parser rejects, and a parse
- * failure fails closed rather than falling through to the regex LIMIT path.
+ * Allow only read-only SELECT queries. Everything else is rejected: any non-SELECT
+ * statement (SET, RESET, COPY, DO, CALL, DML, DDL, transaction control), any query
+ * that calls a dangerous function (role/GUC setters, file/program/large-object
+ * access), and any query the parser cannot verify. This is an allowlist, not a
+ * denylist of specific commands. A source whose tenant scope rides on
+ * role/session_vars needs it so a submitted query cannot re-point the scope or
+ * leave the restricted role. A parse failure fails closed rather than falling
+ * through to the regex LIMIT path.
  */
 export function assertReadOnlyQuery(sql: string): void {
   if (SESSION_MUTATION_RE.test(sql)) {
-    throw new SessionMutationError();
+    throw new ReadOnlyQueryError();
   }
 
   let raw;
@@ -97,7 +112,7 @@ export function assertReadOnlyQuery(sql: string): void {
     raw = parser.astify(sql, PG_OPT);
   } catch {
     throw new Error(
-      "This source only allows read-only SELECT queries, and this statement could " +
+      "This source only answers read-only SELECT queries, and this statement could " +
         "not be parsed to verify that. Rewrite it as a plain SELECT."
     );
   }
@@ -105,12 +120,12 @@ export function assertReadOnlyQuery(sql: string): void {
   const statements = Array.isArray(raw) ? raw : [raw];
   for (const ast of statements) {
     if (!ast || (ast as { type?: string }).type !== "select") {
-      throw new SessionMutationError();
+      throw new ReadOnlyQueryError();
     }
     const fns = new Set<string>();
     collectFunctionNames(ast, fns);
     for (const fn of fns) {
-      if (SESSION_MUTATING_FUNCTIONS.has(fn)) throw new SessionMutationError();
+      if (DANGEROUS_FUNCTIONS.has(fn)) throw new ReadOnlyQueryError();
     }
   }
 }
@@ -182,7 +197,7 @@ export function formatPgError(err: PgErrorLike) {
 export interface ExecuteQueryOptions {
   readonly: boolean;
   allowMultiStatements: boolean;
-  restrictSessionState?: boolean;
+  readOnlyQueries?: boolean;
   role?: string;
   sessionVars?: Record<string, string>;
   expandStar?: (sql: string) => string;
@@ -194,7 +209,7 @@ export async function executeQuery(
   maxRows: number,
   options: ExecuteQueryOptions
 ): Promise<QueryResult> {
-  if (options.restrictSessionState) {
+  if (options.readOnlyQueries) {
     assertReadOnlyQuery(sql);
   }
 

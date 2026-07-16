@@ -69,7 +69,7 @@ export function createServer(
         const result = await executeQuery(pool, query, source.maxRows, {
           readonly: source.readonly,
           allowMultiStatements: source.allowMultiStatements,
-          restrictSessionState: source.restrictSessionState,
+          readOnlyQueries: source.readOnlyQueries,
           role: source.role,
           sessionVars: source.sessionVars,
           expandStar: (sql) => expandStarColumns(sql, schema),

@@ -5,7 +5,7 @@ import {
   ensureLimit,
   executeQuery,
   formatPgError,
-  SessionMutationError,
+  ReadOnlyQueryError,
 } from "../src/query.js";
 
 describe("ensureLimit", () => {
@@ -160,7 +160,7 @@ describe("assertReadOnlyQuery", () => {
   it("blocks set_config()", () => {
     expect(() =>
       assertReadOnlyQuery("SELECT set_config('app.partner_id', 'other', false)")
-    ).toThrow(SessionMutationError);
+    ).toThrow(ReadOnlyQueryError);
   });
 
   it("blocks set_config() hidden inside a CTE", () => {
@@ -168,7 +168,7 @@ describe("assertReadOnlyQuery", () => {
       assertReadOnlyQuery(
         "WITH x AS (SELECT set_config('app.partner_id', 'other', false)) SELECT count(*) FROM collaborations, x"
       )
-    ).toThrow(SessionMutationError);
+    ).toThrow(ReadOnlyQueryError);
   });
 
   it("blocks set_config() in a subquery", () => {
@@ -176,7 +176,7 @@ describe("assertReadOnlyQuery", () => {
       assertReadOnlyQuery(
         "SELECT * FROM t WHERE id = (SELECT set_role('postgres'))"
       )
-    ).toThrow(SessionMutationError);
+    ).toThrow(ReadOnlyQueryError);
   });
 
   it("blocks schema-qualified pg_catalog.set_config()", () => {
@@ -184,30 +184,28 @@ describe("assertReadOnlyQuery", () => {
       assertReadOnlyQuery(
         "SELECT pg_catalog.set_config('role', 'postgres', false)"
       )
-    ).toThrow(SessionMutationError);
+    ).toThrow(ReadOnlyQueryError);
   });
 
   it("blocks the SET command", () => {
     expect(() => assertReadOnlyQuery("SET app.partner_id = 'other'")).toThrow(
-      SessionMutationError
+      ReadOnlyQueryError
     );
   });
 
   it("blocks SET ROLE (which the parser cannot parse)", () => {
     expect(() => assertReadOnlyQuery("SET ROLE zest_mcp_reader")).toThrow(
-      SessionMutationError
+      ReadOnlyQueryError
     );
   });
 
   it("blocks RESET ROLE", () => {
-    expect(() => assertReadOnlyQuery("RESET ROLE")).toThrow(
-      SessionMutationError
-    );
+    expect(() => assertReadOnlyQuery("RESET ROLE")).toThrow(ReadOnlyQueryError);
   });
 
   it("blocks RESET of a GUC", () => {
     expect(() => assertReadOnlyQuery("RESET app.partner_id")).toThrow(
-      SessionMutationError
+      ReadOnlyQueryError
     );
   });
 
@@ -215,10 +213,33 @@ describe("assertReadOnlyQuery", () => {
     expect(() => assertReadOnlyQuery("SELECT FROM WHERE ((")).toThrow();
   });
 
-  it("rejects a non-SELECT statement", () => {
-    expect(() =>
-      assertReadOnlyQuery("UPDATE collaborations SET name = 'x'")
-    ).toThrow(SessionMutationError);
+  // The guard is an allowlist (only SELECT passes), not a denylist of a few
+  // commands. These prove the broader surface stays blocked so nobody can
+  // weaken the fail-closed behaviour without a test going red.
+  it.each([
+    ["UPDATE", "UPDATE collaborations SET name = 'x'"],
+    ["INSERT", "INSERT INTO collaborations (id) VALUES ('x')"],
+    ["DELETE", "DELETE FROM collaborations"],
+    ["SET SESSION AUTHORIZATION", "SET SESSION AUTHORIZATION postgres"],
+    ["SET TRANSACTION READ WRITE", "SET TRANSACTION READ WRITE"],
+    ["SET LOCAL", "SET LOCAL app.partner_id = 'x'"],
+    ["RESET ALL", "RESET ALL"],
+    ["COPY TO PROGRAM", "COPY collaborations TO PROGRAM 'curl evil'"],
+    ["DO block", "DO $$ BEGIN PERFORM 1; END $$"],
+    ["CALL", "CALL some_proc()"],
+    ["BEGIN", "BEGIN"],
+    ["dblink", "SELECT * FROM dblink('host=x', 'select 1') AS t(a int)"],
+  ])("rejects %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow();
+  });
+
+  // Dangerous functions hidden inside an otherwise-valid SELECT.
+  it.each([
+    ["pg_read_file", "SELECT pg_read_file('/etc/passwd')"],
+    ["pg_ls_dir", "SELECT pg_ls_dir('/')"],
+    ["lo_export", "SELECT lo_export(1, '/tmp/x')"],
+  ])("blocks %s in a SELECT", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
   });
 });
 
@@ -241,7 +262,7 @@ describe("executeQuery", () => {
 
   const defaultOptions = { readonly: false, allowMultiStatements: false };
 
-  it("rejects a session-mutating query before connecting when restrictSessionState is on", async () => {
+  it("rejects a session-mutating query before connecting when readOnlyQueries is on", async () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [] });
     const pool = createMockPool(queryFn);
 
@@ -252,15 +273,15 @@ describe("executeQuery", () => {
         100,
         {
           ...defaultOptions,
-          restrictSessionState: true,
+          readOnlyQueries: true,
         }
       )
-    ).rejects.toThrow(SessionMutationError);
+    ).rejects.toThrow(ReadOnlyQueryError);
 
     expect(pool.connect).not.toHaveBeenCalled();
   });
 
-  it("allows a session-mutating query when restrictSessionState is off", async () => {
+  it("allows a session-mutating query when readOnlyQueries is off", async () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [] });
     const pool = createMockPool(queryFn);
 
@@ -270,7 +291,7 @@ describe("executeQuery", () => {
       100,
       {
         ...defaultOptions,
-        restrictSessionState: false,
+        readOnlyQueries: false,
       }
     );
 
