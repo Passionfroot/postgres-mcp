@@ -22,10 +22,18 @@ export function parseDsnHostPort(dsn: string): { host: string; port: number } {
  * an SSH tunnel via ssh2 forwardOut(). pg.Pool connects to the local proxy as if it were the remote
  * database.
  */
-export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
+export function createTunnel(
+  config: TunnelConfig,
+  onDown?: (reason: string) => void
+): Promise<TunnelHandle> {
   return new Promise((resolve, reject) => {
     const ssh = new SSHClient();
     const activeSockets = new Set<net.Socket>();
+    // Once the tunnel is established the establishment promise is settled, so a later ssh error or
+    // close (e.g. the TCP socket dying across a laptop sleep) can no longer reject it. Route those
+    // to onDown instead, so the caller tears the tunnel + pool down and recreates them. Without
+    // this the dead tunnel lingers and queries wedge on it until the process is killed.
+    let settled = false;
 
     const proxyServer = net.createServer((socket) => {
       activeSockets.add(socket);
@@ -73,6 +81,7 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
           `SSH tunnel established: 127.0.0.1:${addr.port} -> ${config.remoteHost}:${config.remotePort} via ${config.sshHost}`
         );
 
+        settled = true;
         resolve({
           localHost: "127.0.0.1",
           localPort: addr.port,
@@ -93,9 +102,23 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
     });
 
     ssh.on("error", (err) => {
-      reject(
-        new Error(`SSH tunnel to ${config.sshHost} failed: ${err.message}`)
+      if (!settled) {
+        reject(
+          new Error(`SSH tunnel to ${config.sshHost} failed: ${err.message}`)
+        );
+        return;
+      }
+      logger.error(
+        `SSH tunnel to ${config.sshHost} errored after establishment: ${err.message}`
       );
+      onDown?.(`ssh error: ${err.message}`);
+    });
+
+    ssh.on("close", () => {
+      if (settled) {
+        logger.warn(`SSH tunnel to ${config.sshHost} closed`);
+        onDown?.("ssh connection closed");
+      }
     });
 
     let privateKey: Buffer;
@@ -116,6 +139,9 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
       username: config.sshUser,
       privateKey,
       keepaliveInterval: config.keepaliveInterval,
+      // Drop the connection after 3 missed keepalives so a dead peer (laptop sleep) surfaces as an
+      // ssh error/close within ~keepaliveInterval*3 instead of hanging indefinitely.
+      keepaliveCountMax: 3,
     });
   });
 }

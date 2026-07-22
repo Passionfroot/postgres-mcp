@@ -24,7 +24,11 @@ function getErrorMessage(err: unknown) {
  * Rewrite a PostgreSQL DSN's host and port while preserving user, password, database, and query
  * parameters.
  */
-export function rewriteDsnHostPort(originalDsn: string, newHost: string, newPort: number) {
+export function rewriteDsnHostPort(
+  originalDsn: string,
+  newHost: string,
+  newPort: number
+) {
   const url = new URL(originalDsn);
   url.hostname = newHost;
   url.port = String(newPort);
@@ -88,7 +92,9 @@ export class ConnectionManager {
         try {
           await this.destroyPoolAndTunnel(sourceId);
         } catch (err) {
-          logger.error(`Error shutting down source "${sourceId}": ${getErrorMessage(err)}`);
+          logger.error(
+            `Error shutting down source "${sourceId}": ${getErrorMessage(err)}`
+          );
         }
       })
     );
@@ -100,19 +106,36 @@ export class ConnectionManager {
     let connectionString = source.dsn;
 
     if (source.sshHost && source.sshUser && source.sshKey) {
-      const { host: remoteHost, port: remotePort } = parseDsnHostPort(source.dsn);
+      const { host: remoteHost, port: remotePort } = parseDsnHostPort(
+        source.dsn
+      );
 
-      const tunnel = await createTunnel({
-        sshHost: source.sshHost,
-        sshUser: source.sshUser,
-        sshKeyPath: source.sshKey,
-        remoteHost,
-        remotePort,
-        keepaliveInterval: KEEPALIVE_INTERVAL_MS,
-      });
+      const tunnel = await createTunnel(
+        {
+          sshHost: source.sshHost,
+          sshUser: source.sshUser,
+          sshKeyPath: source.sshKey,
+          remoteHost,
+          remotePort,
+          keepaliveInterval: KEEPALIVE_INTERVAL_MS,
+        },
+        (reason) => {
+          // The tunnel died after establishment (e.g. sleep killed the socket). Mark the pool dead
+          // so the next getPool tears both down and recreates them, instead of wedging on the dead
+          // tunnel until the process is killed.
+          logger.warn(
+            `Tunnel down for source "${source.id}" (${reason}); marking pool dead`
+          );
+          this.markPoolDead(source.id);
+        }
+      );
 
       this.tunnels.set(source.id, tunnel);
-      connectionString = rewriteDsnHostPort(source.dsn, tunnel.localHost, tunnel.localPort);
+      connectionString = rewriteDsnHostPort(
+        source.dsn,
+        tunnel.localHost,
+        tunnel.localPort
+      );
     }
 
     const pool = new pg.Pool({
@@ -121,6 +144,10 @@ export class ConnectionManager {
       idleTimeoutMillis: 5_000,
       statement_timeout: source.timeout * 1000,
       allowExitOnIdle: true,
+      // Bound how long acquiring a connection can block. Through a dead tunnel a connect would
+      // otherwise hang with no client-side limit; failing fast surfaces the error, which (with the
+      // tunnel onDown above) recreates the pool + tunnel on the next call instead of wedging.
+      connectionTimeoutMillis: source.timeout * 1000,
     });
 
     pool.on("error", (err) => {
@@ -132,7 +159,9 @@ export class ConnectionManager {
 
     const isTunneled = this.tunnels.has(source.id);
     logger.info(
-      `Pool created for source "${source.id}" (max=${source.poolMax}, timeout=${source.timeout}s, readonly=${source.readonly}${isTunneled ? ", tunneled" : ""})`
+      `Pool created for source "${source.id}" (max=${source.poolMax}, timeout=${
+        source.timeout
+      }s, readonly=${source.readonly}${isTunneled ? ", tunneled" : ""})`
     );
 
     return pool;
@@ -151,7 +180,9 @@ export class ConnectionManager {
       try {
         await poolEntry.pool.end();
       } catch (err) {
-        logger.error(`Error ending pool for source "${sourceId}": ${getErrorMessage(err)}`);
+        logger.error(
+          `Error ending pool for source "${sourceId}": ${getErrorMessage(err)}`
+        );
       }
       this.pools.delete(sourceId);
     }
@@ -161,7 +192,11 @@ export class ConnectionManager {
       try {
         await tunnel.close();
       } catch (err) {
-        logger.error(`Error closing tunnel for source "${sourceId}": ${getErrorMessage(err)}`);
+        logger.error(
+          `Error closing tunnel for source "${sourceId}": ${getErrorMessage(
+            err
+          )}`
+        );
       }
       this.tunnels.delete(sourceId);
     }
