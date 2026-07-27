@@ -42,27 +42,39 @@ export function createTunnel(
       const srcAddr = socket.remoteAddress ?? "127.0.0.1";
       const srcPort = socket.remotePort ?? 0;
 
-      ssh.forwardOut(
-        srcAddr,
-        srcPort,
-        config.remoteHost,
-        config.remotePort,
-        (err, stream) => {
-          if (err) {
-            logger.error(`SSH forwardOut failed: ${err.message}`, {
-              remoteHost: config.remoteHost,
-              remotePort: config.remotePort,
-            });
-            socket.destroy();
-            return;
+      try {
+        ssh.forwardOut(
+          srcAddr,
+          srcPort,
+          config.remoteHost,
+          config.remotePort,
+          (err, stream) => {
+            if (err) {
+              logger.error(`SSH forwardOut failed: ${err.message}`, {
+                remoteHost: config.remoteHost,
+                remotePort: config.remotePort,
+              });
+              socket.destroy();
+              return;
+            }
+
+            socket.pipe(stream).pipe(socket);
+
+            stream.on("error", () => socket.destroy());
+            socket.on("error", () => stream.destroy());
           }
-
-          socket.pipe(stream).pipe(socket);
-
-          stream.on("error", () => socket.destroy());
-          socket.on("error", () => stream.destroy());
-        }
-      );
+        );
+      } catch (err) {
+        // forwardOut throws synchronously ("Not connected") if the ssh connection has already died.
+        // Destroy the incoming socket instead of letting the throw crash the whole process; the
+        // ssh error/close handler marks the pool dead so the tunnel is recreated on the next call.
+        logger.error(
+          `SSH forwardOut threw: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        socket.destroy();
+      }
     });
 
     proxyServer.on("error", (err) => {

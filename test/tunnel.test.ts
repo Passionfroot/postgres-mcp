@@ -6,6 +6,10 @@ const shared = vi.hoisted(() => ({
   sshInstances: [] as EventEmitter[],
   // autoReady off lets a test drive the pre-establishment path (emit "error" before "ready").
   autoReady: true,
+  // When true, forwardOut throws synchronously ("Not connected"), as ssh2 does on a dead client.
+  forwardOutThrows: false,
+  // The proxy's per-connection handler, captured so a test can drive an incoming connection.
+  connectionListener: undefined as ((socket: unknown) => void) | undefined,
 }));
 
 vi.mock("ssh2", async () => {
@@ -26,6 +30,7 @@ vi.mock("ssh2", async () => {
       _d: number,
       cb: (err: Error | undefined, stream: EventEmitter) => void
     ) {
+      if (shared.forwardOutThrows) throw new Error("Not connected");
       cb(undefined, new EE());
     }
     end() {}
@@ -49,14 +54,25 @@ vi.mock("node:net", async (orig) => {
       return this;
     }
   }
-  const createServer = () => new FakeServer();
-  return { ...actual, default: { ...actual.default, createServer }, createServer };
+  const createServer = (listener: (socket: unknown) => void) => {
+    shared.connectionListener = listener;
+    return new FakeServer();
+  };
+  return {
+    ...actual,
+    default: { ...actual.default, createServer },
+    createServer,
+  };
 });
 
 vi.mock("node:fs", async (orig) => {
   const actual = await orig<typeof import("node:fs")>();
   const readFileSync = () => Buffer.from("fake-key");
-  return { ...actual, default: { ...actual.default, readFileSync }, readFileSync };
+  return {
+    ...actual,
+    default: { ...actual.default, readFileSync },
+    readFileSync,
+  };
 });
 
 import { createTunnel } from "../src/tunnel.js";
@@ -72,6 +88,8 @@ const cfg = {
 
 afterEach(() => {
   shared.autoReady = true;
+  shared.forwardOutThrows = false;
+  shared.connectionListener = undefined;
   shared.sshInstances.length = 0;
 });
 
@@ -82,12 +100,29 @@ describe("createTunnel", () => {
     expect(handle.localPort).toBe(15432);
   });
 
+  it("destroys the socket instead of crashing when forwardOut throws on a dead tunnel", async () => {
+    await createTunnel(cfg);
+    shared.forwardOutThrows = true;
+    const socket = Object.assign(new EventEmitter(), {
+      remoteAddress: "127.0.0.1",
+      remotePort: 1234,
+      destroy: vi.fn(),
+      pipe: vi.fn(),
+    });
+    // Driving an incoming proxy connection must not throw out of the handler (which would crash
+    // the process as an uncaught exception); the socket is destroyed instead.
+    expect(() => shared.connectionListener!(socket)).not.toThrow();
+    expect(socket.destroy).toHaveBeenCalled();
+  });
+
   it("routes a post-establishment ssh error to onDown instead of a rejection", async () => {
     const onDown = vi.fn();
     await createTunnel(cfg, onDown);
     shared.sshInstances.at(-1)!.emit("error", new Error("socket hang up"));
     expect(onDown).toHaveBeenCalledTimes(1);
-    expect(onDown).toHaveBeenCalledWith(expect.stringContaining("socket hang up"));
+    expect(onDown).toHaveBeenCalledWith(
+      expect.stringContaining("socket hang up")
+    );
   });
 
   it("routes a post-establishment close to onDown", async () => {
