@@ -40,7 +40,7 @@ interface PoolEntry {
   dead: boolean;
 }
 
-const KEEPALIVE_INTERVAL_MS = 30_000;
+const KEEPALIVE_INTERVAL_MS = 10_000;
 
 /**
  * Manages the full connection lifecycle for all configured database sources.
@@ -148,6 +148,7 @@ export class ConnectionManager {
       // otherwise hang with no client-side limit; failing fast surfaces the error, which (with the
       // tunnel onDown above) recreates the pool + tunnel on the next call instead of wedging.
       connectionTimeoutMillis: source.timeout * 1000,
+      query_timeout: source.timeout * 1000,
     });
 
     pool.on("error", (err) => {
