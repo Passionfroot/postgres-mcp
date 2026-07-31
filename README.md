@@ -87,7 +87,7 @@ Search for tables by name (Prisma model name or SQL table name). Returns column-
 
 ### `schema://[database]` (resource)
 
-Returns a lean relationship map: all tables, their Prisma model names, and FK connections (incoming & outgoing). Use this for orientation before drilling into specific tables with `search_objects`.
+Returns a lean relationship map: tables, their Prisma model names, and FK connections (incoming & outgoing). Use this for orientation before drilling into specific tables with `search_objects`. With `prisma_schema_path` set the map lists the Prisma-mapped tables; without it, every table in the database.
 
 ## Configuration Reference
 
@@ -108,10 +108,9 @@ Returns a lean relationship map: all tables, their Prisma model names, and FK co
 
 ### Global options
 
-| Field                  | Default | Description                                                                                                                                                                                            |
-| ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `prisma_schema_path`   | —       | Path to your `.prisma` schema file. Also discovers `models/*.prisma` files.                                                                                                                            |
-| `include_prisma_info`  | `true`  | Whether to render Prisma annotations: `(Prisma: ModelName)` and `(no Prisma model)` on table headers, and `(Prisma: fieldName)` on column lines. Set to `false` to drop the annotations and save tokens for SQL-only consumers. |
+| Field                | Default | Description                                                                                                             |
+| -------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `prisma_schema_path` | —       | Path to your `.prisma` schema file. Also discovers `models/*.prisma` files. Leave it unset to run in plain-SQL mode.     |
 
 ### Audit log options
 
@@ -140,7 +139,17 @@ The MCP reads your Prisma schema file at runtime via `prisma_schema_path`. It us
 - Missing columns (Prisma field exists, DB column doesn't)
 - Type mismatches (Prisma says `String`, DB has `integer`)
 
-**Suppressing the annotations:** If the MCP consumer only writes raw SQL (e.g. a tightly-budgeted production LLM agent), the `(Prisma: ModelName)`, `(no Prisma model)`, and `(Prisma: fieldName)` annotations are pure tokens. Set `include_prisma_info = false` in the config to drop them from `search_objects` output and the `schema://` resource. The schema is still parsed, so drift detection and the in-memory mapping remain available for any future tooling - only the rendered text changes.
+### Without a Prisma schema
+
+`prisma_schema_path` is optional, and everything Prisma-specific switches itself off when it is unset. There is no flag to set — the server has no mapping to talk about, so it stops talking about it:
+
+- Table headers render as `users`, not `users (no Prisma model)`, and columns carry no `(Prisma: fieldName)` suffix.
+- The `search_objects` description and its `pattern` parameter stop offering to search by Prisma model name.
+- The `schema://` resource description drops its mention of Prisma model names.
+- Drift warnings are suppressed. Drift is Prisma-versus-database by definition.
+- The `schema://` map lists **every** table in the database. With a mapping loaded it stays filtered to the Prisma-mapped tables, which is the point of that view; without one that filter would leave the resource empty.
+
+The header count on `schema://` always matches the tables the body actually lists, and the FK count only counts edges visible in the map.
 
 ## Using a Skill
 
