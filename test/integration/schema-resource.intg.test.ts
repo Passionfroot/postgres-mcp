@@ -12,8 +12,9 @@ import { introspectDatabase } from "../../src/schema/introspect.js";
 import { mergeSchemas } from "../../src/schema/merge.js";
 import { parsePrismaFiles } from "../../src/schema/prisma-parser.js";
 import { searchTables } from "../../src/schema/search.js";
+import { resolveTestDb, TEST_DSN as TEST_DSN_ENV } from "./test-db.js";
 
-const TEST_DSN = process.env.POSTGRES_MCP_TEST_DSN ?? "postgresql://localhost/postgres";
+const TEST_DSN = TEST_DSN_ENV ?? "";
 
 const localSource: SourceConfig = {
   id: "local",
@@ -25,18 +26,7 @@ const localSource: SourceConfig = {
   allowMultiStatements: false,
 };
 
-async function checkDbAvailable() {
-  try {
-    const testPool = new pg.Pool({ connectionString: TEST_DSN, max: 1 });
-    await testPool.query("SELECT 1");
-    await testPool.end();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const isDbAvailable = await checkDbAvailable();
+const { isAvailable: isDbAvailable } = await resolveTestDb();
 
 // Self-provisioned fixtures so the pipeline assertions (tables/columns/PKs > 0) hold against
 // any target DB, rather than assuming the public schema is already populated.

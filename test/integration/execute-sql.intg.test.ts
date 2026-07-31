@@ -5,8 +5,9 @@ import type { SourceConfig } from "../../src/types.js";
 
 import { ConnectionManager } from "../../src/connections.js";
 import { executeQuery } from "../../src/query.js";
+import { resolveTestDb, TEST_DSN as TEST_DSN_ENV } from "./test-db.js";
 
-const TEST_DSN = process.env.POSTGRES_MCP_TEST_DSN ?? "postgresql://localhost/postgres";
+const TEST_DSN = TEST_DSN_ENV ?? "";
 
 const localSource: SourceConfig = {
   id: "local",
@@ -20,18 +21,7 @@ const localSource: SourceConfig = {
 
 const defaultOptions = { readonly: false, allowMultiStatements: false };
 
-async function checkDbAvailable() {
-  try {
-    const testPool = new pg.Pool({ connectionString: TEST_DSN, max: 1 });
-    await testPool.query("SELECT 1");
-    await testPool.end();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const isDbAvailable = await checkDbAvailable();
+const { isAvailable: isDbAvailable } = await resolveTestDb();
 
 let connectionManager: ConnectionManager;
 
