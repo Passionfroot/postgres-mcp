@@ -227,17 +227,7 @@ dsn = "postgres://localhost/db"
     expect(config.sources[0].sessionVars).toBeUndefined();
   });
 
-  it("defaults includePrismaInfo to true when not set", () => {
-    const toml = `
-[[sources]]
-id = "local"
-dsn = "postgres://localhost/db"
-`;
-    const config = loadConfig(writeTempToml(toml));
-    expect(config.includePrismaInfo).toBe(true);
-  });
-
-  it("respects include_prisma_info = false", () => {
+  it("ignores an unknown top-level key without failing to load", () => {
     const toml = `
 include_prisma_info = false
 
@@ -246,7 +236,8 @@ id = "local"
 dsn = "postgres://localhost/db"
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.includePrismaInfo).toBe(false);
+    expect(config.sources).toHaveLength(1);
+    expect(config).not.toHaveProperty("includePrismaInfo");
   });
 
   it("parses multiple sources", () => {

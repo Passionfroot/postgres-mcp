@@ -21,7 +21,6 @@ export interface AuditLogConfig {
 export interface Config {
   sources: SourceConfig[];
   prismaSchemaPath?: string;
-  includePrismaInfo: boolean;
   auditLog?: AuditLogConfig;
 }
 
