@@ -50,9 +50,24 @@ describe("formatRelationshipMap", () => {
         sqlName: "creators",
         prismaModelName: "Creator",
         incomingFks: [
-          { fromTable: "collaborations", fromColumn: "creatorId" },
-          { fromTable: "collaborations", fromColumn: "ownerId" },
-          { fromTable: "invoices", fromColumn: "creatorId" },
+          {
+            fromTable: "collaborations",
+            fromColumn: "creatorId",
+            constraintName: "collaborations_creatorId_fkey",
+            isUnique: false,
+          },
+          {
+            fromTable: "collaborations",
+            fromColumn: "ownerId",
+            constraintName: "collaborations_ownerId_fkey",
+            isUnique: false,
+          },
+          {
+            fromTable: "invoices",
+            fromColumn: "creatorId",
+            constraintName: "invoices_creatorId_fkey",
+            isUnique: false,
+          },
         ],
       }),
     ]);

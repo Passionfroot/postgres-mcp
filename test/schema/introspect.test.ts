@@ -57,6 +57,38 @@ describe("introspectDatabase", () => {
       expect(fkSql).toContain("'SELECT'");
     });
 
+    it("constrains both sides of a foreign key to the public schema", async () => {
+      const queryFn = vi.fn().mockResolvedValue(emptyResult);
+      const pool = createMockPool(queryFn);
+
+      await introspectDatabase(pool);
+
+      const fkSql = queryFn.mock.calls[2][0] as string;
+      // Only relnames are returned, so leaving the referenced side unfiltered attributes a
+      // cross-schema FK to the same-named public table.
+      expect(fkSql).toContain("JOIN pg_namespace fn ON fn.oid = frel.relnamespace");
+      expect(fkSql).toContain("fn.nspname = 'public'");
+      // Constraint identity keeps composite FK columns grouped as one relationship.
+      expect(fkSql).toContain("con.conname AS constraint_name");
+    });
+
+    it("only counts unique indexes that actually enforce uniqueness", async () => {
+      const queryFn = vi.fn().mockResolvedValue(emptyResult);
+      const pool = createMockPool(queryFn);
+
+      await introspectDatabase(pool);
+
+      const uniqueSql = queryFn.mock.calls[4][0] as string;
+      // A failed CREATE UNIQUE INDEX CONCURRENTLY leaves indisunique set on an index that
+      // enforces nothing.
+      expect(uniqueSql).toContain("idx.indisvalid");
+      expect(uniqueSql).toContain("idx.indislive");
+      // indnatts also counts INCLUDE columns, which do not widen the guarantee.
+      expect(uniqueSql).toContain("idx.indnkeyatts");
+      expect(uniqueSql).not.toContain("indnatts");
+      expect(uniqueSql).toContain("idx.indpred IS NULL");
+    });
+
     it("does not use privilege filters in the enum values query", async () => {
       const queryFn = vi.fn().mockResolvedValue(emptyResult);
       const pool = createMockPool(queryFn);
@@ -157,6 +189,7 @@ describe("introspectDatabase", () => {
         .mockResolvedValueOnce({
           rows: [
             {
+              constraint_name: "orders_userId_fkey",
               from_table: "orders",
               from_column: "userId",
               to_table: "users",
@@ -172,6 +205,7 @@ describe("introspectDatabase", () => {
 
       expect(result.foreignKeys).toHaveLength(1);
       expect(result.foreignKeys[0]).toEqual({
+        constraintName: "orders_userId_fkey",
         fromTable: "orders",
         fromColumn: "userId",
         toTable: "users",

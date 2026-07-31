@@ -164,8 +164,18 @@ describe("formatSearchResults", () => {
         ],
         outgoingFks: [{ toTable: "creators", toColumn: "id", viaColumn: "creatorId" }],
         incomingFks: [
-          { fromTable: "invoices", fromColumn: "collaborationId" },
-          { fromTable: "messages", fromColumn: "collaborationId" },
+          {
+            fromTable: "invoices",
+            fromColumn: "collaborationId",
+            constraintName: "invoices_collaborationId_fkey",
+            isUnique: false,
+          },
+          {
+            fromTable: "messages",
+            fromColumn: "collaborationId",
+            constraintName: "messages_collaborationId_fkey",
+            isUnique: false,
+          },
         ],
       }),
     ];
@@ -191,7 +201,14 @@ describe("formatSearchResults", () => {
     const tables = [
       makeTable({
         sqlName: "parents",
-        incomingFks: [{ fromTable: "children", fromColumn: "parentId", isUnique: true }],
+        incomingFks: [
+          {
+            fromTable: "children",
+            fromColumn: "parentId",
+            constraintName: "children_parentId_fkey",
+            isUnique: true,
+          },
+        ],
       }),
     ];
 
@@ -206,7 +223,14 @@ describe("formatSearchResults", () => {
     const tables = [
       makeTable({
         sqlName: "parents",
-        incomingFks: [{ fromTable: "children", fromColumn: "parentId", isUnique: false }],
+        incomingFks: [
+          {
+            fromTable: "children",
+            fromColumn: "parentId",
+            constraintName: "children_parentId_fkey",
+            isUnique: false,
+          },
+        ],
       }),
     ];
 
@@ -214,6 +238,130 @@ describe("formatSearchResults", () => {
 
     expect(output).toContain("<- children via parentId [1:many]");
     expect(output).toContain("fan-out");
+  });
+
+  it("renders a composite FK as one join path over all its columns", () => {
+    const tables = [
+      makeTable({
+        sqlName: "comp_parent",
+        incomingFks: [
+          {
+            fromTable: "comp_child",
+            fromColumn: "pa",
+            constraintName: "comp_child_pa_pb_fkey",
+            isUnique: true,
+          },
+          {
+            fromTable: "comp_child",
+            fromColumn: "pb",
+            constraintName: "comp_child_pa_pb_fkey",
+            isUnique: true,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    // One relationship joined on both columns. Two separate arrows would describe join
+    // paths that do not exist, and a model following them would omit the second column.
+    expect(output).toContain("<- comp_child via (pa, pb) [1:1]");
+    expect(output).not.toContain("via pa [");
+    expect(output).not.toContain("via pb [");
+  });
+
+  it("keeps FKs from the same table apart when they are separate constraints", () => {
+    const tables = [
+      makeTable({
+        sqlName: "users",
+        incomingFks: [
+          {
+            fromTable: "messages",
+            fromColumn: "senderId",
+            constraintName: "messages_senderId_fkey",
+            isUnique: false,
+          },
+          {
+            fromTable: "messages",
+            fromColumn: "recipientId",
+            constraintName: "messages_recipientId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    expect(output).toContain("<- messages via senderId [1:many]");
+    expect(output).toContain("<- messages via recipientId [1:many]");
+  });
+
+  it("omits the cardinality tag when uniqueness is unknown", () => {
+    const tables = [
+      makeTable({
+        sqlName: "parents",
+        incomingFks: [
+          {
+            fromTable: "children",
+            fromColumn: "parentId",
+            constraintName: "children_parentId_fkey",
+            isUnique: null,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    // Silence is correct here. Claiming 1:many would be a guess, and it would also drag in
+    // a fan-out warning for a relationship that may well be 1:1.
+    expect(output).toContain("<- children via parentId");
+    expect(output).not.toContain("[1:1]");
+    expect(output).not.toContain("[1:many]");
+    expect(output).not.toContain("fan-out");
+  });
+
+  it("emits the fan-out warning once for the whole response", () => {
+    const tables = [
+      makeTable({
+        sqlName: "parents",
+        incomingFks: [
+          {
+            fromTable: "children",
+            fromColumn: "parentId",
+            constraintName: "children_parentId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+      makeTable({
+        sqlName: "others",
+        incomingFks: [
+          {
+            fromTable: "otherChildren",
+            fromColumn: "otherId",
+            constraintName: "otherChildren_otherId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+      makeTable({
+        sqlName: "thirds",
+        incomingFks: [
+          {
+            fromTable: "thirdChildren",
+            fromColumn: "thirdId",
+            constraintName: "thirdChildren_thirdId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    expect(output.split("will duplicate rows on JOIN")).toHaveLength(2);
   });
 
   it("shows 'no Prisma model' for unmapped tables", () => {

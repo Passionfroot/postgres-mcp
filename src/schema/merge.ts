@@ -5,6 +5,7 @@ import type {
   DbPrimaryKey,
   DriftWarning,
   MergedColumn,
+  MergedIncomingFk,
   MergedSchema,
   MergedTable,
   PrismaMapping,
@@ -53,12 +54,17 @@ function deriveFksFromPrisma(prisma: PrismaMapping) {
       const targetModel = modelByName.get(rel.targetModel);
       if (!targetModel) continue;
 
+      // Synthetic identity so the columns of a composite Prisma relation group together the
+      // same way a database constraint does. Namespaced to avoid colliding with a conname.
+      const constraintName = `prisma:${model.modelName}.${rel.fieldName}`;
+
       for (let i = 0; i < rel.fromFields.length; i++) {
         const fromColumn = resolveFieldToColumn(model, rel.fromFields[i]);
         const toColumn = resolveFieldToColumn(targetModel, rel.toReferences[i]);
         if (!fromColumn || !toColumn) continue;
 
         fks.push({
+          constraintName,
           fromTable: model.tableName,
           fromColumn,
           toTable: targetModel.tableName,
@@ -89,6 +95,80 @@ function deduplicateFks(dbFks: DbForeignKey[], prismaFks: DbForeignKey[]) {
   return merged;
 }
 
+/**
+ * Uniqueness knowledge for the whole database. `columns`/`columnSets` being undefined means
+ * "not introspected", which must stay distinguishable from "introspected, nothing unique":
+ * defaulting the former to empty would relabel every genuine 1:1 as 1:many.
+ */
+interface UniquenessIndex {
+  columns: Set<string> | undefined;
+  columnSets: Set<string> | undefined;
+}
+
+function columnSetKey(tableName: string, columnNames: string[]) {
+  // Uniqueness is a property of the set, so index column order does not matter.
+  return `${tableName}.${[...columnNames].sort().join(",")}`;
+}
+
+function buildUniquenessIndex(db: DbMetadata): UniquenessIndex {
+  // Normalizes both the Set and the array form (a Set does not survive a JSON round-trip).
+  const columns = db.uniqueColumns ? new Set(db.uniqueColumns) : undefined;
+
+  const columnSets = db.uniqueColumnSets
+    ? new Set(db.uniqueColumnSets.map((s) => columnSetKey(s.tableName, s.columnNames)))
+    : undefined;
+
+  return { columns, columnSets };
+}
+
+/**
+ * Whether an FK's referencing column set is unique, so the join yields at most one row.
+ * Returns null when uniqueness cannot be decided from the metadata available.
+ */
+function isFkUnique(
+  tableName: string,
+  fkColumns: string[],
+  uniqueness: UniquenessIndex
+): boolean | null {
+  if (fkColumns.length === 1) {
+    if (!uniqueness.columns) return null;
+    return uniqueness.columns.has(`${tableName}.${fkColumns[0]}`);
+  }
+
+  // Single-column uniqueness can never decide a composite FK, so without the column sets
+  // there is nothing to answer with.
+  if (!uniqueness.columnSets) return null;
+  return uniqueness.columnSets.has(columnSetKey(tableName, fkColumns));
+}
+
+/**
+ * Split incoming FKs into constraints. Rows without a constraint name cannot be grouped,
+ * so each becomes its own single-column relationship.
+ */
+function groupIncomingFksByConstraint(fks: DbForeignKey[]) {
+  const groups: DbForeignKey[][] = [];
+  const byKey = new Map<string, DbForeignKey[]>();
+
+  for (const fk of fks) {
+    if (fk.constraintName === null) {
+      groups.push([fk]);
+      continue;
+    }
+
+    const key = `${fk.fromTable}|${fk.constraintName}`;
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.push(fk);
+    } else {
+      const group = [fk];
+      byKey.set(key, group);
+      groups.push(group);
+    }
+  }
+
+  return groups;
+}
+
 interface TableLookups {
   columnsByTable: Map<string, DbColumn[]>;
   pksByTable: Map<string, DbPrimaryKey[]>;
@@ -109,11 +189,43 @@ function dbColToMergedColumn(dbCol: DbColumn, pkColNames: Set<string>): MergedCo
   };
 }
 
+/**
+ * One entry per FK column, carrying the constraint identity and a cardinality decided over
+ * the constraint's whole column set. Consumers group by constraintName to render a composite
+ * FK as one relationship.
+ */
+function buildIncomingFks(
+  incomingFks: DbForeignKey[],
+  uniqueness: UniquenessIndex
+): MergedIncomingFk[] {
+  const result: MergedIncomingFk[] = [];
+
+  for (const group of groupIncomingFksByConstraint(incomingFks)) {
+    const fromTable = group[0].fromTable;
+    const isUnique = isFkUnique(
+      fromTable,
+      group.map((fk) => fk.fromColumn),
+      uniqueness
+    );
+
+    for (const fk of group) {
+      result.push({
+        fromTable,
+        fromColumn: fk.fromColumn,
+        constraintName: fk.constraintName,
+        isUnique,
+      });
+    }
+  }
+
+  return result;
+}
+
 function buildMergedTable(
   tableName: string,
   model: PrismaModelMapping | null,
   lookups: TableLookups,
-  uniqueColumns: Set<string>
+  uniqueness: UniquenessIndex
 ): { table: MergedTable; warnings: DriftWarning[] } {
   const dbCols = lookups.columnsByTable.get(tableName) ?? [];
   const pks = lookups.pksByTable.get(tableName) ?? [];
@@ -165,11 +277,7 @@ function buildMergedTable(
       prismaModelName: model?.modelName ?? null,
       columns: mergedColumns,
       primaryKeys: pks.map((pk) => pk.columnName),
-      incomingFks: incomingFks.map((fk) => ({
-        fromTable: fk.fromTable,
-        fromColumn: fk.fromColumn,
-        isUnique: uniqueColumns.has(`${fk.fromTable}.${fk.fromColumn}`),
-      })),
+      incomingFks: buildIncomingFks(incomingFks, uniqueness),
       outgoingFks: outgoingFks.map((fk) => ({
         toTable: fk.toTable,
         toColumn: fk.toColumn,
@@ -186,7 +294,7 @@ export function mergeSchemas(prisma: PrismaMapping | null, db: DbMetadata): Merg
   const mapping = prisma ?? { models: [], enums: [] };
   const prismaFks = deriveFksFromPrisma(mapping);
   const allFks = deduplicateFks(db.foreignKeys, prismaFks);
-  const uniqueColumns = db.uniqueColumns ?? new Set<string>();
+  const uniqueness = buildUniquenessIndex(db);
 
   const dbTableNames = new Set(db.columns.map((c) => c.tableName));
   const lookups: TableLookups = {
@@ -213,7 +321,7 @@ export function mergeSchemas(prisma: PrismaMapping | null, db: DbMetadata): Merg
       continue;
     }
 
-    const { table } = buildMergedTable(model.tableName, model, lookups, uniqueColumns);
+    const { table } = buildMergedTable(model.tableName, model, lookups, uniqueness);
     tables.push(table);
   }
 
@@ -222,7 +330,7 @@ export function mergeSchemas(prisma: PrismaMapping | null, db: DbMetadata): Merg
     if (mappedTableNames.has(tableName)) continue;
     unmappedTables.push(tableName);
 
-    const { table } = buildMergedTable(tableName, null, lookups, uniqueColumns);
+    const { table } = buildMergedTable(tableName, null, lookups, uniqueness);
     tables.push(table);
   }
 

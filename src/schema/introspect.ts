@@ -1,6 +1,13 @@
 import pg from "pg";
 
-import type { DbColumn, DbEnumValue, DbForeignKey, DbMetadata, DbPrimaryKey } from "./types.js";
+import type {
+  DbColumn,
+  DbEnumValue,
+  DbForeignKey,
+  DbMetadata,
+  DbPrimaryKey,
+  DbUniqueColumnSet,
+} from "./types.js";
 
 import { assertSafeGucName, escapeIdentifier, escapeLiteral } from "../sql-helpers.js";
 import { logger } from "../logger.js";
@@ -42,9 +49,17 @@ ORDER BY tc.table_name, kcu.ordinal_position
  * views (constraint_column_usage) require ownership or REFERENCES privilege on the referenced
  * table, so roles with only column-level SELECT grants (like zest_mcp_reader) see zero FKs.
  * pg_constraint is visible to all roles and filtered by has_column_privilege on the FK column.
+ *
+ * Both sides are constrained to schema 'public'. Only relnames are returned, so a FK pointing
+ * at another schema would otherwise be reported against the same-named public table.
+ *
+ * conname is returned so composite FKs stay grouped: a 2-column FK is two rows here, and
+ * without the constraint identity they are indistinguishable from two separate single-column
+ * FKs between the same pair of tables.
  */
 const FOREIGN_KEYS_QUERY = `
 SELECT
+  con.conname AS constraint_name,
   rel.relname AS from_table,
   a.attname AS from_column,
   frel.relname AS to_table,
@@ -53,35 +68,56 @@ FROM pg_constraint con
 JOIN pg_class rel ON rel.oid = con.conrelid
 JOIN pg_class frel ON frel.oid = con.confrelid
 JOIN pg_namespace n ON n.oid = con.connamespace
+JOIN pg_namespace fn ON fn.oid = frel.relnamespace
 JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(conkey, confkey, ord) ON true
 JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = cols.conkey
 JOIN pg_attribute af ON af.attrelid = con.confrelid AND af.attnum = cols.confkey
-WHERE con.contype = 'f' AND n.nspname = 'public'
+WHERE con.contype = 'f' AND n.nspname = 'public' AND fn.nspname = 'public'
   AND has_column_privilege(con.conrelid, a.attnum, 'SELECT')
 ORDER BY from_table, from_column, cols.ord
 `;
 
 /**
- * Single-column uniqueness. Used to determine FK cardinality: if the FK source column is
- * unique the relationship is 1:1, otherwise 1:many.
+ * Enforced uniqueness, one row per unique index with its ordered key columns. Used to
+ * determine FK cardinality: if the FK's column set is unique the relationship is 1:1,
+ * otherwise 1:many. Composite FKs need the whole set, so this returns sets rather than
+ * single columns.
  *
  * Sourced from pg_index, not pg_constraint: Prisma emits @unique as a UNIQUE INDEX rather
  * than a UNIQUE constraint, so constraint-only discovery misses every Prisma 1:1 relation.
  * pg_index covers both (PKs and UNIQUE constraints are backed by unique indexes too).
- * Excludes multi-column indexes (indnatts = 1), partial indexes (indpred), and
- * expression indexes (indkey[0] = 0), none of which guarantee single-column uniqueness.
+ *
+ * Only indexes that actually enforce uniqueness over a plain column set qualify:
+ * - indisvalid AND indislive: a failed CREATE UNIQUE INDEX CONCURRENTLY leaves indisunique
+ *   set on an index that enforces nothing, so duplicates can exist despite the flag.
+ * - indpred IS NULL: a partial index only constrains the rows matching its predicate.
+ * - all key attnums <> 0: an expression index constrains the expression, not the column.
+ *
+ * Key columns are indkey[0 .. indnkeyatts-1]. indnatts also counts INCLUDE columns (PG11+),
+ * which are payload only and do not widen the uniqueness guarantee.
+ *
+ * attname is cast to text before aggregating: node-postgres has no parser for name[], and
+ * returns it as the raw literal string "{a,b}" instead of an array.
  */
-const UNIQUE_COLUMNS_QUERY = `
+const UNIQUE_COLUMN_SETS_QUERY = `
 SELECT
   rel.relname AS table_name,
-  a.attname AS column_name
+  keys.column_names
 FROM pg_index idx
 JOIN pg_class rel ON rel.oid = idx.indrelid
 JOIN pg_namespace n ON n.oid = rel.relnamespace
-JOIN pg_attribute a ON a.attrelid = idx.indrelid AND a.attnum = idx.indkey[0]
-WHERE idx.indisunique AND idx.indnatts = 1 AND idx.indpred IS NULL
-  AND idx.indkey[0] <> 0 AND n.nspname = 'public'
-ORDER BY table_name, column_name
+JOIN LATERAL (
+  SELECT array_agg(a.attname::text ORDER BY k.ord) AS column_names,
+         bool_and(k.attnum <> 0) AS all_plain_columns
+  FROM unnest(idx.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+  LEFT JOIN pg_attribute a ON a.attrelid = idx.indrelid AND a.attnum = k.attnum
+  WHERE k.ord <= idx.indnkeyatts
+) keys ON true
+WHERE idx.indisunique AND idx.indisvalid AND idx.indislive
+  AND idx.indpred IS NULL
+  AND keys.all_plain_columns
+  AND n.nspname = 'public'
+ORDER BY table_name, keys.column_names
 `;
 
 const ENUM_VALUES_QUERY = `
@@ -110,6 +146,7 @@ interface PkRow {
 }
 
 interface FkRow {
+  constraint_name: string;
   from_table: string;
   from_column: string;
   to_table: string;
@@ -122,9 +159,9 @@ interface EnumRow {
   sort_order: number;
 }
 
-interface UniqueColumnRow {
+interface UniqueColumnSetRow {
   table_name: string;
-  column_name: string;
+  column_names: string[];
 }
 
 export interface IntrospectOptions {
@@ -156,7 +193,7 @@ export async function introspectDatabase(
     pool.query<PkRow>(PRIMARY_KEYS_QUERY),
     pool.query<FkRow>(FOREIGN_KEYS_QUERY),
     pool.query<EnumRow>(ENUM_VALUES_QUERY),
-    pool.query<UniqueColumnRow>(UNIQUE_COLUMNS_QUERY),
+    pool.query<UniqueColumnSetRow>(UNIQUE_COLUMN_SETS_QUERY),
   ]);
 
   return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows, uniqueResult.rows);
@@ -184,7 +221,7 @@ async function introspectWithSession(
       client.query<PkRow>(PRIMARY_KEYS_QUERY),
       client.query<FkRow>(FOREIGN_KEYS_QUERY),
       client.query<EnumRow>(ENUM_VALUES_QUERY),
-      client.query<UniqueColumnRow>(UNIQUE_COLUMNS_QUERY),
+      client.query<UniqueColumnSetRow>(UNIQUE_COLUMN_SETS_QUERY),
     ]);
 
     return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows, uniqueResult.rows);
@@ -214,7 +251,7 @@ function buildMetadata(
   pkRows: PkRow[],
   fkRows: FkRow[],
   enumRows: EnumRow[],
-  uniqueRows: UniqueColumnRow[]
+  uniqueRows: UniqueColumnSetRow[]
 ): DbMetadata {
   const columns: DbColumn[] = columnRows.map((r) => ({
     tableName: r.table_name,
@@ -233,6 +270,7 @@ function buildMetadata(
   }));
 
   const foreignKeys: DbForeignKey[] = fkRows.map((r) => ({
+    constraintName: r.constraint_name ?? null,
     fromTable: r.from_table,
     fromColumn: r.from_column,
     toTable: r.to_table,
@@ -245,7 +283,18 @@ function buildMetadata(
     sortOrder: r.sort_order,
   }));
 
-  const uniqueColumns = new Set(uniqueRows.map((r) => `${r.table_name}.${r.column_name}`));
+  const uniqueColumnSets: DbUniqueColumnSet[] = uniqueRows.map((r) => ({
+    tableName: r.table_name,
+    columnNames: r.column_names,
+  }));
 
-  return { columns, primaryKeys, foreignKeys, enumValues, uniqueColumns };
+  // Single-column sets are the 1:1 signal for single-column FKs. Kept as a flat
+  // "table.column" set for consumers that only care about that case.
+  const uniqueColumns = new Set(
+    uniqueColumnSets
+      .filter((s) => s.columnNames.length === 1)
+      .map((s) => `${s.tableName}.${s.columnNames[0]}`)
+  );
+
+  return { columns, primaryKeys, foreignKeys, enumValues, uniqueColumns, uniqueColumnSets };
 }
