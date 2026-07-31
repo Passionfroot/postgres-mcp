@@ -42,6 +42,13 @@ CREATE POLICY rls_messages_scope ON rls_messages USING (
 
 GRANT USAGE ON SCHEMA public TO rls_tenant_reader;
 GRANT SELECT ON rls_t, rls_threads, rls_messages TO rls_tenant_reader;
+
+-- A column whose name literally ends in a backslash, so the identifier half of a
+-- smuggling payload resolves instead of aborting the batch at 42703.
+DROP TABLE IF EXISTS backstop_src;
+CREATE TABLE backstop_src ("x\\" int);
+INSERT INTO backstop_src VALUES (7);
+GRANT SELECT ON backstop_src TO rls_tenant_reader;
 `;
 
 async function checkDbAvailable() {
@@ -131,6 +138,18 @@ describe.skipIf(!isDbAvailable)("read-only guard against a two-tenant RLS fixtur
       "SET of the tenant GUC against the EXISTS policy",
       String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM rls_messages; --'`,
     ],
+    [
+      "SET of the tenant GUC smuggled past a backslash-terminated identifier",
+      String.raw`SELECT "x\"; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`,
+    ],
+    [
+      "SET ROLE smuggled past a backslash-terminated identifier",
+      String.raw`SELECT 1 AS "x\"; SET ROLE postgres; SELECT * FROM rls_t; --"`,
+    ],
+    [
+      "identifier bypass with an odd backslash run of three",
+      String.raw`SELECT "x\\\"; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`,
+    ],
   ];
 
   it.each(payloads)("rejects %s", async (_label, sql) => {
@@ -161,6 +180,29 @@ describe.skipIf(!isDbAvailable)("read-only guard against a two-tenant RLS fixtur
 
       const smuggled = await client.query(
         String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM rls_t; --'`
+      );
+      const results = Array.isArray(smuggled) ? smuggled : [smuggled];
+
+      expect(results).toHaveLength(3);
+      expect(JSON.stringify(results.map((r) => r.rows))).toContain("B-secret");
+    } finally {
+      await client.query("RESET ALL").catch(() => undefined);
+      await client.query("RESET ROLE").catch(() => undefined);
+      client.release();
+    }
+  });
+
+  // Guards the premise for the identifier half. Same check as above, one lexer branch over.
+  it("confirms Postgres executes statements smuggled past a quoted identifier", async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("SET ROLE rls_tenant_reader");
+      await client.query("SET app.partner_id = 'tenantA'");
+
+      // Reads backstop_src so the first statement resolves against a real `x\` column;
+      // without it the batch aborts at 42703 before reaching the smuggled SET.
+      const smuggled = await client.query(
+        String.raw`SELECT "x\" FROM backstop_src; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`
       );
       const results = Array.isArray(smuggled) ? smuggled : [smuggled];
 

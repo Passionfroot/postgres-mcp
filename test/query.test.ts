@@ -308,6 +308,63 @@ describe("assertReadOnlyQuery", () => {
     expect(reason).toContain("backslash immediately before its closing quote");
   });
 
+  // The same divergence in a "..." quoted identifier. node-sql-parser applies MySQL-style
+  // backslash escaping there too and reads \" as an escaped quote, so it sees one column
+  // with a long name; PostgreSQL closes the identifier at that quote and treats what
+  // follows the `;` as further statements. A grammar sweep of 5632 inputs against
+  // PostgreSQL 16 found 1008 of these, all of them an odd run of backslashes before the
+  // closing quote and none of them an even run. These are a spread of the shapes it found:
+  // different surrounding clauses, different smuggled statements, different trailers.
+  it.each([
+    ["bare select item", String.raw`SELECT "x\"; SET app.partner_id TO 'tenantB' --"`],
+    ["select item with FROM", String.raw`SELECT "x\" FROM t; INSERT INTO sideeffect VALUES (1) --"`],
+    ["select item with WHERE", String.raw`SELECT "x\" WHERE 1=1; DROP TABLE sideeffect --"`],
+    ["select item with ORDER BY", String.raw`SELECT "x\" ORDER BY 1; SELECT 424242 AS injected --"`],
+    ["qualified column", String.raw`SELECT t."x\" FROM t; RESET ROLE --"`],
+    ["second of two select items", String.raw`SELECT 3, "x\"; UPDATE sideeffect SET n = 2 --"`],
+    ["inside a CTE", String.raw`WITH c AS (SELECT "x\"; CREATE TABLE zz (i int) --") SELECT * FROM c`],
+    ["odd backslash run of three", String.raw`SELECT "x\\\"; SELECT 424242 AS injected --"`],
+    ["empty identifier body", String.raw`SELECT "\"; SET app.partner_id TO 'tenantB' --"`],
+    ["block-comment trailer", String.raw`SELECT "x\"; SELECT 424242 AS injected /*"*/`],
+  ])("rejects an identifier bypass: %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+  });
+
+  it("names the quoted-identifier reason separately from the literal one", () => {
+    let reason = "";
+    try {
+      assertReadOnlyQuery(String.raw`SELECT "x\"; SELECT 1 --"`);
+    } catch (err) {
+      reason = (err as ReadOnlyQueryError).reason;
+    }
+    expect(reason).toContain("a quoted identifier");
+    expect(reason).toContain("backslash immediately before its closing quote");
+  });
+
+  // Even runs and mid-identifier backslashes produce the same statement boundary in both
+  // lexers, so tightening past the odd-run rule would only add false positives.
+  it.each([
+    ["backslash mid-identifier", String.raw`SELECT 1 AS "a\b"`],
+    ["even backslash run before the closing quote", String.raw`SELECT 1 AS "a\\"`],
+    ["Windows path in an identifier", String.raw`SELECT "C:\temp\dir" FROM t`],
+  ])("allows %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).not.toThrow();
+  });
+
+  // A backslash immediately before a DOUBLED quote is rejected even though PostgreSQL
+  // and node-sql-parser cannot be made to disagree in the dangerous direction there:
+  // PostgreSQL reads "" as one literal quote and keeps consuming, so it always ends the
+  // token no earlier than the parser does. It is rejected anyway because the '...' branch
+  // has ordered the checks this way since the guard shipped, and the two branches are
+  // easier to keep correct while they stay identical. Pinned so the conservatism is a
+  // decision rather than an accident.
+  it.each([
+    ["quoted identifier", String.raw`SELECT 1 AS "a\""b"`],
+    ["string literal", String.raw`SELECT 'a\''b'`],
+  ])("conservatively rejects a backslash before a doubled quote in a %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+  });
+
   // Constructs verified against PostgreSQL 16 to produce identical statement
   // boundaries in node-sql-parser and the server. They must stay allowed so nobody
   // "hardens" them later and adds false positives that close nothing.

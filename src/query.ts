@@ -141,21 +141,33 @@ function collectFunctionNames(node: unknown, acc: Set<string>): void {
 //   SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT ...; --'
 // re-points tenant scope from an unprivileged reader.
 //
+// node-sql-parser applies the same MySQL-style escaping inside a "..." quoted
+// identifier, where PostgreSQL again treats the backslash as an ordinary character, so
+//   SELECT "x\"; SET app.partner_id TO 'tenantB' --"
+// smuggles a statement exactly the same way. Both quote characters therefore get the
+// same odd-backslash-run rule.
+//
 // The divergence is exactly an ODD run of backslashes immediately before a quote. An
 // even run (`'x\\'`) is an escaped backslash to node-sql-parser and two literal
 // backslashes to PostgreSQL: the contents differ but both agree the quote closes, so
 // no statement can be smuggled. That was verified against PostgreSQL 16 rather than
 // assumed, along with the constructs deliberately NOT rejected here: dollar-quoted
 // strings ($$...$$, $tag$...$tag$), E'...' escape strings (PostgreSQL honours
-// backslash escapes inside those, so the two lexers agree), doubled '' quotes,
-// comments and quoted identifiers all produce identical statement boundaries on both
-// sides. Rejecting them would add false positives and close nothing.
+// backslash escapes inside those, so the two lexers agree), doubled '' quotes and
+// comments all produce identical statement boundaries on both sides. Rejecting them
+// would add false positives and close nothing.
 function findStatementBoundaryHazard(sql: string): string | null {
-  const HAZARD =
-    "a string literal has a backslash immediately before its closing quote, the one " +
-    "spot where the SQL parser and PostgreSQL disagree about where the literal ends. " +
-    "Backslashes elsewhere inside a literal are fine; for a value that ends in one, " +
-    "write it as an escape string (E'\\\\') or build it with chr(92)";
+  const HAZARD_TAIL =
+    "has a backslash immediately before its closing quote, the one spot where the SQL " +
+    "parser and PostgreSQL disagree about where the quoted token ends";
+  const LITERAL_HAZARD =
+    `a string literal ${HAZARD_TAIL}. Backslashes elsewhere inside a literal are fine; ` +
+    "for a value that ends in one, write it as an escape string (E'\\\\') or build it " +
+    "with chr(92)";
+  const IDENTIFIER_HAZARD =
+    `a quoted identifier ${HAZARD_TAIL}. Backslashes elsewhere inside an identifier are ` +
+    "fine; an identifier that really ends in a backslash cannot be addressed through " +
+    "this source";
 
   let i = 0;
 
@@ -186,18 +198,29 @@ function findStatementBoundaryHazard(sql: string): string | null {
       continue;
     }
 
-    // Quoted identifier: "" doubles, backslash means nothing.
+    // Quoted identifier, lexed the way PostgreSQL does: "" doubles, backslash is an
+    // ordinary character. Same odd-backslash-run rule as a '...' literal, for the same
+    // reason: node-sql-parser reads \" as an escaped quote and keeps consuming.
     if (char === '"') {
       i++;
+      let backslashRun = 0;
       while (i < sql.length) {
+        if (sql[i] === "\\") {
+          backslashRun++;
+          i++;
+          continue;
+        }
         if (sql[i] === '"') {
+          if (backslashRun % 2 === 1) return IDENTIFIER_HAZARD;
           if (sql[i + 1] === '"') {
             i += 2;
+            backslashRun = 0;
             continue;
           }
           i++;
           break;
         }
+        backslashRun = 0;
         i++;
       }
       continue;
@@ -252,7 +275,7 @@ function findStatementBoundaryHazard(sql: string): string | null {
           continue;
         }
         if (sql[i] === "'") {
-          if (backslashRun % 2 === 1) return HAZARD;
+          if (backslashRun % 2 === 1) return LITERAL_HAZARD;
           if (sql[i + 1] === "'") {
             i += 2;
             backslashRun = 0;
