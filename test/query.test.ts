@@ -271,6 +271,168 @@ describe("assertReadOnlyQuery", () => {
       )
     ).not.toThrow();
   });
+
+  // Statement-boundary bypass. node-sql-parser reads \' as an escaped quote and keeps
+  // consuming, so it sees one clean SELECT; PostgreSQL with
+  // standard_conforming_strings=on closes the literal at that quote and executes what
+  // follows the `;` as further statements. Both of these were proven to re-point tenant
+  // scope on a PostgreSQL 16 FORCE ROW LEVEL SECURITY fixture while passing the guard.
+  it.each([
+    [
+      "SET ROLE after a backslash-terminated literal",
+      String.raw`SELECT 'x\'; SET ROLE postgres; SELECT * FROM secrets; --'`,
+    ],
+    [
+      "SET of the tenant GUC after a backslash-terminated literal",
+      String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM secrets; --'`,
+    ],
+    [
+      "plain second statement after a backslash-terminated literal",
+      String.raw`SELECT 'x\'; SELECT 424242 AS injected; --'`,
+    ],
+    [
+      "odd backslash run of three",
+      String.raw`SELECT 'x\\\'; SELECT 424242 AS injected; --'`,
+    ],
+  ])("rejects %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+  });
+
+  it("names the backslash-before-quote reason", () => {
+    let reason = "";
+    try {
+      assertReadOnlyQuery(String.raw`SELECT 'x\'; SELECT 1; --'`);
+    } catch (err) {
+      reason = (err as ReadOnlyQueryError).reason;
+    }
+    expect(reason).toContain("backslash immediately before its closing quote");
+  });
+
+  // Constructs verified against PostgreSQL 16 to produce identical statement
+  // boundaries in node-sql-parser and the server. They must stay allowed so nobody
+  // "hardens" them later and adds false positives that close nothing.
+  it.each([
+    ["backslash mid-literal (regex)", String.raw`SELECT 'a' ~ '\d+'`],
+    ["Windows path literal", String.raw`SELECT 'C:\temp\file' AS p`],
+    ["E-string with escapes", String.raw`SELECT E'tab\there'`],
+    ["E-string ending in a backslash escape", String.raw`SELECT E'x\'; SELECT 1; --'`],
+    ["dollar-quoted string", `SELECT $$a'; SELECT 1; --$$`],
+    ["tagged dollar-quoted string", `SELECT $t$a'; SELECT 1; --$t$`],
+    ["doubled quote escape", `SELECT 'x''; SELECT 1; --'`],
+    ["backslash-quote inside a line comment", "SELECT 1 -- a\\'; SELECT 2\n"],
+    ["backslash-quote inside a block comment", String.raw`SELECT 1 /* a\'; SELECT 2; */`],
+    ["backslash-quote inside a quoted identifier", String.raw`SELECT 1 AS "a\'; SELECT 2; --"`],
+    ["typed literal after an identifier ending in e", `SELECT date'2026-01-01'`],
+  ])("allows %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).not.toThrow();
+  });
+
+  // Multiple statements that node-sql-parser does see are rejected regardless of the
+  // source's allow_multi_statements setting.
+  it("rejects multiple statements the parser can see", () => {
+    expect(() => assertReadOnlyQuery("SELECT 1; SELECT 2")).toThrow(
+      ReadOnlyQueryError
+    );
+  });
+
+  // The set_config payloads proven to leak on a two-tenant RLS fixture. The third is
+  // plan-dependent (it leaked on one fixture, not another); it must be rejected either
+  // way.
+  it.each([
+    [
+      "WHERE",
+      "SELECT * FROM t WHERE set_config('app.partner_id','tenantB',false) IS NOT NULL",
+    ],
+    [
+      "materialized CTE",
+      "WITH x AS MATERIALIZED (SELECT set_config('app.partner_id','tenantB',false)) SELECT * FROM t CROSS JOIN x",
+    ],
+    [
+      "select list",
+      "SELECT set_config('app.partner_id','tenantB',false), t.* FROM t",
+    ],
+  ])("rejects set_config in the %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+  });
+
+  describe("EXPLAIN", () => {
+    it.each([
+      ["bare", "EXPLAIN SELECT * FROM collaborations"],
+      ["with options", "EXPLAIN (COSTS OFF, FORMAT JSON) SELECT * FROM collaborations"],
+      ["VERBOSE", "EXPLAIN VERBOSE SELECT * FROM collaborations"],
+    ])("allows EXPLAIN %s", (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).not.toThrow();
+    });
+
+    // ANALYZE actually runs the statement it explains.
+    it.each([
+      ["legacy syntax", "EXPLAIN ANALYZE SELECT * FROM collaborations"],
+      ["option syntax", "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM collaborations"],
+      ["British spelling", "EXPLAIN ANALYSE SELECT * FROM collaborations"],
+    ])("rejects EXPLAIN ANALYZE (%s)", (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+    });
+
+    it("still guards the statement behind the EXPLAIN", () => {
+      expect(() =>
+        assertReadOnlyQuery("EXPLAIN INSERT INTO t (a) VALUES (1)")
+      ).toThrow(ReadOnlyQueryError);
+      expect(() =>
+        assertReadOnlyQuery("EXPLAIN SELECT set_config('a', 'b', false)")
+      ).toThrow(ReadOnlyQueryError);
+    });
+  });
+
+  describe("rejection reasons", () => {
+    it.each([
+      [
+        "the text 'set_config('",
+        "SELECT id FROM logs WHERE msg LIKE '%set_config(%'",
+        "set_config(",
+      ],
+      [
+        "the text 'set_role('",
+        "SELECT id FROM audit WHERE sql ILIKE '%set_role(%'",
+        "set_role(",
+      ],
+      [
+        "a leading SET",
+        "SET app.partner_id = 'other'",
+        "starts with SET or RESET",
+      ],
+      // Known false positive: `set` is a reserved word to the guard's parser, so this
+      // plain SELECT fails closed. The message has to say why rather than telling the
+      // caller to "rewrite it as a plain SELECT".
+      [
+        "why an unparseable plain SELECT was rejected",
+        "SELECT count(*) AS set FROM channels",
+        "reserved word used as a bare alias",
+      ],
+      [
+        "the statement type",
+        "UPDATE collaborations SET name = 'x'",
+        "not SELECT",
+      ],
+      [
+        "a nested write",
+        "WITH x AS (INSERT INTO t(a) VALUES (1) RETURNING id) SELECT * FROM x",
+        "write statement is nested",
+      ],
+      [
+        "the offending function",
+        "SELECT pg_read_file('/etc/passwd')",
+        "pg_read_file()",
+      ],
+    ])("names %s", (_label, sql, expected) => {
+      let message = "";
+      try {
+        assertReadOnlyQuery(sql);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain(expected);
+    });
+  });
 });
 
 describe("executeQuery", () => {

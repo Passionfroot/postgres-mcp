@@ -61,14 +61,16 @@ const SESSION_MUTATION_RE =
   /\b(?:set_config|set_role|set_user)\s*\(|^\s*(?:set|reset)\b/i;
 
 export class ReadOnlyQueryError extends Error {
-  constructor() {
+  readonly reason: string;
+
+  constructor(reason: string) {
     super(
-      "This source only answers read-only SELECT queries. Statements that change " +
-        "the role or session (SET, RESET, SET ROLE, set_config), non-SELECT " +
-        "statements, and server-side file/program access are not permitted. " +
-        "Rewrite it as a plain SELECT."
+      `This source only answers read-only SELECT queries, and this one was rejected because ${reason}. ` +
+        "Statements that change the role or session (SET, RESET, SET ROLE, set_config), non-SELECT " +
+        "statements, multiple statements in one call, and server-side file/program access are not permitted."
     );
     this.name = "ReadOnlyQueryError";
+    this.reason = reason;
   }
 }
 
@@ -127,6 +129,171 @@ function collectFunctionNames(node: unknown, acc: Set<string>): void {
   for (const key of Object.keys(obj)) collectFunctionNames(obj[key], acc);
 }
 
+// Reject inputs where node-sql-parser and PostgreSQL disagree about where a string
+// literal ends, because that is where they disagree about where a statement ends.
+//
+// In a plain '...' literal, node-sql-parser applies MySQL-style backslash escaping and
+// reads \' as an escaped quote, so the string keeps consuming. PostgreSQL with
+// standard_conforming_strings=on (the default since 9.1) treats the backslash as an
+// ordinary character, so the quote CLOSES the literal and everything after the next `;`
+// is a separate statement. The guard then vets one clean SELECT while the server
+// executes several, which is how
+//   SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT ...; --'
+// re-points tenant scope from an unprivileged reader.
+//
+// The divergence is exactly an ODD run of backslashes immediately before a quote. An
+// even run (`'x\\'`) is an escaped backslash to node-sql-parser and two literal
+// backslashes to PostgreSQL: the contents differ but both agree the quote closes, so
+// no statement can be smuggled. That was verified against PostgreSQL 16 rather than
+// assumed, along with the constructs deliberately NOT rejected here: dollar-quoted
+// strings ($$...$$, $tag$...$tag$), E'...' escape strings (PostgreSQL honours
+// backslash escapes inside those, so the two lexers agree), doubled '' quotes,
+// comments and quoted identifiers all produce identical statement boundaries on both
+// sides. Rejecting them would add false positives and close nothing.
+function findStatementBoundaryHazard(sql: string): string | null {
+  const HAZARD =
+    "a string literal has a backslash immediately before its closing quote, the one " +
+    "spot where the SQL parser and PostgreSQL disagree about where the literal ends. " +
+    "Backslashes elsewhere inside a literal are fine; for a value that ends in one, " +
+    "write it as an escape string (E'\\\\') or build it with chr(92)";
+
+  let i = 0;
+
+  while (i < sql.length) {
+    const char = sql[i];
+
+    if (char === "-" && sql[i + 1] === "-") {
+      const newline = sql.indexOf("\n", i);
+      i = newline === -1 ? sql.length : newline + 1;
+      continue;
+    }
+
+    // PostgreSQL block comments nest.
+    if (char === "/" && sql[i + 1] === "*") {
+      let depth = 1;
+      i += 2;
+      while (i < sql.length && depth > 0) {
+        if (sql[i] === "/" && sql[i + 1] === "*") {
+          depth++;
+          i += 2;
+        } else if (sql[i] === "*" && sql[i + 1] === "/") {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      continue;
+    }
+
+    // Quoted identifier: "" doubles, backslash means nothing.
+    if (char === '"') {
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === '"') {
+          if (sql[i + 1] === '"') {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // Dollar-quoted string: no escapes at all inside, ends at the matching tag.
+    // A bare `$1` placeholder is not a dollar quote.
+    const dollarTag = char === "$" ? /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i)) : null;
+    if (dollarTag) {
+      const tag = dollarTag[0];
+      const close = sql.indexOf(tag, i + tag.length);
+      i = close === -1 ? sql.length : close + tag.length;
+      continue;
+    }
+
+    // E'...' escape string: backslash escapes the next character in PostgreSQL too,
+    // so both lexers agree and there is nothing to flag. Only when E starts a token;
+    // `date'2026-01-01'` is a typed literal, not an escape string.
+    if (
+      (char === "E" || char === "e") &&
+      sql[i + 1] === "'" &&
+      !/[A-Za-z0-9_$]/.test(sql[i - 1] ?? " ")
+    ) {
+      i += 2;
+      while (i < sql.length) {
+        if (sql[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // Plain '...' literal, lexed the way PostgreSQL does: '' doubles, backslash is an
+    // ordinary character. Flag any quote reached across an odd run of backslashes.
+    if (char === "'") {
+      i++;
+      let backslashRun = 0;
+      while (i < sql.length) {
+        if (sql[i] === "\\") {
+          backslashRun++;
+          i++;
+          continue;
+        }
+        if (sql[i] === "'") {
+          if (backslashRun % 2 === 1) return HAZARD;
+          if (sql[i + 1] === "'") {
+            i += 2;
+            backslashRun = 0;
+            continue;
+          }
+          i++;
+          break;
+        }
+        backslashRun = 0;
+        i++;
+      }
+      continue;
+    }
+
+    i++;
+  }
+
+  return null;
+}
+
+// `EXPLAIN [ ( option [, ...] ) | ANALYZE | VERBOSE ] statement`. ANALYZE actually
+// runs the statement, so it stays rejected; everything else is planning only and is
+// stripped so the statement behind it gets the full guard.
+const EXPLAIN_PREFIX_RE =
+  /^\s*EXPLAIN\s*(?:\(([^()]*)\)|((?:\s*\b(?:ANALYZE|ANALYSE|VERBOSE)\b)*))\s+/i;
+const EXPLAIN_ANALYZE_OPTION_RE = /\b(?:ANALYZE|ANALYSE)\b/i;
+
+function stripExplainPrefix(sql: string): string {
+  const match = EXPLAIN_PREFIX_RE.exec(sql);
+  if (!match) return sql;
+
+  const options = match[1] ?? match[2] ?? "";
+  if (EXPLAIN_ANALYZE_OPTION_RE.test(options)) {
+    throw new ReadOnlyQueryError(
+      "EXPLAIN ANALYZE executes the statement it explains; use EXPLAIN without ANALYZE"
+    );
+  }
+
+  return sql.slice(match[0].length);
+}
+
 /**
  * Allow only read-only SELECT queries. Everything else is rejected: any non-SELECT
  * statement (SET, RESET, COPY, DO, CALL, DML, DDL, transaction control), any query
@@ -138,33 +305,62 @@ function collectFunctionNames(node: unknown, acc: Set<string>): void {
  * through to the regex LIMIT path.
  */
 export function assertReadOnlyQuery(sql: string): void {
-  if (SESSION_MUTATION_RE.test(sql)) {
-    throw new ReadOnlyQueryError();
+  const hazard = findStatementBoundaryHazard(sql);
+  if (hazard) {
+    throw new ReadOnlyQueryError(hazard);
+  }
+
+  const body = stripExplainPrefix(sql);
+
+  if (SESSION_MUTATION_RE.test(body)) {
+    const fn = /\b(set_config|set_role|set_user)\s*\(/i.exec(body);
+    throw new ReadOnlyQueryError(
+      fn
+        ? `the text '${fn[1].toLowerCase()}(' appears in the statement; this source rejects it even inside a string literal, so split the literal (e.g. '%set_' || 'config(%') if that is what you meant`
+        : "the statement starts with SET or RESET, which changes session state"
+    );
   }
 
   let raw;
   try {
-    raw = parser.astify(sql, PG_OPT);
+    raw = parser.astify(body, PG_OPT);
   } catch {
     throw new Error(
-      "This source only answers read-only SELECT queries, and this statement could " +
-        "not be parsed to verify that. Rewrite it as a plain SELECT."
+      "This source only answers read-only SELECT queries, and this statement could not be " +
+        "parsed to verify that, so it was rejected. The guard's parser is stricter than " +
+        "PostgreSQL: a reserved word used as a bare alias (AS set, AS order) or an operator " +
+        "it does not know are the usual causes. Quote the alias (AS \"set\") or express the " +
+        "same read another way."
     );
   }
 
   const statements = Array.isArray(raw) ? raw : [raw];
+  if (statements.length > 1) {
+    throw new ReadOnlyQueryError(
+      `it contains ${statements.length} statements; send exactly one SELECT per call`
+    );
+  }
   for (const ast of statements) {
-    if (!ast || (ast as { type?: string }).type !== "select") {
-      throw new ReadOnlyQueryError();
+    const type = (ast as { type?: string } | null)?.type;
+    if (type !== "select") {
+      throw new ReadOnlyQueryError(
+        `the top-level statement is '${type ?? "unknown"}', not SELECT`
+      );
     }
     // Catch writes hidden inside a top-level SELECT: a data-modifying CTE or SELECT INTO.
     if (hasWriteStatement(ast)) {
-      throw new ReadOnlyQueryError();
+      throw new ReadOnlyQueryError(
+        "a write statement is nested inside it (a data-modifying CTE or SELECT INTO)"
+      );
     }
     const fns = new Set<string>();
     collectFunctionNames(ast, fns);
     for (const fn of fns) {
-      if (DANGEROUS_FUNCTIONS.has(fn)) throw new ReadOnlyQueryError();
+      if (DANGEROUS_FUNCTIONS.has(fn)) {
+        throw new ReadOnlyQueryError(
+          `it calls ${fn}(), which changes session state or reaches outside the row set`
+        );
+      }
     }
   }
 }
