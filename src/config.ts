@@ -33,27 +33,20 @@ const auditLogSchema = z.object({
 });
 
 const configSchema = z.object({
-  sources: z
-    .array(sourceConfigSchema)
-    .min(1, "At least one source is required"),
+  sources: z.array(sourceConfigSchema).min(1, "At least one source is required"),
   prisma_schema_path: z.string().optional(),
   audit_log: auditLogSchema.optional(),
 });
 
 export function expandEnvVars(value: string): string {
-  return value.replace(
-    /\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/gi,
-    (match, braced, bare) => {
-      const varName = braced ?? bare;
-      const envValue = process.env[varName];
-      if (envValue === undefined) {
-        throw new Error(
-          `Environment variable ${varName} is not set (referenced in config)`
-        );
-      }
-      return envValue;
+  return value.replace(/\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/gi, (match, braced, bare) => {
+    const varName = braced ?? bare;
+    const envValue = process.env[varName];
+    if (envValue === undefined) {
+      throw new Error(`Environment variable ${varName} is not set (referenced in config)`);
     }
-  );
+    return envValue;
+  });
 }
 
 export function expandTilde(filePath: string): string {
@@ -81,8 +74,7 @@ function toSourceConfig(raw: z.infer<typeof sourceConfigSchema>): SourceConfig {
     timeout: raw.timeout,
     poolMax: raw.pool_max,
     allowMultiStatements: raw.allow_multi_statements,
-    readOnlyQueries:
-      raw.read_only_queries ?? Boolean(raw.role || raw.session_vars),
+    readOnlyQueries: raw.read_only_queries ?? Boolean(raw.role || raw.session_vars),
     role: raw.role,
     sessionVars,
     sshHost: raw.ssh_host,
@@ -127,9 +119,7 @@ export function loadConfig(filePath: string): Config {
   const prismaSchemaPath = result.data.prisma_schema_path
     ? expandTilde(result.data.prisma_schema_path)
     : undefined;
-  const auditLog = result.data.audit_log
-    ? toAuditLogConfig(result.data.audit_log)
-    : undefined;
+  const auditLog = result.data.audit_log ? toAuditLogConfig(result.data.audit_log) : undefined;
 
   return { sources, prismaSchemaPath, auditLog };
 }
