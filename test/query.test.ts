@@ -573,6 +573,39 @@ describe("executeQuery", () => {
     expect(calledSql).not.toMatch(/LIMIT 101/i);
   });
 
+  // The extended protocol is the server-side half of the multi-statement defence: a Parse
+  // carrying more than one command is refused with 42601 before anything executes. It is
+  // gated on readOnlyQueries because allow_multi_statements is an independent setting.
+  it("sends read-only-source queries over the extended protocol", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT * FROM users", 100, {
+      ...defaultOptions,
+      readOnlyQueries: true,
+    });
+
+    const executed = queryFn.mock.calls.at(-1)?.[0] as {
+      text: string;
+      queryMode?: string;
+    };
+    expect(executed.queryMode).toBe("extended");
+    expect(executed.text).toMatch(/LIMIT 101/i);
+  });
+
+  it("leaves a multi-statement source on the simple protocol", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT 1; SELECT 2", 100, {
+      readonly: false,
+      allowMultiStatements: true,
+      readOnlyQueries: false,
+    });
+
+    expect(queryFn.mock.calls.at(-1)?.[0]).toBe("SELECT 1; SELECT 2");
+  });
+
   it("detects truncation when rows exceed maxRows", async () => {
     const rows = Array.from({ length: 11 }, (_, i) => ({ id: i + 1 }));
     const queryFn = vi.fn().mockResolvedValue({ rows });

@@ -1,5 +1,5 @@
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { executeQuery, ReadOnlyQueryError } from "../../src/query.js";
 
@@ -42,14 +42,20 @@ CREATE POLICY rls_messages_scope ON rls_messages USING (
 
 GRANT USAGE ON SCHEMA public TO rls_tenant_reader;
 GRANT SELECT ON rls_t, rls_threads, rls_messages TO rls_tenant_reader;
+`;
 
--- A column whose name literally ends in a backslash, so the identifier half of a
--- smuggling payload resolves instead of aborting the batch at 42703.
-DROP TABLE IF EXISTS backstop_src;
-CREATE TABLE backstop_src ("x\\" int);
+// A column whose name literally ends in a backslash, so the identifier half of the
+// smuggling payload resolves and PostgreSQL gets as far as the second statement instead
+// of aborting the batch at 42703. backstop_probe is the observable side effect.
+const BACKSTOP_FIXTURE = String.raw`
+DROP TABLE IF EXISTS backstop_probe, backstop_src;
+CREATE TABLE backstop_src ("x\" int);
 INSERT INTO backstop_src VALUES (7);
+CREATE TABLE backstop_probe (n int);
 GRANT SELECT ON backstop_src TO rls_tenant_reader;
 `;
+
+const SMUGGLED_INSERT = String.raw`SELECT "x\" FROM backstop_src; INSERT INTO backstop_probe VALUES (1) --"`;
 
 async function checkDbAvailable() {
   if (!TEST_DSN) return false;
@@ -79,6 +85,7 @@ beforeAll(async () => {
   if (!isDbAvailable) return;
   pool = new pg.Pool({ connectionString: TEST_DSN, max: 2 });
   await pool.query(FIXTURE);
+  await pool.query(BACKSTOP_FIXTURE);
 });
 
 afterAll(async () => {
@@ -213,5 +220,97 @@ describe.skipIf(!isDbAvailable)("read-only guard against a two-tenant RLS fixtur
       await client.query("RESET ROLE").catch(() => undefined);
       client.release();
     }
+  });
+});
+
+// The lexer is not the only defence. These exercise the server-side one on its own, with
+// the payload injected through expandStar so it lands AFTER assertReadOnlyQuery has run:
+// that is exactly the position a construct the lexer misses would occupy.
+describe.skipIf(!isDbAvailable)("extended-protocol backstop", () => {
+  const injectSmuggledInsert = () => SMUGGLED_INSERT;
+
+  async function probeRowCount() {
+    const result = await pool.query("SELECT count(*)::int AS c FROM backstop_probe");
+    return result.rows[0].c as number;
+  }
+
+  beforeEach(async () => {
+    await pool.query("DELETE FROM backstop_probe");
+  });
+
+  it("rejects the smuggled statement with 42601 and executes none of it", async () => {
+    await expect(
+      executeQuery(pool, "SELECT 1", 10, {
+        readonly: false,
+        allowMultiStatements: false,
+        readOnlyQueries: true,
+        expandStar: injectSmuggledInsert,
+      })
+    ).rejects.toThrow(/42601[\s\S]*multiple commands/);
+
+    expect(await probeRowCount()).toBe(0);
+  });
+
+  // Guards the premise: without the backstop the same payload really does write. If the
+  // simple protocol ever stopped executing it, the test above would pass for free.
+  //
+  // executeQuery's result handling predates multi-statement support and trips over the
+  // array pg returns for a batch. That is pre-existing and unrelated to protocol gating,
+  // so these two assert on the side effect rather than the return value.
+  it("confirms the simple protocol runs the smuggled INSERT", async () => {
+    const err = await executeQuery(pool, "SELECT 1", 10, {
+      readonly: false,
+      allowMultiStatements: false,
+      readOnlyQueries: false,
+      expandStar: injectSmuggledInsert,
+    }).then(() => null, (caught: unknown) => caught);
+
+    expect(String(err ?? "")).not.toMatch(/42601/);
+    expect(await probeRowCount()).toBe(1);
+  });
+
+  // Gating. read_only_queries and allow_multi_statements are independent settings, and a
+  // batch is legitimate for a source that enables the latter. Forcing the extended
+  // protocol on every source would break it with 42601.
+  it("still runs every statement of a batch on a multi-statement source", async () => {
+    const err = await executeQuery(
+      pool,
+      "SELECT 1 AS a; INSERT INTO backstop_probe VALUES (9)",
+      10,
+      { readonly: false, allowMultiStatements: true, readOnlyQueries: false }
+    ).then(() => null, (caught: unknown) => caught);
+
+    expect(String(err ?? "")).not.toMatch(/42601/);
+    expect(await probeRowCount()).toBe(1);
+  });
+
+  it("keeps the connection usable after a 42601", async () => {
+    await executeQuery(pool, "SELECT 1", 10, {
+      readonly: false,
+      allowMultiStatements: false,
+      readOnlyQueries: true,
+      expandStar: injectSmuggledInsert,
+    }).catch(() => undefined);
+
+    const after = await executeQuery(pool, "SELECT 42 AS a", 10, {
+      readonly: false,
+      allowMultiStatements: false,
+      readOnlyQueries: true,
+    });
+    expect(after.rows).toEqual([{ a: 42 }]);
+  });
+
+  // The extended protocol must not change what a normal read returns.
+  it("returns identical rows, fields and rowCount under the extended protocol", async () => {
+    const sql = "SELECT id, tenant_id, secret FROM rls_t ORDER BY id";
+    const simple = await pool.query(sql);
+    const extended = await executeQuery(pool, sql, 10, {
+      readonly: false,
+      allowMultiStatements: false,
+      readOnlyQueries: true,
+    });
+
+    expect(extended.rows).toEqual(simple.rows);
+    expect(extended.rowCount).toBe(simple.rows.length);
   });
 });

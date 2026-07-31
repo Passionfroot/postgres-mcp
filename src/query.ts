@@ -9,6 +9,19 @@ import {
   escapeLiteral,
 } from "./sql-helpers.js";
 
+// pg has supported `queryMode: "extended"` since 8.18 (pg/lib/query.js reads it in the
+// constructor and requiresPreparation() returns true for it), but @types/pg 8.16 does
+// not describe it yet. Declaring it here keeps the call site type-checked instead of
+// asserting the mismatch away.
+declare module "pg" {
+  // The type parameter list has to repeat @types/pg's exactly, `any[]` default included,
+  // or TypeScript refuses the merge (TS2428).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  interface QueryConfig<I = any[]> {
+    queryMode?: "extended";
+  }
+}
+
 export interface QueryResult {
   rows: Record<string, unknown>[];
   rowCount: number;
@@ -497,7 +510,29 @@ export async function executeQuery(
       );
     }
 
-    const result = await client.query(limitedSql);
+    // Second, independent line of defence for read-only sources. The extended protocol
+    // sends the statement through Parse, and PostgreSQL refuses a Parse carrying more
+    // than one command with 42601 before executing any of it, so a statement smuggled
+    // past the lexer at a boundary the two disagree about still never runs.
+    //
+    // Neither layer is sufficient alone, which is why both stay:
+    //   - The server catches only MULTI-statement smuggling. It has no objection to
+    //     SELECT 'x\', (SELECT string_agg(val, ',') FROM secrets) --'
+    //     which is one legal statement, but node-sql-parser reads it as a single string
+    //     literal, so the AST walk vets a statement that is not the one that runs. That
+    //     payload returned another tenant's rows on a real database with the lexer
+    //     check removed. Only the lexer catches it.
+    //   - The lexer models PostgreSQL's tokenizer by hand and can be wrong about a
+    //     construct nobody has thought of yet. The server cannot be wrong about its own
+    //     statement boundaries.
+    //
+    // Gated on readOnlyQueries because allow_multi_statements is an independent setting
+    // and `SELECT 1; SELECT 2` is legitimate for a source that enables it.
+    const result = await client.query(
+      options.readOnlyQueries
+        ? { text: limitedSql, queryMode: "extended" }
+        : limitedSql
+    );
     const rows: Record<string, unknown>[] = result.rows;
 
     const isTruncated = rows.length > maxRows;
