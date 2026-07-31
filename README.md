@@ -134,6 +134,27 @@ run). This is distinct from `readonly`, which only wraps each query in a read-on
 transaction. It defaults on for any source that uses `role` or `session_vars`; set it
 to `false` for a local source where you want free-form access.
 
+`EXPLAIN` and `EXPLAIN (...)` are allowed and the statement behind them is guarded the
+same way. `EXPLAIN ANALYZE` is rejected, because it runs the statement it explains.
+
+The guard also rejects a string literal with a backslash immediately before its
+closing quote. That is the one place where the SQL parser it uses and PostgreSQL
+disagree about where a literal ends: the parser reads `\'` as an escaped quote and
+keeps consuming, while PostgreSQL with `standard_conforming_strings = on` closes the
+literal there and runs whatever follows the next `;` as separate statements. Without
+that check, `SELECT 'x\'; SET app.tenant_id TO "victim"; SELECT ...; --'` reads as one
+clean `SELECT` to the guard and as three statements to the server. Backslashes
+anywhere else in a literal are fine, as are dollar-quoted strings and `E'...'` escape
+strings, whose boundaries both sides agree on. A value that genuinely ends in a
+backslash has to be written as `E'\\'` or built with `chr(92)`; the one form with no
+workaround is `LIKE ... ESCAPE '\'`, since the parser accepts only a plain literal
+there.
+
+> A closed design goes the other way: PR #6 / branch `feat/per-request-session-vars`
+> lets the caller supply session variables per request, which is the inverse of what
+> `read_only_queries` enforces. Do not resurrect it without reconciling the two, or the
+> tenant scope this guard protects becomes caller-controlled again.
+
 ### Global options
 
 | Field                | Default | Description                                                                 |
