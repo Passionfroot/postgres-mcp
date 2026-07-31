@@ -22,6 +22,8 @@ const localSource: SourceConfig = {
   maxRows: 10,
   timeout: 5,
   poolMax: 1,
+  poolMaxExplicit: false,
+  maxResponseBytes: 1_000_000,
   allowMultiStatements: false,
 };
 

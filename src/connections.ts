@@ -20,6 +20,21 @@ function getErrorMessage(err: unknown) {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Resolves true if the promise settled in time, false if the deadline won. */
+async function withTimeout(promise: Promise<unknown>, ms: number) {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * Rewrite a PostgreSQL DSN's host and port while preserving user, password, database, and query
  * parameters.
@@ -39,6 +54,29 @@ interface PoolEntry {
 const KEEPALIVE_INTERVAL_MS = 30_000;
 
 /**
+ * These grace values keep statement_timeout < query_timeout < connectionTimeoutMillis. Collapsing
+ * them onto one value breaks queries against a healthy database.
+ *
+ * query_timeout is a client-side timer needing no round trip, so setting it equal to
+ * statement_timeout makes it win the race and the server's 57014, along with its "simplify the
+ * query" hint, never reaches the caller. It is only a backstop for a half-dead tunnel where the
+ * server never answers, so it sits above statement_timeout.
+ *
+ * connectionTimeoutMillis bounds pg-pool's queue wait as well as the connect, so it sits above
+ * both: at a small pool_max a concurrent query waits in that queue, and any value at or below the
+ * longest legitimate query would fail it with "timeout exceeded when trying to connect".
+ */
+const QUERY_TIMEOUT_GRACE_MS = 2_000;
+const CONNECT_TIMEOUT_GRACE_MS = 5_000;
+
+/**
+ * pool.end() waits for every checked-out client to come back, so a query still running holds it
+ * open forever. Bound it: the caller is either shutting down or replacing a dead pool, and in both
+ * cases hanging is worse than dropping the sockets.
+ */
+const POOL_END_TIMEOUT_MS = 2_000;
+
+/**
  * Manages the full connection lifecycle for all configured database sources.
  *
  * Pools are created lazily on first getPool() call for a given source. SSH-enabled sources get
@@ -49,6 +87,12 @@ export class ConnectionManager {
   private sources: Map<string, SourceConfig>;
   private pools: Map<string, PoolEntry> = new Map();
   private tunnels: Map<string, TunnelHandle> = new Map();
+  /**
+   * createPool awaits (the SSH tunnel above all), so concurrent first calls for the same source
+   * used to each build their own tunnel, pool and proxy listener, with only the last reachable
+   * from shutdown(). Sharing the in-flight promise makes cold start create exactly one of each.
+   */
+  private creating: Map<string, Promise<pg.Pool>> = new Map();
 
   constructor(sources: SourceConfig[]) {
     this.sources = new Map(sources.map((s) => [s.id, s]));
@@ -75,7 +119,12 @@ export class ConnectionManager {
       await this.destroyPoolAndTunnel(sourceId);
     }
 
-    return this.createPool(source);
+    const inflight = this.creating.get(sourceId);
+    if (inflight) return inflight;
+
+    const creation = this.createPool(source).finally(() => this.creating.delete(sourceId));
+    this.creating.set(sourceId, creation);
+    return creation;
   }
 
   async shutdown() {
@@ -115,12 +164,19 @@ export class ConnectionManager {
       connectionString = rewriteDsnHostPort(source.dsn, tunnel.localHost, tunnel.localPort);
     }
 
+    const statementTimeoutMs = source.timeout * 1000;
+    const queryTimeoutMs = statementTimeoutMs + QUERY_TIMEOUT_GRACE_MS;
+
     const pool = new pg.Pool({
       connectionString,
       max: source.poolMax,
       idleTimeoutMillis: 5_000,
-      statement_timeout: source.timeout * 1000,
+      statement_timeout: statementTimeoutMs,
       allowExitOnIdle: true,
+      // Bound acquiring a connection so an unreachable host fails on the source's own timescale
+      // instead of waiting out the OS TCP timeout, which took over a minute despite timeout = 5.
+      connectionTimeoutMillis: queryTimeoutMs + CONNECT_TIMEOUT_GRACE_MS,
+      query_timeout: queryTimeoutMs,
     });
 
     pool.on("error", (err) => {
@@ -149,7 +205,12 @@ export class ConnectionManager {
     const poolEntry = this.pools.get(sourceId);
     if (poolEntry) {
       try {
-        await poolEntry.pool.end();
+        const ended = await withTimeout(poolEntry.pool.end(), POOL_END_TIMEOUT_MS);
+        if (!ended) {
+          logger.warn(
+            `Pool for source "${sourceId}" still had a query in flight after ${POOL_END_TIMEOUT_MS}ms; abandoning it`
+          );
+        }
       } catch (err) {
         logger.error(`Error ending pool for source "${sourceId}": ${getErrorMessage(err)}`);
       }
