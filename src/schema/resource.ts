@@ -27,7 +27,7 @@ export function registerSchemaResource(
     }),
     {
       title: "Database Schema",
-      description: config.includePrismaInfo
+      description: schemaCache.hasPrismaMapping
         ? "Lean relationship map showing tables, Prisma model names, and FK relationships"
         : "Lean relationship map showing tables and FK relationships",
       mimeType: "text/plain",
@@ -50,7 +50,7 @@ export function registerSchemaResource(
         sessionVars: source.sessionVars,
       });
       const text = formatRelationshipMap(schema, database, {
-        includePrismaInfo: config.includePrismaInfo,
+        hasPrismaMapping: schemaCache.hasPrismaMapping,
       });
 
       return {

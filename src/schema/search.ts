@@ -29,12 +29,12 @@ export function searchTables(schema: MergedSchema, pattern: string): MergedTable
   return [...exact, ...partial];
 }
 
-function formatColumn(col: MergedColumn, includePrismaInfo: boolean) {
+function formatColumn(col: MergedColumn, hasPrismaMapping: boolean) {
   const parts = [`    ${col.sqlName}`, col.dataType, col.isNullable ? "NULL" : "NOT NULL"];
 
   if (col.isPrimaryKey) parts.push("[PK]");
   if (col.columnDefault !== null) parts.push(`default: ${col.columnDefault}`);
-  if (includePrismaInfo && col.prismaFieldName !== null) {
+  if (hasPrismaMapping && col.prismaFieldName !== null) {
     parts.push(`(Prisma: ${col.prismaFieldName})`);
   }
 
@@ -43,7 +43,8 @@ function formatColumn(col: MergedColumn, includePrismaInfo: boolean) {
 
 export interface FormatSearchResultsOptions {
   enumResolver?: (udtName: string) => { label: string; dbValue: string }[] | null;
-  includePrismaInfo?: boolean;
+  /** When false, no Prisma annotation is rendered at all. Defaults to true. */
+  hasPrismaMapping?: boolean;
 }
 
 export function formatSearchResults(
@@ -52,7 +53,7 @@ export function formatSearchResults(
 ) {
   if (tables.length === 0) return "No matching tables found.";
 
-  const { enumResolver, includePrismaInfo = true } = options;
+  const { enumResolver, hasPrismaMapping = true } = options;
 
   const sections: string[] = [];
 
@@ -60,7 +61,7 @@ export function formatSearchResults(
     const lines: string[] = [];
 
     let header: string;
-    if (!includePrismaInfo) {
+    if (!hasPrismaMapping) {
       header = table.sqlName;
     } else if (table.prismaModelName) {
       header = `${table.sqlName} (Prisma: ${table.prismaModelName})`;
@@ -76,7 +77,7 @@ export function formatSearchResults(
     if (table.columns.length > 0) {
       lines.push("  Columns:");
       for (const col of table.columns) {
-        lines.push(formatColumn(col, includePrismaInfo));
+        lines.push(formatColumn(col, hasPrismaMapping));
 
         if (col.dataType === "USER-DEFINED" && enumResolver) {
           const values = enumResolver(col.udtName);
