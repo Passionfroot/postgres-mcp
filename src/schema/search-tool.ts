@@ -23,7 +23,7 @@ export function registerSearchTool(
     {
       title: "Search Schema Objects",
       description:
-        "Search for tables by Prisma model name or SQL table name. Returns column detail including types, nullability, defaults, and enum values. Use this to look up specific tables before writing queries.",
+        "Search for tables by Prisma model name or SQL table name. Returns column detail including types, nullability, defaults, and enum values. Foreign keys are listed as 'FK out' (this table references another) and 'FK in' (another table references this one); incoming FKs are annotated with join cardinality, [1:1] or [1:many], and are joined on all the columns shown after 'via'. Use this to look up specific tables before writing queries.",
       inputSchema: {
         database: z.string().describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
         pattern: z
