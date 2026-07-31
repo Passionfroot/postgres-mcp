@@ -19,7 +19,27 @@ Claude Code session
         └── Audit log (optional rotating file)
 ```
 
-Each Claude Code session spawns one MCP server process. The server connects lazily to configured database sources on first query. Connections idle-timeout after 5 seconds and are recreated on demand.
+Over stdio, each Claude Code session spawns one MCP server process. The server connects lazily to configured database sources on first query. Connections idle-timeout after 5 seconds and are recreated on demand.
+
+## Transports
+
+stdio is the default: one process per client, which is what the per-tenant setup below relies on.
+
+`--http` serves Streamable HTTP on `127.0.0.1:7803/mcp` instead, so one process handles every client and the connection pool and schema cache are shared rather than rebuilt per session.
+
+| Flag | Default | |
+|---|---|---|
+| `--stdio` | on | One process per client |
+| `--http` | off | Streamable HTTP, shared across clients |
+| `--port <n>` | 7803 | `POSTGRES_MCP_PORT` |
+| `--host <addr>` | 127.0.0.1 | `POSTGRES_MCP_HOST` |
+| `--token <secret>` | none | Require `Authorization: Bearer <secret>`. `POSTGRES_MCP_TOKEN` |
+
+Binding a non-loopback address without `--token` is refused at startup rather than warned about.
+
+### HTTP is refused for per-tenant configs
+
+A source with `session_vars` pins one tenant's identity, such as `app.partner_id`, for the life of the process, and RLS is the only thing enforcing that boundary. One server shared across clients cannot honour a per-process pin, so `--http` refuses to start when any source sets `session_vars`. Use stdio for those.
 
 ## Setup
 
