@@ -151,8 +151,10 @@ export function createTunnel(
       username: config.sshUser,
       privateKey,
       keepaliveInterval: config.keepaliveInterval,
-      // Drop the connection after 3 missed keepalives so a dead peer (laptop sleep) surfaces as an
-      // ssh error/close within ~keepaliveInterval*3 instead of hanging indefinitely.
+      // ssh2 trips on the 4th missed keepalive (`if (++kacount > kacountmax)`), so a dead peer
+      // (laptop sleep) surfaces as an ssh error/close after keepaliveInterval * (countMax + 1),
+      // currently 40s, rather than hanging indefinitely. Pinned rather than left to ssh2's default,
+      // which happens to be the same 3 today, because that interval is load-bearing here.
       keepaliveCountMax: 3,
     });
   });
