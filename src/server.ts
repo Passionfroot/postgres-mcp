@@ -8,7 +8,7 @@ import type { Config } from "./types.js";
 
 import { expandStarColumns } from "./expand-star.js";
 import { logger } from "./logger.js";
-import { mcpErrorResult, mcpTextResult, resolveSource } from "./mcp-helpers.js";
+import { mcpErrorResult, mcpTextResult, resolveSource, serializeQueryResult } from "./mcp-helpers.js";
 import { executeQuery } from "./query.js";
 import { registerSchemaResource } from "./schema/resource.js";
 import { registerSearchTool } from "./schema/search-tool.js";
@@ -78,7 +78,7 @@ export function createServer(
           truncated: result.truncated,
         });
 
-        return mcpTextResult(JSON.stringify(result, null, 2));
+        return mcpTextResult(serializeQueryResult(result, source.maxResponseBytes));
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         logger.error(`execute_sql error for database "${database}": ${message}`);

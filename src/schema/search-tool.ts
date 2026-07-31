@@ -7,7 +7,7 @@ import type { Config } from "../types.js";
 import type { SchemaCache } from "./cache.js";
 
 import { logger } from "../logger.js";
-import { mcpErrorResult, mcpTextResult, resolveSource } from "../mcp-helpers.js";
+import { mcpErrorResult, mcpTextResult, resolveSource, truncateText } from "../mcp-helpers.js";
 import { formatSearchResults, searchTables } from "./search.js";
 
 export function registerSearchTool(
@@ -48,7 +48,7 @@ export function registerSearchTool(
         const enumResolver = (udtName: string) => schemaCache.getEnumValues(udtName);
         const formatted = formatSearchResults(results, enumResolver);
 
-        return mcpTextResult(formatted);
+        return mcpTextResult(truncateText(formatted, source.maxResponseBytes));
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         logger.error(`search_objects error for database "${database}": ${message}`);
