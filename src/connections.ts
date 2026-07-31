@@ -43,6 +43,22 @@ interface PoolEntry {
 const KEEPALIVE_INTERVAL_MS = 10_000;
 
 /**
+ * These grace values keep statement_timeout < query_timeout < connectionTimeoutMillis. Collapsing
+ * them onto one value breaks queries against a healthy database.
+ *
+ * query_timeout is a client-side timer needing no round trip, so setting it equal to
+ * statement_timeout makes it win the race and the server's 57014, along with its "simplify the
+ * query" hint, never reaches the caller. It is only a backstop for a half-dead tunnel where the
+ * server never answers, so it sits above statement_timeout.
+ *
+ * connectionTimeoutMillis bounds pg-pool's queue wait as well as the connect. At the default
+ * pool_max of 1 a second concurrent query waits in that queue, so any value at or below the
+ * longest legitimate query fails it with "timeout exceeded when trying to connect".
+ */
+const QUERY_TIMEOUT_GRACE_MS = 2_000;
+const CONNECT_TIMEOUT_GRACE_MS = 5_000;
+
+/**
  * Manages the full connection lifecycle for all configured database sources.
  *
  * Pools are created lazily on first getPool() call for a given source. SSH-enabled sources get
@@ -138,17 +154,20 @@ export class ConnectionManager {
       );
     }
 
+    const statementTimeoutMs = source.timeout * 1000;
+    const queryTimeoutMs = statementTimeoutMs + QUERY_TIMEOUT_GRACE_MS;
+
     const pool = new pg.Pool({
       connectionString,
       max: source.poolMax,
       idleTimeoutMillis: 5_000,
-      statement_timeout: source.timeout * 1000,
+      statement_timeout: statementTimeoutMs,
       allowExitOnIdle: true,
-      // Bound how long acquiring a connection can block. Through a dead tunnel a connect would
-      // otherwise hang with no client-side limit; failing fast surfaces the error, which (with the
-      // tunnel onDown above) recreates the pool + tunnel on the next call instead of wedging.
-      connectionTimeoutMillis: source.timeout * 1000,
-      query_timeout: source.timeout * 1000,
+      // Bound acquiring a connection so a half-dead tunnel, where the peer never answers and the
+      // ssh keepalive has not tripped yet, fails instead of hanging. Together with the tunnel's
+      // onDown above, the next call recreates the pool and tunnel rather than wedging.
+      connectionTimeoutMillis: queryTimeoutMs + CONNECT_TIMEOUT_GRACE_MS,
+      query_timeout: queryTimeoutMs,
     });
 
     pool.on("error", (err) => {

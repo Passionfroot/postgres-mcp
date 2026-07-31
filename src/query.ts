@@ -115,6 +115,9 @@ export async function executeQuery(
   );
 
   const client = await pool.connect();
+  // Set when the connection cannot be trusted for reuse. Releasing without an error hands it
+  // straight back to the pool, and at the default pool_max of 1 it is the only connection there.
+  let discardReason: string | undefined;
   try {
     if (options.role) {
       await client.query(`SET ROLE ${escapeIdentifier(options.role)}`);
@@ -145,6 +148,12 @@ export async function executeQuery(
       truncated: isTruncated,
     };
   } catch (err: unknown) {
+    // pg's client-side query_timeout rejects the caller but leaves the server still executing on
+    // this connection, so it must not go back into the pool.
+    if (err instanceof Error && err.message === "Query read timeout") {
+      discardReason = "client-side query timeout";
+    }
+
     if (!isPgError(err)) throw err;
 
     if (err.code === "57014") {
@@ -177,12 +186,15 @@ export async function executeQuery(
         await client.query("RESET ROLE");
       }
     } catch (cleanupErr) {
-      logger.warn("Failed to reset RLS session state; connection may be discarded by pool", {
+      // The role or session vars may still be set, so this connection must not serve another
+      // caller: leaking a pinned app.partner_id across callers would defeat RLS.
+      discardReason = "failed to reset session state";
+      logger.warn("Failed to reset RLS session state; discarding connection", {
         error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
         role: options.role ?? "",
         sessionVarKeys: options.sessionVars ? Object.keys(options.sessionVars).join(", ") : "",
       });
     }
-    client.release();
+    client.release(discardReason ? new Error(discardReason) : undefined);
   }
 }
