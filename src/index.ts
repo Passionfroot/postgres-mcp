@@ -3,72 +3,15 @@ process.env.NODE_NO_WARNINGS = "1";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
+import { parseArgs, printUsage } from "./args.js";
 import { createAuditLog } from "./audit-log.js";
-import { loadConfig } from "./config.js";
+import { applyHttpPoolDefaults, loadConfig } from "./config.js";
 import { ConnectionManager } from "./connections.js";
 import { startHttpServer } from "./http.js";
 import { logger } from "./logger.js";
 import { createSchemaCache } from "./schema/cache.js";
 import { createServer } from "./server.js";
 import type { Config } from "./types.js";
-
-const DEFAULT_PORT = 7803;
-const DEFAULT_HOST = "127.0.0.1";
-
-function printUsage() {
-  console.error("Usage: postgres-mcp <config-file> [options]");
-  console.error("  config-file        Path to TOML configuration file");
-  console.error("");
-  console.error("Options:");
-  console.error("  --stdio            Serve over stdio, one process per client (default)");
-  console.error("  --http             Serve over Streamable HTTP, shared across clients");
-  console.error(`  --port <n>         HTTP port (default ${DEFAULT_PORT}, env POSTGRES_MCP_PORT)`);
-  console.error(`  --host <addr>      HTTP bind address (default ${DEFAULT_HOST}, env POSTGRES_MCP_HOST)`);
-  console.error("  --token <secret>   Require 'Authorization: Bearer <secret>' (env POSTGRES_MCP_TOKEN)");
-  console.error("");
-  console.error("Note: --http is refused when any source sets session_vars. Those pin a");
-  console.error("per-tenant identity to the process, which a shared server cannot honour.");
-}
-
-interface ParsedArgs {
-  configPath: string;
-  useHttp: boolean;
-  host: string;
-  port: number;
-  token?: string;
-}
-
-function parseArgs(argv: string[]): ParsedArgs | undefined {
-  const positional: string[] = [];
-  // stdio stays the default: the per-tenant production path depends on it.
-  let useHttp = false;
-  let host = process.env.POSTGRES_MCP_HOST ?? DEFAULT_HOST;
-  let port = Number(process.env.POSTGRES_MCP_PORT ?? DEFAULT_PORT);
-  let token = process.env.POSTGRES_MCP_TOKEN;
-
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--http") useHttp = true;
-    else if (arg === "--stdio") useHttp = false;
-    else if (arg === "--port") port = Number(argv[++i]);
-    else if (arg === "--host") host = argv[++i];
-    else if (arg === "--token") token = argv[++i];
-    else if (arg === "--help" || arg === "-h") return undefined;
-    else if (arg.startsWith("-")) {
-      console.error(`Unknown option: ${arg}`);
-      return undefined;
-    } else positional.push(arg);
-  }
-
-  const configPath = positional[0];
-  if (!configPath) return undefined;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    console.error(`Invalid port: ${port}`);
-    return undefined;
-  }
-
-  return { configPath, useHttp, host, port, token };
-}
 
 /**
  * A source with session_vars pins one tenant's identity (e.g. app.partner_id) for the
@@ -103,12 +46,15 @@ async function main() {
   }
 
   logger.info(`Loading config from ${args.configPath}`);
-  const config = loadConfig(args.configPath);
+  let config = loadConfig(args.configPath);
   logger.info(
     `Loaded ${config.sources.length} source(s): ${config.sources.map((s) => s.id).join(", ")}`
   );
 
-  if (args.useHttp) assertHttpSafe(config);
+  if (args.useHttp) {
+    assertHttpSafe(config);
+    config = applyHttpPoolDefaults(config);
+  }
 
   const connectionManager = new ConnectionManager(config.sources);
   const schemaCache = await createSchemaCache(config);
@@ -117,6 +63,16 @@ async function main() {
   let closeTransport: () => Promise<void>;
 
   if (args.useHttp) {
+    // One process serves every client here, so an uncaught error must not be allowed to take the
+    // whole server down with it. Log it and keep serving; the transport-level handlers still turn
+    // per-request failures into per-request errors.
+    process.on("uncaughtException", (err) => {
+      logger.error(`Uncaught exception (server kept running): ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    });
+    process.on("unhandledRejection", (reason) => {
+      logger.error(`Unhandled rejection (server kept running): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
+    });
+
     const http = await startHttpServer({
       host: args.host,
       port: args.port,
@@ -143,14 +99,18 @@ async function main() {
     const hardTimeout = setTimeout(() => {
       logger.error("Shutdown timed out, forcing exit");
       process.exit(1);
-    }, 5000);
+      // Above the transport drain and pool deadlines below it, so this stays a backstop for a
+      // genuine hang rather than something a slow-but-working shutdown trips.
+    }, 8000);
     hardTimeout.unref();
 
-    connectionManager
-      .shutdown()
+    // Transport first: stop accepting, end the sessions, drain what is in flight. Ending the pools
+    // first meant pool.end() waited on a client that an in-flight query still held, so SIGTERM
+    // during a query hit the hard timeout and exited 1.
+    closeTransport()
+      .then(() => connectionManager.shutdown())
       .then(() => {
         auditLog.close();
-        return closeTransport();
       })
       .then(() => {
         logger.info("Clean shutdown complete");
