@@ -23,7 +23,7 @@
     "url": "https://github.com/Passionfroot/postgres-mcp.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "node-sql-parser": "^5.4.0",
     "pg": "^8.22.0",
     "postgres-array": "^3.0.4",
