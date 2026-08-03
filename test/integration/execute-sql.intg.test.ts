@@ -213,3 +213,105 @@ describe.skipIf(!isDbAvailable)("readonly enforcement integration", () => {
     }
   });
 });
+
+describe.skipIf(!isDbAvailable)("multi-statement batches against a real connection", () => {
+  const multiStatementSource: SourceConfig = {
+    id: "multi-statement-test",
+    dsn: TEST_DSN,
+    readonly: false,
+    maxRows: 10,
+    timeout: 5,
+    poolMax: 1,
+    allowMultiStatements: true,
+  };
+  const multiStatementOptions = { readonly: false, allowMultiStatements: true };
+
+  it("executes a genuine two-statement batch and returns the final statement's rows", async () => {
+    const manager = new ConnectionManager([multiStatementSource]);
+
+    try {
+      const pool = await manager.getPool("multi-statement-test");
+      // A real batch sent to the wire as one string containing two statements — this is what
+      // node-postgres returns an ARRAY of QueryResults for, which previously threw a TypeError.
+      const result = await executeQuery(
+        pool,
+        "SET statement_timeout = '5000'; SELECT generate_series(1, 3) as n",
+        10,
+        multiStatementOptions
+      );
+
+      expect(result.rows).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }]);
+      expect(result.rowCount).toBe(3);
+      expect(result.truncated).toBe(false);
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it("caps rows at maxRows for the final statement in a batch", async () => {
+    const manager = new ConnectionManager([multiStatementSource]);
+
+    try {
+      const pool = await manager.getPool("multi-statement-test");
+      const result = await executeQuery(
+        pool,
+        "SET statement_timeout = '5000'; SELECT generate_series(1, 100) as n",
+        10,
+        multiStatementOptions
+      );
+
+      expect(result.rowCount).toBe(10);
+      expect(result.truncated).toBe(true);
+      expect(result.rows).toHaveLength(10);
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it("throws instead of discarding rows when two statements in the batch both return rows", async () => {
+    const manager = new ConnectionManager([multiStatementSource]);
+
+    try {
+      const pool = await manager.getPool("multi-statement-test");
+
+      await expect(
+        executeQuery(
+          pool,
+          "SELECT 1 as n; SELECT 2 as n",
+          10,
+          multiStatementOptions
+        )
+      ).rejects.toThrow("Multi-statement query returned rows from more than one statement");
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
+  it("still rejects a multi-statement batch on a read-only-guarded source (guard not weakened)", async () => {
+    // readonly + allowMultiStatements: false is the "guarded" combination — this must keep
+    // rejecting multi-statement input outright, never reaching the array-handling code above.
+    const guardedSource: SourceConfig = {
+      id: "guarded-test",
+      dsn: TEST_DSN,
+      readonly: true,
+      maxRows: 10,
+      timeout: 5,
+      poolMax: 1,
+      allowMultiStatements: false,
+    };
+    const manager = new ConnectionManager([guardedSource]);
+
+    try {
+      const pool = await manager.getPool("guarded-test");
+
+      await expect(
+        executeQuery(pool, "SELECT 1 as n; SELECT 2 as n", 10, {
+          readonly: true,
+          allowMultiStatements: false,
+        })
+      ).rejects.toThrow("Multi-statement queries are not allowed");
+    } finally {
+      await manager.shutdown();
+    }
+  });
+});

@@ -792,4 +792,105 @@ describe("executeQuery", () => {
       executeQuery(pool, "SELECT * FROM creators", 100, defaultOptions)
     ).rejects.toThrow("search_objects");
   });
+
+  describe("multi-statement result handling (allowMultiStatements: true)", () => {
+    const multiStatementOptions = { readonly: false, allowMultiStatements: true };
+
+    it("returns the last statement's rows when node-postgres returns an array", async () => {
+      // node-postgres returns an ARRAY of QueryResults (not a single QueryResult) when the
+      // SQL text sent to the wire contains more than one statement. This reproduces that shape.
+      const queryFn = vi.fn().mockResolvedValue([
+        { rows: [], rowCount: 0, command: "SET" },
+        { rows: [{ id: 1 }, { id: 2 }], rowCount: 2, command: "SELECT" },
+      ]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "SET statement_timeout = 5000; SELECT id FROM users",
+        100,
+        multiStatementOptions
+      );
+
+      expect(result.rows).toEqual([{ id: 1 }, { id: 2 }]);
+      expect(result.rowCount).toBe(2);
+      expect(result.truncated).toBe(false);
+    });
+
+    it("applies max_rows truncation to the last statement's result set", async () => {
+      const rows = Array.from({ length: 11 }, (_, i) => ({ id: i + 1 }));
+      const queryFn = vi.fn().mockResolvedValue([
+        { rows: [], rowCount: 0, command: "SET" },
+        { rows, rowCount: rows.length, command: "SELECT" },
+      ]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "SET statement_timeout = 5000; SELECT id FROM users",
+        10,
+        multiStatementOptions
+      );
+
+      expect(result.truncated).toBe(true);
+      expect(result.rowCount).toBe(10);
+      expect(result.rows).toHaveLength(10);
+    });
+
+    it("throws instead of silently discarding rows from an earlier statement", async () => {
+      const queryFn = vi.fn().mockResolvedValue([
+        { rows: [{ id: 1 }], rowCount: 1, command: "SELECT" },
+        { rows: [{ id: 2 }], rowCount: 1, command: "SELECT" },
+      ]);
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(pool, "SELECT id FROM a; SELECT id FROM b", 100, multiStatementOptions)
+      ).rejects.toThrow("Multi-statement query returned rows from more than one statement");
+    });
+
+    it("handles an all-empty batch (e.g. SET; SET) without error", async () => {
+      const queryFn = vi.fn().mockResolvedValue([
+        { rows: [], rowCount: 0, command: "SET" },
+        { rows: [], rowCount: 0, command: "SET" },
+      ]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "SET a = 1; SET b = 2",
+        100,
+        multiStatementOptions
+      );
+
+      expect(result.rows).toEqual([]);
+      expect(result.rowCount).toBe(0);
+      expect(result.truncated).toBe(false);
+    });
+
+    it("still rejects multi-statement SQL when allowMultiStatements is false (guard unchanged)", async () => {
+      // This exercises ensureLimit's existing guard, not the array-handling fix above — it must
+      // keep rejecting before a query is ever sent, on both read-only and non-read-only sources.
+      const queryFn = vi.fn();
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(pool, "SELECT 1; SELECT 2", 100, defaultOptions)
+      ).rejects.toThrow("Multi-statement queries are not allowed");
+      expect(queryFn).not.toHaveBeenCalled();
+    });
+
+    it("still rejects multi-statement SQL on a readonly + allowMultiStatements:false source", async () => {
+      const queryFn = vi.fn();
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(pool, "SELECT 1; SELECT 2", 100, {
+          readonly: true,
+          allowMultiStatements: false,
+        })
+      ).rejects.toThrow("Multi-statement queries are not allowed");
+      expect(queryFn).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -528,12 +528,25 @@ export async function executeQuery(
     //
     // Gated on readOnlyQueries because allow_multi_statements is an independent setting
     // and `SELECT 1; SELECT 2` is legitimate for a source that enables it.
-    const result = await client.query(
+    const queryResult = await client.query(
       options.readOnlyQueries
         ? { text: limitedSql, queryMode: "extended" }
         : limitedSql
     );
-    const rows: Record<string, unknown>[] = result.rows;
+    const results: pg.QueryResult[] = Array.isArray(queryResult) ? queryResult : [queryResult];
+    const lastIndex = results.length - 1;
+    const earlierStatementHasRows = results.some(
+      (r, i) => i !== lastIndex && r.rows && r.rows.length > 0
+    );
+    if (earlierStatementHasRows) {
+      throw new Error(
+        "Multi-statement query returned rows from more than one statement; only the final " +
+          "statement's result set can be returned. Combine the statements into a single query " +
+          "(e.g. a CTE or UNION) or send them as separate queries."
+      );
+    }
+
+    const rows: Record<string, unknown>[] = results[lastIndex].rows ?? [];
 
     const isTruncated = rows.length > maxRows;
     const slicedRows = isTruncated ? rows.slice(0, maxRows) : rows;
