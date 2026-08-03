@@ -32,9 +32,50 @@ describe("ensureLimit", () => {
     );
   });
 
-  it("passes multi-statement SQL through when allowed", () => {
-    const sql = "SELECT 1; SELECT 2";
+  it("rejects a batch with two row-returning statements when multi-statement is allowed", () => {
+    // Decided from the AST, so it fails before the batch reaches the database.
+    expect(() => ensureLimit("SELECT 1; SELECT 2", 100, true)).toThrow(
+      "more than one statement that returns rows"
+    );
+  });
+
+  it("pushes the LIMIT onto the batch's SELECT instead of leaving it unbounded", () => {
+    const result = ensureLimit(
+      "SET statement_timeout = '5000'; SELECT n FROM t",
+      100,
+      true
+    );
+    expect(result).toMatch(/SET statement_timeout = '5000'/i);
+    expect(result).toMatch(/LIMIT 100/i);
+  });
+
+  it("pushes the LIMIT onto the SELECT inside a transaction batch", () => {
+    const result = ensureLimit("BEGIN; SELECT n FROM t; COMMIT", 100, true);
+    expect(result).toMatch(/SELECT n FROM "?t"? LIMIT 100/i);
+    expect(result).toMatch(/COMMIT/i);
+  });
+
+  it("preserves an existing LIMIT on the batch's SELECT", () => {
+    const sql = "SET statement_timeout = '5000'; SELECT n FROM t LIMIT 5";
     expect(ensureLimit(sql, 100, true)).toBe(sql);
+  });
+
+  it("leaves a batch with no row-returning statement alone", () => {
+    const sql = "SET a.b = '1'; SET c.d = '2'";
+    expect(ensureLimit(sql, 100, true)).toBe(sql);
+  });
+
+  it("does not try to put a LIMIT on SHOW", () => {
+    const sql = "SET statement_timeout = '5000'; SHOW statement_timeout";
+    expect(ensureLimit(sql, 100, true)).toBe(sql);
+  });
+
+  it("passes an unparseable multi-statement batch through the regex fallback", () => {
+    // astify cannot read `TABLE t`, so there is no AST to push a LIMIT onto.
+    const sql = "SET statement_timeout = '5000'; TABLE t";
+    expect(ensureLimit(sql, 100, true)).toBe(
+      "SET statement_timeout = '5000'; TABLE t LIMIT 100"
+    );
   });
 
   it("leaves non-SELECT statements unchanged", () => {
@@ -982,6 +1023,36 @@ describe("executeQuery", () => {
       expect(result.truncated).toBe(true);
       expect(result.rowCount).toBe(10);
       expect(result.rows).toHaveLength(10);
+    });
+
+    it("rejects two row-returning statements before sending anything to the database", async () => {
+      const queryFn = vi.fn();
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(
+          pool,
+          "SELECT id FROM a; SELECT id FROM b",
+          100,
+          multiStatementOptions
+        )
+      ).rejects.toThrow("more than one statement that returns rows");
+      expect(queryFn).not.toHaveBeenCalled();
+    });
+
+    it("rejects a write batch with two row-returning statements before it can commit", async () => {
+      const queryFn = vi.fn();
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(
+          pool,
+          "INSERT INTO a (n) VALUES (1) RETURNING n; SELECT n FROM a",
+          100,
+          multiStatementOptions
+        )
+      ).rejects.toThrow("more than one statement that returns rows");
+      expect(queryFn).not.toHaveBeenCalled();
     });
 
     it("still rejects two row-returning results at runtime when the parser could not check", async () => {

@@ -403,6 +403,28 @@ describe.skipIf(!isDbAvailable)(
       }
     });
 
+    it("stops the server at max_rows instead of slicing a full result set locally", async () => {
+      const manager = new ConnectionManager([multiStatementSource]);
+
+      try {
+        await probePool.query("DELETE FROM batch_touched");
+        const pool = await manager.getPool("multi-statement-test");
+        const result = await executeQuery(
+          pool,
+          "SET statement_timeout = '5000'; SELECT batch_touch(n) as n FROM batch_src",
+          10,
+          multiStatementOptions
+        );
+
+        expect(result.rowCount).toBe(10);
+        expect(result.truncated).toBe(true);
+        // maxRows + 1 rows produced on the server, not all 100 in batch_src.
+        expect(await countRows("batch_touched")).toBe(11);
+      } finally {
+        await manager.shutdown();
+      }
+    });
+
     it("rejects a batch with two row-returning statements", async () => {
       const manager = new ConnectionManager([multiStatementSource]);
 
@@ -417,6 +439,30 @@ describe.skipIf(!isDbAvailable)(
             multiStatementOptions
           )
         ).rejects.toThrow("more than one statement that returns rows");
+      } finally {
+        await manager.shutdown();
+      }
+    });
+
+    it("rejects an ambiguous write batch before any of it runs", async () => {
+      const manager = new ConnectionManager([multiStatementSource]);
+
+      try {
+        await probePool.query("DELETE FROM batch_writes");
+        const pool = await manager.getPool("multi-statement-test");
+
+        await expect(
+          executeQuery(
+            pool,
+            "INSERT INTO batch_writes (n) VALUES (1) RETURNING n; SELECT n FROM batch_writes",
+            10,
+            multiStatementOptions
+          )
+        ).rejects.toThrow("more than one statement that returns rows");
+
+        // The point of deciding this from the AST: told to resend, the caller would otherwise
+        // insert a second row, because the first attempt had already committed.
+        expect(await countRows("batch_writes")).toBe(0);
       } finally {
         await manager.shutdown();
       }
