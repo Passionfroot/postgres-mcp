@@ -79,7 +79,8 @@ Safety mechanisms:
 - **LIMIT injection**: Single SELECT queries without a LIMIT get one auto-appended. If the SQL parser can't handle the query (PostgreSQL-specific operators, lateral joins), a regex fallback appends `LIMIT N` instead of running unlimited.
 - **Statement timeout**: Every query runs under the source's `statement_timeout`. PostgreSQL cancels it server-side.
 - **Readonly enforcement**: When `readonly = true`, the server sets `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` before each query.
-- **Multi-statement blocking**: When `allow_multi_statements = false` (default), semicolon-separated compound queries are rejected.
+- **Multi-statement blocking**: When `allow_multi_statements = false` (default), a compound query the parser can see is rejected before it is sent. Input the parser reads as one statement and PostgreSQL splits into several is caught after the fact, when the driver returns one result per statement, and is rejected and logged rather than answered. Only `read_only_queries = true` keeps such a statement from running at all.
+- **Batch results**: With `allow_multi_statements = true`, a batch returns its last row-returning statement, so `BEGIN; SELECT ...; COMMIT` returns the SELECT. A batch with two statements that both return rows is ambiguous and is rejected.
 
 ### `search_objects`
 

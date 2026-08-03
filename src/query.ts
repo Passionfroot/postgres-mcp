@@ -241,7 +241,10 @@ function findStatementBoundaryHazard(sql: string): string | null {
 
     // Dollar-quoted string: no escapes at all inside, ends at the matching tag.
     // A bare `$1` placeholder is not a dollar quote.
-    const dollarTag = char === "$" ? /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i)) : null;
+    const dollarTag =
+      char === "$"
+        ? /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i))
+        : null;
     if (dollarTag) {
       const tag = dollarTag[0];
       const close = sql.indexOf(tag, i + tag.length);
@@ -365,7 +368,7 @@ export function assertReadOnlyQuery(sql: string): void {
       "This source only answers read-only SELECT queries, and this statement could not be " +
         "parsed to verify that, so it was rejected. The guard's parser is stricter than " +
         "PostgreSQL: a reserved word used as a bare alias (AS set, AS order) or an operator " +
-        "it does not know are the usual causes. Quote the alias (AS \"set\") or express the " +
+        'it does not know are the usual causes. Quote the alias (AS "set") or express the ' +
         "same read another way."
     );
   }
@@ -401,6 +404,14 @@ export function assertReadOnlyQuery(sql: string): void {
   }
 }
 
+const MULTI_STATEMENT_NOT_ALLOWED =
+  "Multi-statement queries are not allowed on this source. Send one statement at a time.";
+
+const AMBIGUOUS_BATCH =
+  "Multi-statement query has more than one statement that returns rows; only the final " +
+  "statement's result set can be returned. Combine the statements into a single query " +
+  "(e.g. a CTE or UNION) or send them as separate queries.";
+
 /**
  * Parse the SQL, and if it's a single SELECT without a LIMIT, append one.
  *
@@ -418,9 +429,7 @@ export function ensureLimit(
     const statements = Array.isArray(raw) ? raw : [raw];
     if (statements.length > 1) {
       if (!allowMultiStatements) {
-        throw new Error(
-          "Multi-statement queries are not allowed on this source. Send one statement at a time."
-        );
+        throw new Error(MULTI_STATEMENT_NOT_ALLOWED);
       }
       return sql;
     }
@@ -533,20 +542,41 @@ export async function executeQuery(
         ? { text: limitedSql, queryMode: "extended" }
         : limitedSql
     );
-    const results: pg.QueryResult[] = Array.isArray(queryResult) ? queryResult : [queryResult];
-    const lastIndex = results.length - 1;
-    const earlierStatementHasRows = results.some(
-      (r, i) => i !== lastIndex && r.rows && r.rows.length > 0
-    );
-    if (earlierStatementHasRows) {
-      throw new Error(
-        "Multi-statement query returned rows from more than one statement; only the final " +
-          "statement's result set can be returned. Combine the statements into a single query " +
-          "(e.g. a CTE or UNION) or send them as separate queries."
-      );
+    // node-postgres types client.query() as returning a single QueryResult, but the driver
+    // returns an ARRAY of them, one per statement, whenever the server executed more than one
+    // command. That is not limited to allow_multi_statements sources: input that the SQL
+    // parser reads as one statement and PostgreSQL splits into several arrives here too (see
+    // findStatementBoundaryHazard), so nothing below assumes the source opted in.
+    const results: pg.QueryResult[] = Array.isArray(queryResult)
+      ? queryResult
+      : [queryResult];
+
+    if (results.length > 1 && !options.allowMultiStatements) {
+      // ensureLimit saw one statement and the server ran several, so this input split at a
+      // boundary the parser does not agree with. Returning rows here would put a smuggled
+      // batch on the success path, where the audit log records it as an ordinary read.
+      logger.warn("Multi-statement batch on a source that does not allow one", {
+        statements: results.length,
+        commands: results.map((r) => r.command).join(", "),
+      });
+      throw new Error(MULTI_STATEMENT_NOT_ALLOWED);
     }
 
-    const rows: Record<string, unknown>[] = results[lastIndex].rows ?? [];
+    // Runtime fallback for batches ensureLimit could not check, i.e. the ones the parser
+    // could not read. `fields` is the signal, not `rows`: on PostgreSQL 16, SELECT ... WHERE
+    // false returns zero rows with populated fields, while SET, BEGIN and COMMIT return
+    // neither. SHOW is skipped for the same reason it is at parse time: it reports session
+    // state rather than competing for the batch's answer.
+    const rowReturning = results.filter((r) => r.fields?.length);
+    if (rowReturning.filter((r) => r.command !== "SHOW").length > 1) {
+      throw new Error(AMBIGUOUS_BATCH);
+    }
+
+    // The batch's answer is its last row-returning result, not its last result: `BEGIN;
+    // SELECT ...; COMMIT` has to return the SELECT. With none (`SET a; SET b`) every result
+    // is empty, so the last one stands in.
+    const chosen = rowReturning.at(-1) ?? results[results.length - 1];
+    const rows: Record<string, unknown>[] = chosen.rows ?? [];
 
     const isTruncated = rows.length > maxRows;
     const slicedRows = isTruncated ? rows.slice(0, maxRows) : rows;
