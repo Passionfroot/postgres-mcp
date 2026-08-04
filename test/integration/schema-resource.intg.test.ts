@@ -92,7 +92,10 @@ describe.skipIf(!isDbAvailable)("full schema pipeline integration", () => {
     const pool = await connectionManager.getPool("local");
 
     const dbMetadata = await introspectDatabase(pool);
-    const merged = mergeSchemas(null, dbMetadata);
+    // An empty mapping is what createSchemaCache builds when no prisma_schema_path is
+    // configured, which is every production source. mergeSchemas takes a PrismaMapping,
+    // never null, so passing null here never matched the code under test.
+    const merged = mergeSchemas({ models: [], enums: [] }, dbMetadata);
 
     const tableWithColumns = merged.tables.find((t) => t.columns.length > 1);
     expect(tableWithColumns).toBeDefined();
