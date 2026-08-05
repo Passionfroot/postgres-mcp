@@ -499,6 +499,71 @@ describe("assertReadOnlyQuery", () => {
     expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
   });
 
+  // A comment glued directly onto a function name with no separating whitespace, e.g.
+  // `set_config--x\n(...)`. node-sql-parser folds the `--x` into the identifier itself
+  // (it names the function `set_config--x`), so it matches neither SESSION_MUTATION_RE
+  // nor DANGEROUS_FUNCTIONS; PostgreSQL's own lexer always ends the identifier at
+  // `set_config` and executes `--x\n` as a comment, so the real set_config(...) runs.
+  // Proven on a live FORCE ROW LEVEL SECURITY fixture to leak another tenant's row. Not
+  // set_config-specific: the whole DANGEROUS_FUNCTIONS list is exposed the same way.
+  //
+  // The trailing LIMIT is required to reproduce this: without one, ensureLimit
+  // re-serialises the AST (parser.sqlify), which collapses the glued comment onto one
+  // line and PostgreSQL rejects the result with a syntax error before this guard even
+  // matters. A regression test without a LIMIT would pass whether or not this is fixed.
+  it.each([
+    [
+      "set_config, line comment",
+      "SELECT set_config--x\n('app.partner_id','tenantB',false) FROM t LIMIT 10",
+    ],
+    [
+      "pg_read_file, line comment",
+      "SELECT pg_read_file--x\n('/etc/passwd') FROM t LIMIT 10",
+    ],
+    [
+      "set_config, block comment",
+      "SELECT set_config/*x*/('app.partner_id','tenantB',false) FROM t LIMIT 10",
+    ],
+    [
+      "bare trailing -- with no text before the newline",
+      "SELECT set_config--\n('app.partner_id','tenantB',false) FROM t LIMIT 10",
+    ],
+  ])(
+    "rejects a comment glued onto a dangerous function (%s)",
+    (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+    }
+  );
+
+  it("names the comment-glue reason", () => {
+    let reason = "";
+    try {
+      assertReadOnlyQuery(
+        "SELECT set_config--x\n('app.partner_id','tenantB',false) FROM t LIMIT 10"
+      );
+    } catch (err) {
+      reason = (err as ReadOnlyQueryError).reason;
+    }
+    expect(reason).toContain(
+      "a comment starts immediately after an identifier"
+    );
+  });
+
+  // A comment that is NOT glued to the preceding token stays allowed; this is what
+  // distinguishes the fix from simply banning comments outright.
+  it.each([
+    [
+      "line comment with a leading space",
+      "SELECT * FROM t -- trailing note\nLIMIT 10",
+    ],
+    [
+      "block comment with a leading space",
+      "SELECT * FROM t /* note */ LIMIT 10",
+    ],
+  ])("still allows %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).not.toThrow();
+  });
+
   describe("EXPLAIN", () => {
     it.each([
       ["bare", "EXPLAIN SELECT * FROM collaborations"],
@@ -771,10 +836,52 @@ describe("executeQuery", () => {
 
     await executeQuery(pool, "SELECT 1", 10, defaultOptions);
 
-    expect(
-      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })
-        ._client.release
-    ).toHaveBeenCalledTimes(1);
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
+    expect(release).toHaveBeenCalledTimes(1);
+    // Falsy first argument, so pg-pool keeps the connection for reuse. `release()` and
+    // `release(undefined)` are equivalent to it, so assert the value rather than the arity.
+    expect(release.mock.calls[0][0]).toBeFalsy();
+  });
+
+  it("discards the connection when the client-side query timeout fires", async () => {
+    // pg rejects with this and leaves the server still executing on the connection. Releasing it
+    // clean puts a busy connection back into a pool whose default size is 1.
+    const queryFn = vi.fn().mockRejectedValue(new Error("Query read timeout"));
+    const pool = createMockPool(queryFn);
+
+    await expect(
+      executeQuery(pool, "SELECT 1", 10, defaultOptions)
+    ).rejects.toThrow("Query read timeout");
+
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release.mock.calls[0][0]).toBeInstanceOf(Error);
+  });
+
+  it("discards the connection when resetting session state fails", async () => {
+    // Leaving a pinned app.partner_id on a pooled connection would hand one caller's RLS scope to
+    // the next one.
+    const queryFn = vi.fn().mockImplementation((sql: string) => {
+      if (sql.startsWith("RESET"))
+        return Promise.reject(new Error("connection lost"));
+      return Promise.resolve({ rows: [{ id: 1 }] });
+    });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT 1", 10, {
+      ...defaultOptions,
+      sessionVars: { "app.partner_id": "abc" },
+    });
+
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release.mock.calls[0][0]).toBeInstanceOf(Error);
   });
 
   it("releases client after failed query", async () => {

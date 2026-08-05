@@ -169,6 +169,18 @@ function collectFunctionNames(node: unknown, acc: Set<string>): void {
 // backslash escapes inside those, so the two lexers agree), doubled '' quotes and
 // comments all produce identical statement boundaries on both sides. Rejecting them
 // would add false positives and close nothing.
+//
+// A comment glued directly onto an identifier or quoted token with no separating
+// whitespace, e.g. `set_config--x\n(...)`. node-sql-parser folds `--x` into the
+// identifier itself (it names the function `set_config--x`, which matches nothing
+// in DANGEROUS_FUNCTIONS or SESSION_MUTATION_RE), while PostgreSQL's lexer always
+// ends an identifier/quoted-token at that boundary and treats `--x\n` as a comment,
+// so it calls the real set_config(...) underneath. Same disagreement class as the
+// odd-backslash-before-a-quote check above, just at the opposite end of a token:
+// PostgreSQL has a fixed opinion about where the token stops, node-sql-parser
+// doesn't always agree, and the guard has to side with PostgreSQL.
+const COMMENT_GLUE_CHAR_RE = /[A-Za-z0-9_$"]/;
+
 function findStatementBoundaryHazard(sql: string): string | null {
   const HAZARD_TAIL =
     "has a backslash immediately before its closing quote, the one spot where the SQL " +
@@ -181,6 +193,13 @@ function findStatementBoundaryHazard(sql: string): string | null {
     `a quoted identifier ${HAZARD_TAIL}. Backslashes elsewhere inside an identifier are ` +
     "fine; an identifier that really ends in a backslash cannot be addressed through " +
     "this source";
+  const COMMENT_GLUE_HAZARD =
+    "a comment starts immediately after an identifier or quoted token with no space or " +
+    "newline in between, the one spot where PostgreSQL always ends the token there while " +
+    "the SQL parser can read the comment as part of the token name instead (e.g. " +
+    "set_config--x then a newline then (...) is parsed here as one identifier, " +
+    "set_config--x, but PostgreSQL ends the identifier at set_config and runs the real " +
+    "set_config(...) underneath). Add a space or newline before the comment";
 
   let i = 0;
 
@@ -188,6 +207,8 @@ function findStatementBoundaryHazard(sql: string): string | null {
     const char = sql[i];
 
     if (char === "-" && sql[i + 1] === "-") {
+      if (COMMENT_GLUE_CHAR_RE.test(sql[i - 1] ?? ""))
+        return COMMENT_GLUE_HAZARD;
       const newline = sql.indexOf("\n", i);
       i = newline === -1 ? sql.length : newline + 1;
       continue;
@@ -195,6 +216,8 @@ function findStatementBoundaryHazard(sql: string): string | null {
 
     // PostgreSQL block comments nest.
     if (char === "/" && sql[i + 1] === "*") {
+      if (COMMENT_GLUE_CHAR_RE.test(sql[i - 1] ?? ""))
+        return COMMENT_GLUE_HAZARD;
       let depth = 1;
       i += 2;
       while (i < sql.length && depth > 0) {
@@ -551,6 +574,9 @@ export async function executeQuery(
   );
 
   const client = await pool.connect();
+  // Set when the connection cannot be trusted for reuse. Releasing without an error hands it
+  // straight back to the pool, and at the default pool_max of 1 it is the only connection there.
+  let discardReason: string | undefined;
   try {
     if (options.role) {
       await client.query(`SET ROLE ${escapeIdentifier(options.role)}`);
@@ -637,6 +663,12 @@ export async function executeQuery(
       truncated: isTruncated,
     };
   } catch (err: unknown) {
+    // pg's client-side query_timeout rejects the caller but leaves the server still executing on
+    // this connection, so it must not go back into the pool.
+    if (err instanceof Error && err.message === "Query read timeout") {
+      discardReason = "client-side query timeout";
+    }
+
     if (!isPgError(err)) throw err;
 
     if (err.code === "57014") {
@@ -669,20 +701,18 @@ export async function executeQuery(
         await client.query("RESET ROLE");
       }
     } catch (cleanupErr) {
-      logger.warn(
-        "Failed to reset RLS session state; connection may be discarded by pool",
-        {
-          error:
-            cleanupErr instanceof Error
-              ? cleanupErr.message
-              : String(cleanupErr),
-          role: options.role ?? "",
-          sessionVarKeys: options.sessionVars
-            ? Object.keys(options.sessionVars).join(", ")
-            : "",
-        }
-      );
+      // The role or session vars may still be set, so this connection must not serve another
+      // caller: leaking a pinned app.partner_id across callers would defeat RLS.
+      discardReason = "failed to reset session state";
+      logger.warn("Failed to reset RLS session state; discarding connection", {
+        error:
+          cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        role: options.role ?? "",
+        sessionVarKeys: options.sessionVars
+          ? Object.keys(options.sessionVars).join(", ")
+          : "",
+      });
     }
-    client.release();
+    client.release(discardReason ? new Error(discardReason) : undefined);
   }
 }
