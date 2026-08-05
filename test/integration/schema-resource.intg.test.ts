@@ -13,7 +13,8 @@ import { mergeSchemas } from "../../src/schema/merge.js";
 import { parsePrismaFiles } from "../../src/schema/prisma-parser.js";
 import { searchTables } from "../../src/schema/search.js";
 
-const TEST_DSN = process.env.POSTGRES_MCP_TEST_DSN ?? "postgresql://localhost/postgres";
+const TEST_DSN =
+  process.env.POSTGRES_MCP_TEST_DSN ?? "postgresql://localhost/postgres";
 
 const localSource: SourceConfig = {
   id: "local",
@@ -137,8 +138,16 @@ describe.skipIf(!isDbAvailable)("createSchemaCache integration", () => {
     expect(schema.tables.length).toBeGreaterThan(0);
     expect(schema.tables.every((t) => t.prismaModelName === null)).toBe(true);
 
-    const output = formatRelationshipMap(schema, "local");
-    expect(output).toContain("0 tables");
+    // Without a mapping the map lists every database table. Filtering to Prisma-mapped tables
+    // here would leave the resource empty, which is what it used to serve.
+    expect(cache.hasPrismaMapping).toBe(false);
+    const output = formatRelationshipMap(schema, "local", {
+      hasPrismaMapping: false,
+    });
+    expect(output).toContain(`${schema.tables.length} tables`);
+    for (const table of schema.tables) {
+      expect(output).toContain(table.sqlName);
+    }
   });
 
   it("search_objects still finds tables when prismaSchemaPath is omitted", async () => {

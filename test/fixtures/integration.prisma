@@ -1,0 +1,28 @@
+// Maps the throwaway tables that server-surface.intg.test.ts creates in the test database.
+// The `pgmcp_` prefix keeps the fixture from colliding with whatever else lives in that database.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model PgmcpUser {
+  id    String      @id
+  email String
+  posts PgmcpPost[]
+
+  @@map("pgmcp_users")
+}
+
+model PgmcpPost {
+  id       String    @id
+  title    String
+  authorId String    @map("author_id")
+  author   PgmcpUser @relation(fields: [authorId], references: [id])
+
+  @@map("pgmcp_posts")
+}

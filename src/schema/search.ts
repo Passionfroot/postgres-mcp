@@ -29,32 +29,45 @@ export function searchTables(schema: MergedSchema, pattern: string): MergedTable
   return [...exact, ...partial];
 }
 
-function formatColumn(col: MergedColumn) {
+function formatColumn(col: MergedColumn, hasPrismaMapping: boolean) {
   const parts = [`    ${col.sqlName}`, col.dataType, col.isNullable ? "NULL" : "NOT NULL"];
 
   if (col.isPrimaryKey) parts.push("[PK]");
   if (col.columnDefault !== null) parts.push(`default: ${col.columnDefault}`);
-  if (col.prismaFieldName !== null) {
+  if (hasPrismaMapping && col.prismaFieldName !== null) {
     parts.push(`(Prisma: ${col.prismaFieldName})`);
   }
 
   return parts.join("  ");
 }
 
+export interface FormatSearchResultsOptions {
+  enumResolver?: (udtName: string) => { label: string; dbValue: string }[] | null;
+  /** When false, no Prisma annotation is rendered at all. Defaults to true. */
+  hasPrismaMapping?: boolean;
+}
+
 export function formatSearchResults(
   tables: MergedTable[],
-  enumResolver?: (udtName: string) => { label: string; dbValue: string }[] | null
+  options: FormatSearchResultsOptions = {}
 ) {
   if (tables.length === 0) return "No matching tables found.";
+
+  const { enumResolver, hasPrismaMapping = true } = options;
 
   const sections: string[] = [];
 
   for (const table of tables) {
     const lines: string[] = [];
 
-    const header = table.prismaModelName
-      ? `${table.sqlName} (Prisma: ${table.prismaModelName})`
-      : `${table.sqlName} (no Prisma model)`;
+    let header: string;
+    if (!hasPrismaMapping) {
+      header = table.sqlName;
+    } else if (table.prismaModelName) {
+      header = `${table.sqlName} (Prisma: ${table.prismaModelName})`;
+    } else {
+      header = `${table.sqlName} (no Prisma model)`;
+    }
     lines.push(header);
 
     if (table.primaryKeys.length > 0) {
@@ -64,7 +77,7 @@ export function formatSearchResults(
     if (table.columns.length > 0) {
       lines.push("  Columns:");
       for (const col of table.columns) {
-        lines.push(formatColumn(col));
+        lines.push(formatColumn(col, hasPrismaMapping));
 
         if (col.dataType === "USER-DEFINED" && enumResolver) {
           const values = enumResolver(col.udtName);

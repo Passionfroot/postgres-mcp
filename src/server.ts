@@ -9,7 +9,7 @@ import type { Config } from "./types.js";
 import { expandStarColumns } from "./expand-star.js";
 import { logger } from "./logger.js";
 import { mcpErrorResult, mcpTextResult, resolveSource } from "./mcp-helpers.js";
-import { executeQuery } from "./query.js";
+import { executeQuery, ReadOnlyQueryError } from "./query.js";
 import { registerSchemaResource } from "./schema/resource.js";
 import { registerSearchTool } from "./schema/search-tool.js";
 
@@ -40,11 +40,22 @@ export function createServer(
       ? ` Sources configured as read-only: ${readonlySources.join(", ")}.`
       : "";
 
+  const restrictedSources = config.sources
+    .filter((s) => s.readOnlyQueries)
+    .map((s) => s.id);
+  const restrictedNote =
+    restrictedSources.length > 0
+      ? ` Sources that accept ONLY read-only SELECT statements: ${restrictedSources.join(", ")}.` +
+        " On these, do not send SET, RESET, SET ROLE, set_config(), DDL, DML, transaction control," +
+        " or multiple statements in one call. They are rejected before reaching the database." +
+        " EXPLAIN without ANALYZE is allowed; EXPLAIN ANALYZE is not."
+      : "";
+
   server.registerTool(
     "execute_sql",
     {
       title: "Execute SQL",
-      description: `Execute SQL against a configured PostgreSQL database. Returns JSON rows.${readonlyNote}`,
+      description: `Execute SQL against a configured PostgreSQL database. Returns JSON rows.${readonlyNote}${restrictedNote}`,
       inputSchema: {
         database: z.string().describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
         query: z.string().describe("SQL query to execute"),
@@ -65,6 +76,7 @@ export function createServer(
         const result = await executeQuery(pool, query, source.maxRows, {
           readonly: source.readonly,
           allowMultiStatements: source.allowMultiStatements,
+          readOnlyQueries: source.readOnlyQueries,
           role: source.role,
           sessionVars: source.sessionVars,
           expandStar: (sql) => expandStarColumns(sql, schema),
@@ -81,6 +93,16 @@ export function createServer(
         return mcpTextResult(JSON.stringify(result, null, 2));
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
+        // The guard rejecting a query is a security event, not a syntax error. Both
+        // production deployments run without an [audit_log], so emit a distinct
+        // greppable line that does not depend on one being configured. Reason and
+        // source only: the SQL itself can carry user data.
+        if (err instanceof ReadOnlyQueryError) {
+          logger.warn("blocked session-mutating query", {
+            source: database,
+            reason: err.reason,
+          });
+        }
         logger.error(`execute_sql error for database "${database}": ${message}`);
 
         auditLog.log({
