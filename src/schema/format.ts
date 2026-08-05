@@ -63,18 +63,24 @@ export function formatRelationshipMap(
 
   const totalFks = countVisibleFks(sortedTables);
 
-  const lines: string[] = [];
-  lines.push(
-    `# Schema: ${databaseId} (${sortedTables.length} tables, ${totalFks} FK relationships)`
-  );
-  lines.push("");
-  lines.push("Use search_objects to look up column detail for specific tables.");
-
   // missing_table warnings from top-level driftWarnings
   const missingTableWarnings = hasPrismaMapping
     ? schema.driftWarnings.filter((w) => w.type === "missing_table")
     : [];
   const missingTableNames = new Set(missingTableWarnings.map((w) => w.tableName));
+
+  // These render as extra trailing entries below, on top of sortedTables, so the header total
+  // has to count them too or it undercounts whenever a Prisma model maps to a table missing
+  // from the database.
+  const trailingMissingTableWarnings = missingTableWarnings.filter(
+    (w) => !sortedTables.some((t) => t.sqlName === w.tableName)
+  );
+  const totalTables = sortedTables.length + trailingMissingTableWarnings.length;
+
+  const lines: string[] = [];
+  lines.push(`# Schema: ${databaseId} (${totalTables} tables, ${totalFks} FK relationships)`);
+  lines.push("");
+  lines.push("Use search_objects to look up column detail for specific tables.");
 
   for (const table of sortedTables) {
     lines.push("");
@@ -107,15 +113,12 @@ export function formatRelationshipMap(
   }
 
   // Render top-level missing_table warnings for tables not already in sortedTables
-  for (const warning of missingTableWarnings) {
-    const alreadyRendered = sortedTables.some((t) => t.sqlName === warning.tableName);
-    if (!alreadyRendered) {
-      // Find the Prisma model name from the warning detail
-      const modelNameMatch = warning.detail.match(/Prisma model "(\w+)"/);
-      const modelName = modelNameMatch ? modelNameMatch[1] : warning.tableName;
-      lines.push("");
-      lines.push(`${warning.tableName} (Prisma: ${modelName}) -- TABLE MISSING IN DATABASE`);
-    }
+  for (const warning of trailingMissingTableWarnings) {
+    // Find the Prisma model name from the warning detail
+    const modelNameMatch = warning.detail.match(/Prisma model "(\w+)"/);
+    const modelName = modelNameMatch ? modelNameMatch[1] : warning.tableName;
+    lines.push("");
+    lines.push(`${warning.tableName} (Prisma: ${modelName}) -- TABLE MISSING IN DATABASE`);
   }
 
   lines.push("");

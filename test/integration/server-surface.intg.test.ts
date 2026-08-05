@@ -129,12 +129,16 @@ describe.skipIf(!isDbAvailable)("MCP surface with no Prisma mapping loaded", () 
   });
 
   it("mentions Prisma nowhere a language model can read it", () => {
-    // A database restored from a Prisma project owns tables like `_prisma_migrations`. Those names
-    // are legitimate output, so strip them before sweeping: what must not appear is Prisma
-    // commentary the server adds on top of the database's own vocabulary.
-    const prismaNamedTables = surfaces.tableNames.filter((t) => /prisma/i.test(t));
-    const strip = (text: string) =>
-      prismaNamedTables.reduce((acc, name) => acc.replaceAll(name, "<table>"), text);
+    // A bare /prisma/i sweep false-fails on a database's own vocabulary (a table or column that
+    // happens to contain "prisma", e.g. `_prisma_migrations`). Check for the actual annotation
+    // markers the server emits when a mapping is loaded (search-tool.ts, resource.ts, search.ts,
+    // format.ts) instead.
+    const prismaMarkers = [
+      "Prisma model name",
+      "Prisma model names",
+      "(Prisma:",
+      "no Prisma model",
+    ];
 
     const everything = [
       surfaces.tools,
@@ -143,7 +147,9 @@ describe.skipIf(!isDbAvailable)("MCP surface with no Prisma mapping loaded", () 
       ...surfaces.searchResults,
     ].join("\n");
 
-    expect(strip(everything)).not.toMatch(/prisma/i);
+    for (const marker of prismaMarkers) {
+      expect(everything).not.toContain(marker);
+    }
   });
 
   it("serves a schema:// body that lists the database's tables", () => {

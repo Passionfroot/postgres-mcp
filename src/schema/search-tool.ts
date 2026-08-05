@@ -23,7 +23,7 @@ export function registerSearchTool(
   const { hasPrismaMapping } = schemaCache;
   const description = hasPrismaMapping
     ? "Search for tables by Prisma model name or SQL table name. Returns column detail including types, nullability, defaults, and enum values. Use this to look up specific tables before writing queries."
-    : "Search for tables by SQL table name. Returns column detail including types, nullability, defaults, and enum values. Use this to look up specific tables before writing queries.";
+    : "Search for tables by SQL table name. Returns column detail including types, nullability, and defaults. Use this to look up specific tables before writing queries.";
   const patternDescription = hasPrismaMapping
     ? "Table name or Prisma model name to search for (e.g., 'User', 'partnerUsers', 'collaboration')"
     : "Table name to search for (e.g., 'partnerUsers', 'collaboration')";

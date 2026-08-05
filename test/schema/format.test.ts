@@ -131,6 +131,32 @@ describe("formatRelationshipMap", () => {
     expect(output).toContain("ghost_table (Prisma: GhostModel) -- TABLE MISSING IN DATABASE");
   });
 
+  it("counts missing-table entries in the header total", () => {
+    const schema = makeSchema(
+      [
+        makeTable({
+          sqlName: "creators",
+          prismaModelName: "Creator",
+        }),
+      ],
+      {
+        driftWarnings: [
+          {
+            type: "missing_table",
+            tableName: "ghost_table",
+            detail:
+              'Prisma model "GhostModel" maps to table "ghost_table" which does not exist in the database',
+          },
+        ],
+      }
+    );
+
+    const output = formatRelationshipMap(schema, "local");
+
+    // Body lists both `creators` and the trailing `ghost_table` entry, so the header must say 2.
+    expect(output).toContain("# Schema: local (2 tables, 0 FK relationships)");
+  });
+
   it("renders missing_column and type_mismatch drift warnings indented under table", () => {
     const schema = makeSchema([
       makeTable({
