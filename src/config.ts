@@ -17,6 +17,12 @@ export const sourceConfigSchema = z.object({
   pool_max: z.number().int().positive().optional(),
   max_response_bytes: z.number().int().positive().optional().default(1_000_000),
   allow_multi_statements: z.boolean().optional().default(false),
+  // Answer only read-only SELECT queries: reject SET/RESET/SET ROLE, non-SELECT
+  // statements, and server-side file/program access. Defaults on for any source
+  // that pins its tenant scope via role or session_vars, since a submitted query
+  // could otherwise re-point that scope or leave the restricted role. Set false to
+  // allow free-form access (e.g. a local dev source).
+  read_only_queries: z.boolean().optional(),
   role: z.string().min(1).optional(),
   session_vars: z.record(z.string().min(1), z.string()).optional(),
   ssh_host: z.string().optional(),
@@ -84,6 +90,7 @@ function toSourceConfig(raw: z.infer<typeof sourceConfigSchema>): SourceConfig {
     poolMaxExplicit: raw.pool_max !== undefined,
     maxResponseBytes: raw.max_response_bytes,
     allowMultiStatements: raw.allow_multi_statements,
+    readOnlyQueries: raw.read_only_queries ?? Boolean(raw.role || raw.session_vars),
     role: raw.role,
     sessionVars,
     sshHost: raw.ssh_host,

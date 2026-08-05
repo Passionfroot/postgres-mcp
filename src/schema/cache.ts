@@ -30,6 +30,14 @@ export class SchemaCache {
 
   constructor(private prismaMapping: PrismaMapping) {}
 
+  /**
+   * False when no Prisma schema was configured (or it parsed to nothing). Callers use this to
+   * suppress Prisma annotations and Prisma-specific wording that would be noise without a mapping.
+   */
+  get hasPrismaMapping() {
+    return this.prismaMapping.models.length > 0;
+  }
+
   async get(database: string, pool: pg.Pool, options?: IntrospectOptions): Promise<MergedSchema> {
     const cached = this.cache.get(database);
     if (cached) return cached;

@@ -9,6 +9,7 @@ export interface SourceConfig {
   poolMaxExplicit: boolean;
   maxResponseBytes: number;
   allowMultiStatements: boolean;
+  readOnlyQueries: boolean;
   role?: string;
   sessionVars?: Record<string, string>;
   sshHost?: string;

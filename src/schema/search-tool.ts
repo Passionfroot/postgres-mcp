@@ -18,19 +18,24 @@ export function registerSearchTool(
 ) {
   const sourceIds = config.sources.map((s) => s.id);
 
+  // These strings sit in the client's system context on every turn. Without a mapping loaded no
+  // Prisma model name is ever searchable, so mentioning them only invites dead-end searches.
+  const { hasPrismaMapping } = schemaCache;
+  const description = hasPrismaMapping
+    ? "Search for tables by Prisma model name or SQL table name. Returns column detail including types, nullability, defaults, and enum values. Use this to look up specific tables before writing queries."
+    : "Search for tables by SQL table name. Returns column detail including types, nullability, and defaults. Use this to look up specific tables before writing queries.";
+  const patternDescription = hasPrismaMapping
+    ? "Table name or Prisma model name to search for (e.g., 'User', 'partnerUsers', 'collaboration')"
+    : "Table name to search for (e.g., 'partnerUsers', 'collaboration')";
+
   server.registerTool(
     "search_objects",
     {
       title: "Search Schema Objects",
-      description:
-        "Search for tables by Prisma model name or SQL table name. Returns column detail including types, nullability, defaults, and enum values. Use this to look up specific tables before writing queries.",
+      description,
       inputSchema: {
         database: z.string().describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
-        pattern: z
-          .string()
-          .describe(
-            "Table name or Prisma model name to search for (e.g., 'User', 'partnerUsers', 'collaboration')"
-          ),
+        pattern: z.string().describe(patternDescription),
       },
     },
     async ({ database, pattern }) => {
@@ -46,7 +51,7 @@ export function registerSearchTool(
         });
         const results = searchTables(schema, pattern);
         const enumResolver = (udtName: string) => schemaCache.getEnumValues(udtName);
-        const formatted = formatSearchResults(results, enumResolver);
+        const formatted = formatSearchResults(results, { enumResolver, hasPrismaMapping });
 
         return mcpTextResult(truncateText(formatted, source.maxResponseBytes));
       } catch (err: unknown) {
