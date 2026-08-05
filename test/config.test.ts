@@ -53,6 +53,7 @@ ssh_key = "/absolute/path/to/key.pem"
       timeout: 60,
       poolMax: 1,
       allowMultiStatements: false,
+      readOnlyQueries: false,
       role: undefined,
       sessionVars: undefined,
       sshHost: "bastion.example.com",
@@ -99,7 +100,9 @@ id = "test"
 dsn = "postgres://user:pass@\${TEST_PG_HOST}/db"
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.sources[0].dsn).toBe("postgres://user:pass@db.example.com/db");
+    expect(config.sources[0].dsn).toBe(
+      "postgres://user:pass@db.example.com/db"
+    );
     delete process.env.TEST_PG_HOST;
   });
 
@@ -110,7 +113,9 @@ dsn = "postgres://user:pass@\${TEST_PG_HOST}/db"
 id = "test"
 dsn = "postgres://user:$NONEXISTENT_VAR_12345@host/db"
 `;
-    expect(() => loadConfig(writeTempToml(toml))).toThrow("NONEXISTENT_VAR_12345");
+    expect(() => loadConfig(writeTempToml(toml))).toThrow(
+      "NONEXISTENT_VAR_12345"
+    );
     expect(() => loadConfig(writeTempToml(toml))).toThrow("not set");
   });
 
@@ -122,7 +127,9 @@ dsn = "postgres://localhost/db"
 ssh_key = "~/.ssh/key.pem"
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.sources[0].sshKey).toBe(path.join(os.homedir(), ".ssh/key.pem"));
+    expect(config.sources[0].sshKey).toBe(
+      path.join(os.homedir(), ".ssh/key.pem")
+    );
     expect(config.sources[0].sshKey).not.toContain("~");
   });
 
@@ -138,7 +145,9 @@ ssh_key = "~/.ssh/key.pem"
 id = "test
 dsn = missing closing quote
 `;
-    expect(() => loadConfig(writeTempToml(toml))).toThrow("Failed to parse TOML");
+    expect(() => loadConfig(writeTempToml(toml))).toThrow(
+      "Failed to parse TOML"
+    );
   });
 
   it("throws on missing required field (id)", () => {
@@ -227,6 +236,50 @@ dsn = "postgres://localhost/db"
     expect(config.sources[0].sessionVars).toBeUndefined();
   });
 
+  it("defaults readOnlyQueries off for a plain source", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/db"
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].readOnlyQueries).toBe(false);
+  });
+
+  it("defaults readOnlyQueries on when role pins the source", () => {
+    const toml = `
+[[sources]]
+id = "tenant"
+dsn = "postgres://localhost/db"
+role = "zest_mcp_reader"
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].readOnlyQueries).toBe(true);
+  });
+
+  it("defaults readOnlyQueries on when session_vars pin the source", () => {
+    const toml = `
+[[sources]]
+id = "tenant"
+dsn = "postgres://localhost/db"
+session_vars = { "app.partner_id" = "p1" }
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].readOnlyQueries).toBe(true);
+  });
+
+  it("lets an explicit read_only_queries override the default", () => {
+    const toml = `
+[[sources]]
+id = "tenant"
+dsn = "postgres://localhost/db"
+role = "zest_mcp_reader"
+read_only_queries = false
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].readOnlyQueries).toBe(false);
+  });
+
   it("parses multiple sources", () => {
     const toml = `
 [[sources]]
@@ -248,6 +301,11 @@ dsn = "postgres://localhost/snaplet_db"
 `;
     const config = loadConfig(writeTempToml(toml));
     expect(config.sources).toHaveLength(4);
-    expect(config.sources.map((s) => s.id)).toEqual(["production", "staging", "local", "snaplet"]);
+    expect(config.sources.map((s) => s.id)).toEqual([
+      "production",
+      "staging",
+      "local",
+      "snaplet",
+    ]);
   });
 });

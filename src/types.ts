@@ -6,6 +6,7 @@ export interface SourceConfig {
   timeout: number;
   poolMax: number;
   allowMultiStatements: boolean;
+  readOnlyQueries: boolean;
   role?: string;
   sessionVars?: Record<string, string>;
   sshHost?: string;

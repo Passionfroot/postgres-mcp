@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { ensureLimit, executeQuery, formatPgError } from "../src/query.js";
+import {
+  assertReadOnlyQuery,
+  ensureLimit,
+  executeQuery,
+  formatPgError,
+  ReadOnlyQueryError,
+} from "../src/query.js";
 
 describe("ensureLimit", () => {
   it("adds LIMIT to a simple SELECT", () => {
@@ -41,7 +47,8 @@ describe("ensureLimit", () => {
   });
 
   it("handles CTE (WITH) queries", () => {
-    const sql = "WITH active AS (SELECT * FROM users WHERE active = true) SELECT * FROM active";
+    const sql =
+      "WITH active AS (SELECT * FROM users WHERE active = true) SELECT * FROM active";
     const result = ensureLimit(sql, 100, false);
     expect(result).toMatch(/LIMIT 100/i);
   });
@@ -91,7 +98,9 @@ describe("formatPgError", () => {
       message: 'syntax error at or near "SELCT"',
     });
 
-    expect(result).toBe('PostgreSQL error 42601: syntax error at or near "SELCT"');
+    expect(result).toBe(
+      'PostgreSQL error 42601: syntax error at or near "SELCT"'
+    );
   });
 
   it("includes position when present", () => {
@@ -127,6 +136,478 @@ describe("formatPgError", () => {
   });
 });
 
+describe("assertReadOnlyQuery", () => {
+  it("allows a plain SELECT", () => {
+    expect(() =>
+      assertReadOnlyQuery("SELECT * FROM collaborations WHERE id = 1")
+    ).not.toThrow();
+  });
+
+  it("allows a CTE that only reads", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "WITH c AS (SELECT id FROM collaborations) SELECT count(*) FROM c"
+      )
+    ).not.toThrow();
+  });
+
+  it("allows current_setting (a read)", () => {
+    expect(() =>
+      assertReadOnlyQuery("SELECT current_setting('app.partner_id', true)")
+    ).not.toThrow();
+  });
+
+  it("blocks set_config()", () => {
+    expect(() =>
+      assertReadOnlyQuery("SELECT set_config('app.partner_id', 'other', false)")
+    ).toThrow(ReadOnlyQueryError);
+  });
+
+  it("blocks set_config() hidden inside a CTE", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "WITH x AS (SELECT set_config('app.partner_id', 'other', false)) SELECT count(*) FROM collaborations, x"
+      )
+    ).toThrow(ReadOnlyQueryError);
+  });
+
+  it("blocks set_config() in a subquery", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "SELECT * FROM t WHERE id = (SELECT set_role('postgres'))"
+      )
+    ).toThrow(ReadOnlyQueryError);
+  });
+
+  it("blocks schema-qualified pg_catalog.set_config()", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "SELECT pg_catalog.set_config('role', 'postgres', false)"
+      )
+    ).toThrow(ReadOnlyQueryError);
+  });
+
+  it("blocks the SET command", () => {
+    expect(() => assertReadOnlyQuery("SET app.partner_id = 'other'")).toThrow(
+      ReadOnlyQueryError
+    );
+  });
+
+  it("blocks SET ROLE (which the parser cannot parse)", () => {
+    expect(() => assertReadOnlyQuery("SET ROLE zest_mcp_reader")).toThrow(
+      ReadOnlyQueryError
+    );
+  });
+
+  it("blocks RESET ROLE", () => {
+    expect(() => assertReadOnlyQuery("RESET ROLE")).toThrow(ReadOnlyQueryError);
+  });
+
+  it("blocks RESET of a GUC", () => {
+    expect(() => assertReadOnlyQuery("RESET app.partner_id")).toThrow(
+      ReadOnlyQueryError
+    );
+  });
+
+  it("fails closed on unparseable SQL", () => {
+    expect(() => assertReadOnlyQuery("SELECT FROM WHERE ((")).toThrow();
+  });
+
+  // The guard is an allowlist (only SELECT passes), not a denylist of a few
+  // commands. These prove the broader surface stays blocked so nobody can
+  // weaken the fail-closed behaviour without a test going red.
+  it.each([
+    ["UPDATE", "UPDATE collaborations SET name = 'x'"],
+    ["INSERT", "INSERT INTO collaborations (id) VALUES ('x')"],
+    ["DELETE", "DELETE FROM collaborations"],
+    ["SET SESSION AUTHORIZATION", "SET SESSION AUTHORIZATION postgres"],
+    ["SET TRANSACTION READ WRITE", "SET TRANSACTION READ WRITE"],
+    ["SET LOCAL", "SET LOCAL app.partner_id = 'x'"],
+    ["RESET ALL", "RESET ALL"],
+    ["COPY TO PROGRAM", "COPY collaborations TO PROGRAM 'curl evil'"],
+    ["DO block", "DO $$ BEGIN PERFORM 1; END $$"],
+    ["CALL", "CALL some_proc()"],
+    ["BEGIN", "BEGIN"],
+    ["dblink", "SELECT * FROM dblink('host=x', 'select 1') AS t(a int)"],
+  ])("rejects %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow();
+  });
+
+  // Dangerous functions hidden inside an otherwise-valid SELECT.
+  it.each([
+    ["pg_read_file", "SELECT pg_read_file('/etc/passwd')"],
+    ["pg_ls_dir", "SELECT pg_ls_dir('/')"],
+    ["lo_export", "SELECT lo_export(1, '/tmp/x')"],
+  ])("blocks %s in a SELECT", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+  });
+
+  // Writes that parse as a top-level `select` (data-modifying CTE, SELECT INTO).
+  it.each([
+    [
+      "UPDATE CTE",
+      "WITH x AS (UPDATE t SET a = 1 RETURNING id) SELECT * FROM x",
+    ],
+    [
+      "INSERT CTE",
+      "WITH x AS (INSERT INTO t(a) VALUES (1) RETURNING id) SELECT * FROM x",
+    ],
+    ["DELETE CTE", "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x"],
+    [
+      "write CTE among reads",
+      "WITH a AS (SELECT 1), b AS (UPDATE t SET x = 1 RETURNING id) SELECT * FROM a, b",
+    ],
+    ["SELECT INTO", "SELECT * INTO newtab FROM t"],
+  ])("blocks %s (write hidden in a SELECT)", (_label, sql) => {
+    // Blocked either by the write-statement walk or, for statements the parser can't
+    // parse (e.g. a DELETE CTE), by the fail-closed parse path.
+    expect(() => assertReadOnlyQuery(sql)).toThrow();
+  });
+
+  it("allows a read-only CTE with multiple SELECT clauses", () => {
+    expect(() =>
+      assertReadOnlyQuery(
+        "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b"
+      )
+    ).not.toThrow();
+  });
+
+  // Statement-boundary bypass. node-sql-parser reads \' as an escaped quote and keeps
+  // consuming, so it sees one clean SELECT; PostgreSQL with
+  // standard_conforming_strings=on closes the literal at that quote and executes what
+  // follows the `;` as further statements. Both of these were proven to re-point tenant
+  // scope on a PostgreSQL 16 FORCE ROW LEVEL SECURITY fixture while passing the guard.
+  it.each([
+    [
+      "SET ROLE after a backslash-terminated literal",
+      String.raw`SELECT 'x\'; SET ROLE postgres; SELECT * FROM secrets; --'`,
+    ],
+    [
+      "SET of the tenant GUC after a backslash-terminated literal",
+      String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM secrets; --'`,
+    ],
+    [
+      "plain second statement after a backslash-terminated literal",
+      String.raw`SELECT 'x\'; SELECT 424242 AS injected; --'`,
+    ],
+    [
+      "odd backslash run of three",
+      String.raw`SELECT 'x\\\'; SELECT 424242 AS injected; --'`,
+    ],
+  ])("rejects %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+  });
+
+  it("names the backslash-before-quote reason", () => {
+    let reason = "";
+    try {
+      assertReadOnlyQuery(String.raw`SELECT 'x\'; SELECT 1; --'`);
+    } catch (err) {
+      reason = (err as ReadOnlyQueryError).reason;
+    }
+    expect(reason).toContain("backslash immediately before its closing quote");
+  });
+
+  // The same divergence in a "..." quoted identifier. node-sql-parser applies MySQL-style
+  // backslash escaping there too and reads \" as an escaped quote, so it sees one column
+  // with a long name; PostgreSQL closes the identifier at that quote and treats what
+  // follows the `;` as further statements. A grammar sweep of 5632 inputs against
+  // PostgreSQL 16 found 1008 of these, all of them an odd run of backslashes before the
+  // closing quote and none of them an even run. These are a spread of the shapes it found:
+  // different surrounding clauses, different smuggled statements, different trailers.
+  it.each([
+    [
+      "bare select item",
+      String.raw`SELECT "x\"; SET app.partner_id TO 'tenantB' --"`,
+    ],
+    [
+      "select item with FROM",
+      String.raw`SELECT "x\" FROM t; INSERT INTO sideeffect VALUES (1) --"`,
+    ],
+    [
+      "select item with WHERE",
+      String.raw`SELECT "x\" WHERE 1=1; DROP TABLE sideeffect --"`,
+    ],
+    [
+      "select item with ORDER BY",
+      String.raw`SELECT "x\" ORDER BY 1; SELECT 424242 AS injected --"`,
+    ],
+    ["qualified column", String.raw`SELECT t."x\" FROM t; RESET ROLE --"`],
+    [
+      "second of two select items",
+      String.raw`SELECT 3, "x\"; UPDATE sideeffect SET n = 2 --"`,
+    ],
+    [
+      "inside a CTE",
+      String.raw`WITH c AS (SELECT "x\"; CREATE TABLE zz (i int) --") SELECT * FROM c`,
+    ],
+    [
+      "odd backslash run of three",
+      String.raw`SELECT "x\\\"; SELECT 424242 AS injected --"`,
+    ],
+    [
+      "empty identifier body",
+      String.raw`SELECT "\"; SET app.partner_id TO 'tenantB' --"`,
+    ],
+    [
+      "block-comment trailer",
+      String.raw`SELECT "x\"; SELECT 424242 AS injected /*"*/`,
+    ],
+  ])("rejects an identifier bypass: %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+  });
+
+  it("names the quoted-identifier reason separately from the literal one", () => {
+    let reason = "";
+    try {
+      assertReadOnlyQuery(String.raw`SELECT "x\"; SELECT 1 --"`);
+    } catch (err) {
+      reason = (err as ReadOnlyQueryError).reason;
+    }
+    expect(reason).toContain("a quoted identifier");
+    expect(reason).toContain("backslash immediately before its closing quote");
+  });
+
+  // Even runs and mid-identifier backslashes produce the same statement boundary in both
+  // lexers, so tightening past the odd-run rule would only add false positives.
+  it.each([
+    ["backslash mid-identifier", String.raw`SELECT 1 AS "a\b"`],
+    [
+      "even backslash run before the closing quote",
+      String.raw`SELECT 1 AS "a\\"`,
+    ],
+    ["Windows path in an identifier", String.raw`SELECT "C:\temp\dir" FROM t`],
+  ])("allows %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).not.toThrow();
+  });
+
+  // A backslash immediately before a DOUBLED quote is rejected even though PostgreSQL
+  // and node-sql-parser cannot be made to disagree in the dangerous direction there:
+  // PostgreSQL reads "" as one literal quote and keeps consuming, so it always ends the
+  // token no earlier than the parser does. It is rejected anyway because the '...' branch
+  // has ordered the checks this way since the guard shipped, and the two branches are
+  // easier to keep correct while they stay identical. Pinned so the conservatism is a
+  // decision rather than an accident.
+  it.each([
+    ["quoted identifier", String.raw`SELECT 1 AS "a\""b"`],
+    ["string literal", String.raw`SELECT 'a\''b'`],
+  ])(
+    "conservatively rejects a backslash before a doubled quote in a %s",
+    (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+    }
+  );
+
+  // Constructs verified against PostgreSQL 16 to produce identical statement
+  // boundaries in node-sql-parser and the server. They must stay allowed so nobody
+  // "hardens" them later and adds false positives that close nothing.
+  it.each([
+    ["backslash mid-literal (regex)", String.raw`SELECT 'a' ~ '\d+'`],
+    ["Windows path literal", String.raw`SELECT 'C:\temp\file' AS p`],
+    ["E-string with escapes", String.raw`SELECT E'tab\there'`],
+    [
+      "E-string ending in a backslash escape",
+      String.raw`SELECT E'x\'; SELECT 1; --'`,
+    ],
+    ["dollar-quoted string", `SELECT $$a'; SELECT 1; --$$`],
+    ["tagged dollar-quoted string", `SELECT $t$a'; SELECT 1; --$t$`],
+    ["doubled quote escape", `SELECT 'x''; SELECT 1; --'`],
+    ["backslash-quote inside a line comment", "SELECT 1 -- a\\'; SELECT 2\n"],
+    [
+      "backslash-quote inside a block comment",
+      String.raw`SELECT 1 /* a\'; SELECT 2; */`,
+    ],
+    [
+      "backslash-quote inside a quoted identifier",
+      String.raw`SELECT 1 AS "a\'; SELECT 2; --"`,
+    ],
+    [
+      "typed literal after an identifier ending in e",
+      `SELECT date'2026-01-01'`,
+    ],
+  ])("allows %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).not.toThrow();
+  });
+
+  // Multiple statements that node-sql-parser does see are rejected regardless of the
+  // source's allow_multi_statements setting.
+  it("rejects multiple statements the parser can see", () => {
+    expect(() => assertReadOnlyQuery("SELECT 1; SELECT 2")).toThrow(
+      ReadOnlyQueryError
+    );
+  });
+
+  // The set_config payloads proven to leak on a two-tenant RLS fixture. The third is
+  // plan-dependent (it leaked on one fixture, not another); it must be rejected either
+  // way.
+  it.each([
+    [
+      "WHERE",
+      "SELECT * FROM t WHERE set_config('app.partner_id','tenantB',false) IS NOT NULL",
+    ],
+    [
+      "materialized CTE",
+      "WITH x AS MATERIALIZED (SELECT set_config('app.partner_id','tenantB',false)) SELECT * FROM t CROSS JOIN x",
+    ],
+    [
+      "select list",
+      "SELECT set_config('app.partner_id','tenantB',false), t.* FROM t",
+    ],
+  ])("rejects set_config in the %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+  });
+
+  // A comment glued directly onto a function name with no separating whitespace, e.g.
+  // `set_config--x\n(...)`. node-sql-parser folds the `--x` into the identifier itself
+  // (it names the function `set_config--x`), so it matches neither SESSION_MUTATION_RE
+  // nor DANGEROUS_FUNCTIONS; PostgreSQL's own lexer always ends the identifier at
+  // `set_config` and executes `--x\n` as a comment, so the real set_config(...) runs.
+  // Proven on a live FORCE ROW LEVEL SECURITY fixture to leak another tenant's row. Not
+  // set_config-specific: the whole DANGEROUS_FUNCTIONS list is exposed the same way.
+  //
+  // The trailing LIMIT is required to reproduce this: without one, ensureLimit
+  // re-serialises the AST (parser.sqlify), which collapses the glued comment onto one
+  // line and PostgreSQL rejects the result with a syntax error before this guard even
+  // matters. A regression test without a LIMIT would pass whether or not this is fixed.
+  it.each([
+    [
+      "set_config, line comment",
+      "SELECT set_config--x\n('app.partner_id','tenantB',false) FROM t LIMIT 10",
+    ],
+    [
+      "pg_read_file, line comment",
+      "SELECT pg_read_file--x\n('/etc/passwd') FROM t LIMIT 10",
+    ],
+    [
+      "set_config, block comment",
+      "SELECT set_config/*x*/('app.partner_id','tenantB',false) FROM t LIMIT 10",
+    ],
+    [
+      "bare trailing -- with no text before the newline",
+      "SELECT set_config--\n('app.partner_id','tenantB',false) FROM t LIMIT 10",
+    ],
+  ])(
+    "rejects a comment glued onto a dangerous function (%s)",
+    (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+    }
+  );
+
+  it("names the comment-glue reason", () => {
+    let reason = "";
+    try {
+      assertReadOnlyQuery(
+        "SELECT set_config--x\n('app.partner_id','tenantB',false) FROM t LIMIT 10"
+      );
+    } catch (err) {
+      reason = (err as ReadOnlyQueryError).reason;
+    }
+    expect(reason).toContain(
+      "a comment starts immediately after an identifier"
+    );
+  });
+
+  // A comment that is NOT glued to the preceding token stays allowed; this is what
+  // distinguishes the fix from simply banning comments outright.
+  it.each([
+    [
+      "line comment with a leading space",
+      "SELECT * FROM t -- trailing note\nLIMIT 10",
+    ],
+    [
+      "block comment with a leading space",
+      "SELECT * FROM t /* note */ LIMIT 10",
+    ],
+  ])("still allows %s", (_label, sql) => {
+    expect(() => assertReadOnlyQuery(sql)).not.toThrow();
+  });
+
+  describe("EXPLAIN", () => {
+    it.each([
+      ["bare", "EXPLAIN SELECT * FROM collaborations"],
+      [
+        "with options",
+        "EXPLAIN (COSTS OFF, FORMAT JSON) SELECT * FROM collaborations",
+      ],
+      ["VERBOSE", "EXPLAIN VERBOSE SELECT * FROM collaborations"],
+    ])("allows EXPLAIN %s", (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).not.toThrow();
+    });
+
+    // ANALYZE actually runs the statement it explains.
+    it.each([
+      ["legacy syntax", "EXPLAIN ANALYZE SELECT * FROM collaborations"],
+      [
+        "option syntax",
+        "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM collaborations",
+      ],
+      ["British spelling", "EXPLAIN ANALYSE SELECT * FROM collaborations"],
+    ])("rejects EXPLAIN ANALYZE (%s)", (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+    });
+
+    it("still guards the statement behind the EXPLAIN", () => {
+      expect(() =>
+        assertReadOnlyQuery("EXPLAIN INSERT INTO t (a) VALUES (1)")
+      ).toThrow(ReadOnlyQueryError);
+      expect(() =>
+        assertReadOnlyQuery("EXPLAIN SELECT set_config('a', 'b', false)")
+      ).toThrow(ReadOnlyQueryError);
+    });
+  });
+
+  describe("rejection reasons", () => {
+    it.each([
+      [
+        "the text 'set_config('",
+        "SELECT id FROM logs WHERE msg LIKE '%set_config(%'",
+        "set_config(",
+      ],
+      [
+        "the text 'set_role('",
+        "SELECT id FROM audit WHERE sql ILIKE '%set_role(%'",
+        "set_role(",
+      ],
+      [
+        "a leading SET",
+        "SET app.partner_id = 'other'",
+        "starts with SET or RESET",
+      ],
+      // Known false positive: `set` is a reserved word to the guard's parser, so this
+      // plain SELECT fails closed. The message has to say why rather than telling the
+      // caller to "rewrite it as a plain SELECT".
+      [
+        "why an unparseable plain SELECT was rejected",
+        "SELECT count(*) AS set FROM channels",
+        "reserved word used as a bare alias",
+      ],
+      [
+        "the statement type",
+        "UPDATE collaborations SET name = 'x'",
+        "not SELECT",
+      ],
+      [
+        "a nested write",
+        "WITH x AS (INSERT INTO t(a) VALUES (1) RETURNING id) SELECT * FROM x",
+        "write statement is nested",
+      ],
+      [
+        "the offending function",
+        "SELECT pg_read_file('/etc/passwd')",
+        "pg_read_file()",
+      ],
+    ])("names %s", (_label, sql, expected) => {
+      let message = "";
+      try {
+        assertReadOnlyQuery(sql);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain(expected);
+    });
+  });
+});
+
 describe("executeQuery", () => {
   function createMockPool(queryFn: ReturnType<typeof vi.fn>) {
     const client = {
@@ -137,11 +618,50 @@ describe("executeQuery", () => {
       connect: vi.fn().mockResolvedValue(client),
       _client: client,
     } as unknown as import("pg").Pool & {
-      _client: { query: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> };
+      _client: {
+        query: ReturnType<typeof vi.fn>;
+        release: ReturnType<typeof vi.fn>;
+      };
     };
   }
 
   const defaultOptions = { readonly: false, allowMultiStatements: false };
+
+  it("rejects a session-mutating query before connecting when readOnlyQueries is on", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [] });
+    const pool = createMockPool(queryFn);
+
+    await expect(
+      executeQuery(
+        pool,
+        "SELECT set_config('app.partner_id', 'other', false)",
+        100,
+        {
+          ...defaultOptions,
+          readOnlyQueries: true,
+        }
+      )
+    ).rejects.toThrow(ReadOnlyQueryError);
+
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it("allows a session-mutating query when readOnlyQueries is off", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(
+      pool,
+      "SELECT set_config('app.partner_id', 'other', false)",
+      100,
+      {
+        ...defaultOptions,
+        readOnlyQueries: false,
+      }
+    );
+
+    expect(pool.connect).toHaveBeenCalled();
+  });
 
   it("adds LIMIT to queries without one", async () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
@@ -157,11 +677,49 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
     const pool = createMockPool(queryFn);
 
-    await executeQuery(pool, "SELECT * FROM users LIMIT 5", 100, defaultOptions);
+    await executeQuery(
+      pool,
+      "SELECT * FROM users LIMIT 5",
+      100,
+      defaultOptions
+    );
 
     const calledSql = queryFn.mock.calls[0][0] as string;
     expect(calledSql).toMatch(/LIMIT 5/i);
     expect(calledSql).not.toMatch(/LIMIT 101/i);
+  });
+
+  // The extended protocol is the server-side half of the multi-statement defence: a Parse
+  // carrying more than one command is refused with 42601 before anything executes. It is
+  // gated on readOnlyQueries because allow_multi_statements is an independent setting.
+  it("sends read-only-source queries over the extended protocol", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT * FROM users", 100, {
+      ...defaultOptions,
+      readOnlyQueries: true,
+    });
+
+    const executed = queryFn.mock.calls.at(-1)?.[0] as {
+      text: string;
+      queryMode?: string;
+    };
+    expect(executed.queryMode).toBe("extended");
+    expect(executed.text).toMatch(/LIMIT 101/i);
+  });
+
+  it("leaves a multi-statement source on the simple protocol", async () => {
+    const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT 1; SELECT 2", 100, {
+      readonly: false,
+      allowMultiStatements: true,
+      readOnlyQueries: false,
+    });
+
+    expect(queryFn.mock.calls.at(-1)?.[0]).toBe("SELECT 1; SELECT 2");
   });
 
   it("detects truncation when rows exceed maxRows", async () => {
@@ -169,7 +727,12 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows });
     const pool = createMockPool(queryFn);
 
-    const result = await executeQuery(pool, "SELECT * FROM users", 10, defaultOptions);
+    const result = await executeQuery(
+      pool,
+      "SELECT * FROM users",
+      10,
+      defaultOptions
+    );
 
     expect(result.truncated).toBe(true);
     expect(result.rowCount).toBe(10);
@@ -181,7 +744,12 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows });
     const pool = createMockPool(queryFn);
 
-    const result = await executeQuery(pool, "SELECT * FROM users", 10, defaultOptions);
+    const result = await executeQuery(
+      pool,
+      "SELECT * FROM users",
+      10,
+      defaultOptions
+    );
 
     expect(result.truncated).toBe(false);
     expect(result.rowCount).toBe(3);
@@ -192,10 +760,15 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
     const pool = createMockPool(queryFn);
 
-    await executeQuery(pool, "SELECT 1", 10, { readonly: true, allowMultiStatements: false });
+    await executeQuery(pool, "SELECT 1", 10, {
+      readonly: true,
+      allowMultiStatements: false,
+    });
 
     expect(queryFn).toHaveBeenCalledTimes(2);
-    expect(queryFn.mock.calls[0][0]).toBe("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+    expect(queryFn.mock.calls[0][0]).toBe(
+      "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+    );
     expect(queryFn.mock.calls[1][0]).toMatch(/SELECT/);
   });
 
@@ -214,8 +787,9 @@ describe("executeQuery", () => {
 
     await executeQuery(pool, "SELECT 1", 10, defaultOptions);
 
-    const release = (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client
-      .release;
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
     expect(release).toHaveBeenCalledTimes(1);
     // Falsy first argument, so pg-pool keeps the connection for reuse. `release()` and
     // `release(undefined)` are equivalent to it, so assert the value rather than the arity.
@@ -228,12 +802,13 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockRejectedValue(new Error("Query read timeout"));
     const pool = createMockPool(queryFn);
 
-    await expect(executeQuery(pool, "SELECT 1", 10, defaultOptions)).rejects.toThrow(
-      "Query read timeout"
-    );
+    await expect(
+      executeQuery(pool, "SELECT 1", 10, defaultOptions)
+    ).rejects.toThrow("Query read timeout");
 
-    const release = (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client
-      .release;
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
     expect(release).toHaveBeenCalledTimes(1);
     expect(release.mock.calls[0][0]).toBeInstanceOf(Error);
   });
@@ -242,7 +817,8 @@ describe("executeQuery", () => {
     // Leaving a pinned app.partner_id on a pooled connection would hand one caller's RLS scope to
     // the next one.
     const queryFn = vi.fn().mockImplementation((sql: string) => {
-      if (sql.startsWith("RESET")) return Promise.reject(new Error("connection lost"));
+      if (sql.startsWith("RESET"))
+        return Promise.reject(new Error("connection lost"));
       return Promise.resolve({ rows: [{ id: 1 }] });
     });
     const pool = createMockPool(queryFn);
@@ -252,8 +828,9 @@ describe("executeQuery", () => {
       sessionVars: { "app.partner_id": "abc" },
     });
 
-    const release = (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client
-      .release;
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
     expect(release).toHaveBeenCalledTimes(1);
     expect(release.mock.calls[0][0]).toBeInstanceOf(Error);
   });
@@ -266,10 +843,13 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockRejectedValue(pgError);
     const pool = createMockPool(queryFn);
 
-    await expect(executeQuery(pool, "SELECT * FROM xyz", 100, defaultOptions)).rejects.toThrow();
+    await expect(
+      executeQuery(pool, "SELECT * FROM xyz", 100, defaultOptions)
+    ).rejects.toThrow();
 
     expect(
-      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client.release
+      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })
+        ._client.release
     ).toHaveBeenCalledTimes(1);
   });
 
@@ -281,9 +861,9 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockRejectedValue(pgError);
     const pool = createMockPool(queryFn);
 
-    await expect(executeQuery(pool, "SELECT * FROM xyz", 100, defaultOptions)).rejects.toThrow(
-      'PostgreSQL error 42P01: relation "xyz" does not exist'
-    );
+    await expect(
+      executeQuery(pool, "SELECT * FROM xyz", 100, defaultOptions)
+    ).rejects.toThrow('PostgreSQL error 42P01: relation "xyz" does not exist');
   });
 
   it("sets role before executing query and resets after", async () => {
@@ -311,7 +891,9 @@ describe("executeQuery", () => {
       sessionVars: { "app.current_tenant_id": "tenant_123" },
     });
 
-    expect(queryFn.mock.calls[0][0]).toBe("SET app.current_tenant_id = 'tenant_123'");
+    expect(queryFn.mock.calls[0][0]).toBe(
+      "SET app.current_tenant_id = 'tenant_123'"
+    );
     expect(queryFn.mock.calls[1][0]).toMatch(/SELECT/);
     expect(queryFn.mock.calls[2][0]).toBe("RESET app.current_tenant_id");
   });
@@ -330,7 +912,9 @@ describe("executeQuery", () => {
     // Order: SET ROLE, SET session var, SET readonly, query
     expect(queryFn.mock.calls[0][0]).toBe('SET ROLE "mcp_reader"');
     expect(queryFn.mock.calls[1][0]).toBe("SET app.tenant_id = 't_1'");
-    expect(queryFn.mock.calls[2][0]).toBe("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+    expect(queryFn.mock.calls[2][0]).toBe(
+      "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+    );
     expect(queryFn.mock.calls[3][0]).toMatch(/SELECT/);
     // Cleanup: RESET session var, RESET ROLE
     expect(queryFn.mock.calls[4][0]).toBe("RESET app.tenant_id");
@@ -338,13 +922,18 @@ describe("executeQuery", () => {
   });
 
   it("identifies timeout errors with actionable message", async () => {
-    const timeoutError = Object.assign(new Error("canceling statement due to statement timeout"), {
-      code: "57014",
-    });
+    const timeoutError = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      {
+        code: "57014",
+      }
+    );
     const queryFn = vi.fn().mockRejectedValue(timeoutError);
     const pool = createMockPool(queryFn);
 
-    await expect(executeQuery(pool, "SELECT pg_sleep(999)", 100, defaultOptions)).rejects.toThrow(
+    await expect(
+      executeQuery(pool, "SELECT pg_sleep(999)", 100, defaultOptions)
+    ).rejects.toThrow(
       "Query timed out. Simplify the query or add more specific WHERE conditions."
     );
   });

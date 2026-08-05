@@ -102,9 +102,75 @@ Returns a lean relationship map: all tables, their Prisma model names, and FK co
 | `max_rows`               | `1000`     | Maximum rows returned per query (auto-appended as LIMIT)                              |
 | `pool_max`               | `1`        | Maximum connections in the pool                                                       |
 | `allow_multi_statements` | `false`    | Allow semicolon-separated multi-statement queries                                     |
+| `read_only_queries`      | see below  | Answer only read-only `SELECT` queries; reject everything else. Defaults to `true` when `role` or `session_vars` is set, else `false` |
+| `role`                   | —          | `SET ROLE` to this role for each query (e.g. a restricted RLS reader)                 |
+| `session_vars`           | —          | GUCs to `SET` per query, e.g. `{ "app.tenant_id" = "$TENANT_ID" }`, read by RLS policies |
 | `ssh_host`               | —          | SSH bastion hostname for tunneled connections                                         |
 | `ssh_user`               | —          | SSH username                                                                          |
 | `ssh_key`                | —          | Path to SSH private key (supports `~` expansion)                                      |
+
+#### Tenant isolation and `read_only_queries`
+
+When a source scopes data to one tenant with `role` + `session_vars` (an RLS reader
+plus a GUC like `app.tenant_id` that the policies read), that scope is only as strong
+as the SQL the tool is allowed to run. A submitted query can otherwise re-point the
+GUC at another tenant or leave the restricted role:
+
+```sql
+-- both re-point the tenant and read another tenant's rows
+WITH x AS (SELECT set_config('app.tenant_id', 'victim', false)) SELECT * FROM orders, x;
+SET app.tenant_id = 'victim';
+RESET ROLE;  -- drops back to the connecting role
+```
+
+Postgres cannot lock a custom GUC (parameter ACLs are not enforced on placeholder
+GUCs), so this is enforced at the query layer instead. `read_only_queries` is an
+allowlist: it answers only read-only `SELECT`s and rejects everything else — every
+non-SELECT statement (`SET`, `RESET`, `SET ROLE`, `COPY`, `DO`, `CALL`, DML, DDL,
+transaction control), any call to a role/GUC setter (`set_config`, `set_role`) or a
+server-side file/program/large-object function anywhere in the statement (including
+CTEs and subqueries), and any query it cannot parse (which fails closed rather than
+run). This is distinct from `readonly`, which only wraps each query in a read-only
+transaction. It defaults on for any source that uses `role` or `session_vars`; set it
+to `false` for a local source where you want free-form access.
+
+`EXPLAIN` and `EXPLAIN (...)` are allowed and the statement behind them is guarded the
+same way. `EXPLAIN ANALYZE` is rejected, because it runs the statement it explains.
+
+The guard also rejects a string literal or a quoted identifier with a backslash
+immediately before its closing quote. That is the one place where the SQL parser it
+uses and PostgreSQL disagree about where a quoted token ends: the parser reads `\'` and
+`\"` as escaped quotes and keeps consuming, while PostgreSQL with
+`standard_conforming_strings = on` closes the token there and runs whatever follows the
+next `;` as separate statements. Without that check, both
+
+```sql
+SELECT 'x\'; SET app.tenant_id TO "victim"; SELECT ...; --'
+SELECT "x\"; SET app.tenant_id TO 'victim'; SELECT ...; --"
+```
+
+read as one clean `SELECT` to the guard and as three statements to the server.
+Backslashes anywhere else in a literal or identifier are fine, as are dollar-quoted
+strings and `E'...'` escape strings, whose boundaries both sides agree on. A value that
+genuinely ends in a backslash has to be written as `E'\\'` or built with `chr(92)`; the
+one form with no workaround is `LIKE ... ESCAPE '\'`, since the parser accepts only a
+plain literal there. An identifier that really ends in a backslash cannot be addressed
+through a `read_only_queries` source at all.
+
+Because a hand-written lexer can always be wrong about a construct nobody has thought
+of, a `read_only_queries` source also sends its statement over PostgreSQL's extended
+query protocol. A `Parse` carrying more than one command is refused with `42601` before
+any of it executes, so a statement smuggled past the lexer still never runs. The two
+checks cover different things and both are needed: the server has no objection to
+single-statement smuggling such as
+`SELECT 'x\', (SELECT string_agg(val, ',') FROM secrets) --'`, which only the lexer
+catches. Sources without `read_only_queries` keep the simple protocol, so
+`allow_multi_statements` still works.
+
+> A closed design goes the other way: PR #6 / branch `feat/per-request-session-vars`
+> lets the caller supply session variables per request, which is the inverse of what
+> `read_only_queries` enforces. Do not resurrect it without reconciling the two, or the
+> tenant scope this guard protects becomes caller-controlled again.
 
 ### Global options
 

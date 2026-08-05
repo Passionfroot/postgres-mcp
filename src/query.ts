@@ -3,7 +3,24 @@ const { Parser } = NodeSqlParser;
 import pg from "pg";
 
 import { logger } from "./logger.js";
-import { assertSafeGucName, escapeIdentifier, escapeLiteral } from "./sql-helpers.js";
+import {
+  assertSafeGucName,
+  escapeIdentifier,
+  escapeLiteral,
+} from "./sql-helpers.js";
+
+// pg has supported `queryMode: "extended"` since 8.18 (pg/lib/query.js reads it in the
+// constructor and requiresPreparation() returns true for it), but @types/pg 8.16 does
+// not describe it yet. Declaring it here keeps the call site type-checked instead of
+// asserting the mismatch away.
+declare module "pg" {
+  // The type parameter list has to repeat @types/pg's exactly, `any[]` default included,
+  // or TypeScript refuses the merge (TS2428).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  interface QueryConfig<I = any[]> {
+    queryMode?: "extended";
+  }
+}
 
 export interface QueryResult {
   rows: Record<string, unknown>[];
@@ -28,6 +45,386 @@ const PG_OPT = { database: "PostgreSQL" } as const;
 
 const HAS_LIMIT_RE = /\bLIMIT\s+\d/i;
 const STARTS_WITH_EXPLAIN_RE = /^\s*EXPLAIN\b/i;
+
+// Functions that mutate session state or reach outside the row set, blocked even
+// inside an otherwise-valid SELECT (a plain-statement allowlist can't catch these,
+// since they hide in the projection or a subquery). The role/GUC setters are the
+// tenant-isolation ones (set_config('app.partner_id', <other tenant>, false)); the
+// rest are server-side file/program/large-object/remote-connection reach that an
+// unprivileged reader shouldn't be issuing regardless.
+const DANGEROUS_FUNCTIONS = new Set([
+  "set_config",
+  "set_role",
+  "set_user",
+  "pg_read_file",
+  "pg_read_binary_file",
+  "pg_ls_dir",
+  "pg_stat_file",
+  "lo_import",
+  "lo_export",
+  "dblink",
+  "dblink_exec",
+]);
+
+// Backstop for what the AST walk can miss: SET ROLE / RESET ROLE do not parse at
+// all (so astify throws), and this catches the role/GUC setter functions and the
+// command forms before the parser runs. String literals containing these tokens
+// fail closed, which is the safe direction for a read-only guard.
+const SESSION_MUTATION_RE =
+  /\b(?:set_config|set_role|set_user)\s*\(|^\s*(?:set|reset)\b/i;
+
+export class ReadOnlyQueryError extends Error {
+  readonly reason: string;
+
+  constructor(reason: string) {
+    super(
+      `This source only answers read-only SELECT queries, and this one was rejected because ${reason}. ` +
+        "Statements that change the role or session (SET, RESET, SET ROLE, set_config), non-SELECT " +
+        "statements, multiple statements in one call, and server-side file/program access are not permitted."
+    );
+    this.name = "ReadOnlyQueryError";
+    this.reason = reason;
+  }
+}
+
+// Statement types that write. A top-level one is caught by the `type !== "select"` check, but they
+// also hide inside a SELECT: a data-modifying CTE (`WITH x AS (UPDATE ... RETURNING) SELECT * FROM x`)
+// parses as a top-level `select`, so we walk the whole tree for any of these.
+const WRITE_STATEMENT_TYPES = new Set([
+  "insert",
+  "update",
+  "delete",
+  "replace",
+  "merge",
+  "create",
+  "drop",
+  "alter",
+  "truncate",
+  "rename",
+  "grant",
+  "revoke",
+  "call",
+  "set",
+]);
+
+function hasWriteStatement(node: unknown): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (Array.isArray(node)) return node.some(hasWriteStatement);
+  const obj = node as Record<string, unknown>;
+  if (typeof obj.type === "string" && WRITE_STATEMENT_TYPES.has(obj.type)) {
+    return true;
+  }
+  // SELECT ... INTO <table> creates a table.
+  if (obj.type === "select") {
+    const into = obj.into as { expr?: unknown } | undefined;
+    if (into?.expr) return true;
+  }
+  return Object.keys(obj).some((key) => hasWriteStatement(obj[key]));
+}
+
+function collectFunctionNames(node: unknown, acc: Set<string>): void {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectFunctionNames(item, acc);
+    return;
+  }
+  const obj = node as Record<string, unknown>;
+  if (obj.type === "function") {
+    const nameNode = obj.name as
+      | { name?: Array<{ value?: string }> }
+      | undefined;
+    const parts = nameNode?.name;
+    const fnName = Array.isArray(parts)
+      ? parts[parts.length - 1]?.value
+      : undefined;
+    if (typeof fnName === "string") acc.add(fnName.toLowerCase());
+  }
+  for (const key of Object.keys(obj)) collectFunctionNames(obj[key], acc);
+}
+
+// Reject inputs where node-sql-parser and PostgreSQL disagree about where a string
+// literal ends, because that is where they disagree about where a statement ends.
+//
+// In a plain '...' literal, node-sql-parser applies MySQL-style backslash escaping and
+// reads \' as an escaped quote, so the string keeps consuming. PostgreSQL with
+// standard_conforming_strings=on (the default since 9.1) treats the backslash as an
+// ordinary character, so the quote CLOSES the literal and everything after the next `;`
+// is a separate statement. The guard then vets one clean SELECT while the server
+// executes several, which is how
+//   SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT ...; --'
+// re-points tenant scope from an unprivileged reader.
+//
+// node-sql-parser applies the same MySQL-style escaping inside a "..." quoted
+// identifier, where PostgreSQL again treats the backslash as an ordinary character, so
+//   SELECT "x\"; SET app.partner_id TO 'tenantB' --"
+// smuggles a statement exactly the same way. Both quote characters therefore get the
+// same odd-backslash-run rule.
+//
+// The divergence is exactly an ODD run of backslashes immediately before a quote. An
+// even run (`'x\\'`) is an escaped backslash to node-sql-parser and two literal
+// backslashes to PostgreSQL: the contents differ but both agree the quote closes, so
+// no statement can be smuggled. That was verified against PostgreSQL 16 rather than
+// assumed, along with the constructs deliberately NOT rejected here: dollar-quoted
+// strings ($$...$$, $tag$...$tag$), E'...' escape strings (PostgreSQL honours
+// backslash escapes inside those, so the two lexers agree), doubled '' quotes and
+// comments all produce identical statement boundaries on both sides. Rejecting them
+// would add false positives and close nothing.
+// A comment glued directly onto an identifier or quoted token with no separating
+// whitespace, e.g. `set_config--x\n(...)`. node-sql-parser folds `--x` into the
+// identifier itself (it names the function `set_config--x`, which matches nothing
+// in DANGEROUS_FUNCTIONS or SESSION_MUTATION_RE), while PostgreSQL's lexer always
+// ends an identifier/quoted-token at that boundary and treats `--x\n` as a comment,
+// so it calls the real set_config(...) underneath. Same disagreement class as the
+// odd-backslash-before-a-quote check above, just at the opposite end of a token:
+// PostgreSQL has a fixed opinion about where the token stops, node-sql-parser
+// doesn't always agree, and the guard has to side with PostgreSQL.
+const COMMENT_GLUE_CHAR_RE = /[A-Za-z0-9_$"]/;
+
+function findStatementBoundaryHazard(sql: string): string | null {
+  const HAZARD_TAIL =
+    "has a backslash immediately before its closing quote, the one spot where the SQL " +
+    "parser and PostgreSQL disagree about where the quoted token ends";
+  const LITERAL_HAZARD =
+    `a string literal ${HAZARD_TAIL}. Backslashes elsewhere inside a literal are fine; ` +
+    "for a value that ends in one, write it as an escape string (E'\\\\') or build it " +
+    "with chr(92)";
+  const IDENTIFIER_HAZARD =
+    `a quoted identifier ${HAZARD_TAIL}. Backslashes elsewhere inside an identifier are ` +
+    "fine; an identifier that really ends in a backslash cannot be addressed through " +
+    "this source";
+  const COMMENT_GLUE_HAZARD =
+    "a comment starts immediately after an identifier or quoted token with no space or " +
+    "newline in between, the one spot where PostgreSQL always ends the token there while " +
+    "the SQL parser can read the comment as part of the token name instead (e.g. " +
+    "set_config--x then a newline then (...) is parsed here as one identifier, " +
+    "set_config--x, but PostgreSQL ends the identifier at set_config and runs the real " +
+    "set_config(...) underneath). Add a space or newline before the comment";
+
+  let i = 0;
+
+  while (i < sql.length) {
+    const char = sql[i];
+
+    if (char === "-" && sql[i + 1] === "-") {
+      if (COMMENT_GLUE_CHAR_RE.test(sql[i - 1] ?? ""))
+        return COMMENT_GLUE_HAZARD;
+      const newline = sql.indexOf("\n", i);
+      i = newline === -1 ? sql.length : newline + 1;
+      continue;
+    }
+
+    // PostgreSQL block comments nest.
+    if (char === "/" && sql[i + 1] === "*") {
+      if (COMMENT_GLUE_CHAR_RE.test(sql[i - 1] ?? ""))
+        return COMMENT_GLUE_HAZARD;
+      let depth = 1;
+      i += 2;
+      while (i < sql.length && depth > 0) {
+        if (sql[i] === "/" && sql[i + 1] === "*") {
+          depth++;
+          i += 2;
+        } else if (sql[i] === "*" && sql[i + 1] === "/") {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      continue;
+    }
+
+    // Quoted identifier, lexed the way PostgreSQL does: "" doubles, backslash is an
+    // ordinary character. Same odd-backslash-run rule as a '...' literal, for the same
+    // reason: node-sql-parser reads \" as an escaped quote and keeps consuming.
+    if (char === '"') {
+      i++;
+      let backslashRun = 0;
+      while (i < sql.length) {
+        if (sql[i] === "\\") {
+          backslashRun++;
+          i++;
+          continue;
+        }
+        if (sql[i] === '"') {
+          if (backslashRun % 2 === 1) return IDENTIFIER_HAZARD;
+          if (sql[i + 1] === '"') {
+            i += 2;
+            backslashRun = 0;
+            continue;
+          }
+          i++;
+          break;
+        }
+        backslashRun = 0;
+        i++;
+      }
+      continue;
+    }
+
+    // Dollar-quoted string: no escapes at all inside, ends at the matching tag.
+    // A bare `$1` placeholder is not a dollar quote.
+    const dollarTag =
+      char === "$"
+        ? /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i))
+        : null;
+    if (dollarTag) {
+      const tag = dollarTag[0];
+      const close = sql.indexOf(tag, i + tag.length);
+      i = close === -1 ? sql.length : close + tag.length;
+      continue;
+    }
+
+    // E'...' escape string: backslash escapes the next character in PostgreSQL too,
+    // so both lexers agree and there is nothing to flag. Only when E starts a token;
+    // `date'2026-01-01'` is a typed literal, not an escape string.
+    if (
+      (char === "E" || char === "e") &&
+      sql[i + 1] === "'" &&
+      !/[A-Za-z0-9_$]/.test(sql[i - 1] ?? " ")
+    ) {
+      i += 2;
+      while (i < sql.length) {
+        if (sql[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // Plain '...' literal, lexed the way PostgreSQL does: '' doubles, backslash is an
+    // ordinary character. Flag any quote reached across an odd run of backslashes.
+    if (char === "'") {
+      i++;
+      let backslashRun = 0;
+      while (i < sql.length) {
+        if (sql[i] === "\\") {
+          backslashRun++;
+          i++;
+          continue;
+        }
+        if (sql[i] === "'") {
+          if (backslashRun % 2 === 1) return LITERAL_HAZARD;
+          if (sql[i + 1] === "'") {
+            i += 2;
+            backslashRun = 0;
+            continue;
+          }
+          i++;
+          break;
+        }
+        backslashRun = 0;
+        i++;
+      }
+      continue;
+    }
+
+    i++;
+  }
+
+  return null;
+}
+
+// `EXPLAIN [ ( option [, ...] ) | ANALYZE | VERBOSE ] statement`. ANALYZE actually
+// runs the statement, so it stays rejected; everything else is planning only and is
+// stripped so the statement behind it gets the full guard.
+const EXPLAIN_PREFIX_RE =
+  /^\s*EXPLAIN\s*(?:\(([^()]*)\)|((?:\s*\b(?:ANALYZE|ANALYSE|VERBOSE)\b)*))\s+/i;
+const EXPLAIN_ANALYZE_OPTION_RE = /\b(?:ANALYZE|ANALYSE)\b/i;
+
+function stripExplainPrefix(sql: string): string {
+  const match = EXPLAIN_PREFIX_RE.exec(sql);
+  if (!match) return sql;
+
+  const options = match[1] ?? match[2] ?? "";
+  if (EXPLAIN_ANALYZE_OPTION_RE.test(options)) {
+    throw new ReadOnlyQueryError(
+      "EXPLAIN ANALYZE executes the statement it explains; use EXPLAIN without ANALYZE"
+    );
+  }
+
+  return sql.slice(match[0].length);
+}
+
+/**
+ * Allow only read-only SELECT queries. Everything else is rejected: any non-SELECT
+ * statement (SET, RESET, COPY, DO, CALL, DML, DDL, transaction control), any query
+ * that calls a dangerous function (role/GUC setters, file/program/large-object
+ * access), and any query the parser cannot verify. This is an allowlist, not a
+ * denylist of specific commands. A source whose tenant scope rides on
+ * role/session_vars needs it so a submitted query cannot re-point the scope or
+ * leave the restricted role. A parse failure fails closed rather than falling
+ * through to the regex LIMIT path.
+ */
+export function assertReadOnlyQuery(sql: string): void {
+  const hazard = findStatementBoundaryHazard(sql);
+  if (hazard) {
+    throw new ReadOnlyQueryError(hazard);
+  }
+
+  const body = stripExplainPrefix(sql);
+
+  if (SESSION_MUTATION_RE.test(body)) {
+    const fn = /\b(set_config|set_role|set_user)\s*\(/i.exec(body);
+    throw new ReadOnlyQueryError(
+      fn
+        ? `the text '${fn[1].toLowerCase()}(' appears in the statement; this source rejects it even inside a string literal, so split the literal (e.g. '%set_' || 'config(%') if that is what you meant`
+        : "the statement starts with SET or RESET, which changes session state"
+    );
+  }
+
+  let raw;
+  try {
+    raw = parser.astify(body, PG_OPT);
+  } catch {
+    throw new Error(
+      "This source only answers read-only SELECT queries, and this statement could not be " +
+        "parsed to verify that, so it was rejected. The guard's parser is stricter than " +
+        "PostgreSQL: a reserved word used as a bare alias (AS set, AS order) or an operator " +
+        'it does not know are the usual causes. Quote the alias (AS "set") or express the ' +
+        "same read another way."
+    );
+  }
+
+  const statements = Array.isArray(raw) ? raw : [raw];
+  if (statements.length > 1) {
+    throw new ReadOnlyQueryError(
+      `it contains ${statements.length} statements; send exactly one SELECT per call`
+    );
+  }
+  for (const ast of statements) {
+    const type = (ast as { type?: string } | null)?.type;
+    if (type !== "select") {
+      throw new ReadOnlyQueryError(
+        `the top-level statement is '${type ?? "unknown"}', not SELECT`
+      );
+    }
+    // Catch writes hidden inside a top-level SELECT: a data-modifying CTE or SELECT INTO.
+    if (hasWriteStatement(ast)) {
+      throw new ReadOnlyQueryError(
+        "a write statement is nested inside it (a data-modifying CTE or SELECT INTO)"
+      );
+    }
+    const fns = new Set<string>();
+    collectFunctionNames(ast, fns);
+    for (const fn of fns) {
+      if (DANGEROUS_FUNCTIONS.has(fn)) {
+        throw new ReadOnlyQueryError(
+          `it calls ${fn}(), which changes session state or reaches outside the row set`
+        );
+      }
+    }
+  }
+}
 
 /**
  * Parse the SQL, and if it's a single SELECT without a LIMIT, append one.
@@ -96,6 +493,7 @@ export function formatPgError(err: PgErrorLike) {
 export interface ExecuteQueryOptions {
   readonly: boolean;
   allowMultiStatements: boolean;
+  readOnlyQueries?: boolean;
   role?: string;
   sessionVars?: Record<string, string>;
   expandStar?: (sql: string) => string;
@@ -107,6 +505,10 @@ export async function executeQuery(
   maxRows: number,
   options: ExecuteQueryOptions
 ): Promise<QueryResult> {
+  if (options.readOnlyQueries) {
+    assertReadOnlyQuery(sql);
+  }
+
   const expandedSql = options.expandStar ? options.expandStar(sql) : sql;
   const limitedSql = ensureLimit(
     expandedSql,
@@ -136,7 +538,29 @@ export async function executeQuery(
       );
     }
 
-    const result = await client.query(limitedSql);
+    // Second, independent line of defence for read-only sources. The extended protocol
+    // sends the statement through Parse, and PostgreSQL refuses a Parse carrying more
+    // than one command with 42601 before executing any of it, so a statement smuggled
+    // past the lexer at a boundary the two disagree about still never runs.
+    //
+    // Neither layer is sufficient alone, which is why both stay:
+    //   - The server catches only MULTI-statement smuggling. It has no objection to
+    //     SELECT 'x\', (SELECT string_agg(val, ',') FROM secrets) --'
+    //     which is one legal statement, but node-sql-parser reads it as a single string
+    //     literal, so the AST walk vets a statement that is not the one that runs. That
+    //     payload returned another tenant's rows on a real database with the lexer
+    //     check removed. Only the lexer catches it.
+    //   - The lexer models PostgreSQL's tokenizer by hand and can be wrong about a
+    //     construct nobody has thought of yet. The server cannot be wrong about its own
+    //     statement boundaries.
+    //
+    // Gated on readOnlyQueries because allow_multi_statements is an independent setting
+    // and `SELECT 1; SELECT 2` is legitimate for a source that enables it.
+    const result = await client.query(
+      options.readOnlyQueries
+        ? { text: limitedSql, queryMode: "extended" }
+        : limitedSql
+    );
     const rows: Record<string, unknown>[] = result.rows;
 
     const isTruncated = rows.length > maxRows;
@@ -165,8 +589,8 @@ export async function executeQuery(
     if (err.code === "42501") {
       throw new Error(
         formatPgError(err) +
-        "\n\nPermission denied. Use search_objects to check which columns are accessible, " +
-        "then list them explicitly in your query."
+          "\n\nPermission denied. Use search_objects to check which columns are accessible, " +
+          "then list them explicitly in your query."
       );
     }
 
@@ -190,9 +614,12 @@ export async function executeQuery(
       // caller: leaking a pinned app.partner_id across callers would defeat RLS.
       discardReason = "failed to reset session state";
       logger.warn("Failed to reset RLS session state; discarding connection", {
-        error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        error:
+          cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
         role: options.role ?? "",
-        sessionVarKeys: options.sessionVars ? Object.keys(options.sessionVars).join(", ") : "",
+        sessionVarKeys: options.sessionVars
+          ? Object.keys(options.sessionVars).join(", ")
+          : "",
       });
     }
     client.release(discardReason ? new Error(discardReason) : undefined);
