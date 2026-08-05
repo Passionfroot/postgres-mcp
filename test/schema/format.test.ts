@@ -252,7 +252,14 @@ describe("formatRelationshipMap", () => {
       makeTable({
         sqlName: "creators",
         prismaModelName: "Creator",
-        incomingFks: [{ fromTable: "audit_events", fromColumn: "creatorId" }],
+        incomingFks: [
+          {
+            fromTable: "audit_events",
+            fromColumn: "creatorId",
+            constraintName: "audit_events_creatorId_fkey",
+            isUnique: false,
+          },
+        ],
       }),
       // Unmapped, so not rendered. Its FK to another unmapped table appears nowhere in the body.
       makeTable({
@@ -284,7 +291,14 @@ describe("formatRelationshipMap", () => {
         makeTable({
           sqlName: "users",
           prismaModelName: null,
-          incomingFks: [{ fromTable: "posts", fromColumn: "author_id" }],
+          incomingFks: [
+            {
+              fromTable: "posts",
+              fromColumn: "author_id",
+              constraintName: "posts_author_id_fkey",
+              isUnique: false,
+            },
+          ],
         }),
       ]);
 

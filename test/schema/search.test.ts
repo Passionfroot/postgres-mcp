@@ -576,7 +576,12 @@ describe("formatSearchResults", () => {
             { toTable: "creators", toColumn: "id", viaColumn: "creatorId" },
           ],
           incomingFks: [
-            { fromTable: "invoices", fromColumn: "collaborationId" },
+            {
+              fromTable: "invoices",
+              fromColumn: "collaborationId",
+              constraintName: "invoices_collaborationId_fkey",
+              isUnique: false,
+            },
           ],
         }),
       ];

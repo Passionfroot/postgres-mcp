@@ -26,6 +26,7 @@ const localSource: SourceConfig = {
   poolMaxExplicit: false,
   maxResponseBytes: 1_000_000,
   allowMultiStatements: false,
+  readOnlyQueries: false,
 };
 
 const { isAvailable: isDbAvailable } = await resolveTestDb();

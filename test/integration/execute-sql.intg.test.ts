@@ -19,6 +19,7 @@ const localSource: SourceConfig = {
   poolMaxExplicit: false,
   maxResponseBytes: 1_000_000,
   allowMultiStatements: false,
+  readOnlyQueries: false,
 };
 
 const defaultOptions = { readonly: false, allowMultiStatements: false };
@@ -149,9 +150,8 @@ describe.skipIf(!isDbAvailable)("execute_sql integration", () => {
       poolMax: 1,
       poolMaxExplicit: false,
       maxResponseBytes: 1_000_000,
-      poolMaxExplicit: false,
-      maxResponseBytes: 1_000_000,
       allowMultiStatements: false,
+      readOnlyQueries: false,
     };
     const timeoutManager = new ConnectionManager([timeoutSource]);
 
@@ -177,6 +177,7 @@ describe.skipIf(!isDbAvailable)("readonly enforcement integration", () => {
     poolMaxExplicit: false,
     maxResponseBytes: 1_000_000,
     allowMultiStatements: false,
+    readOnlyQueries: false,
   };
 
   const readonlyOptions = { readonly: true, allowMultiStatements: false };
@@ -247,6 +248,8 @@ describe.skipIf(!isDbAvailable)(
       maxRows: 10,
       timeout: 5,
       poolMax: 1,
+      poolMaxExplicit: false,
+      maxResponseBytes: 1_000_000,
       allowMultiStatements: true,
       readOnlyQueries: false,
     };
@@ -475,6 +478,8 @@ describe.skipIf(!isDbAvailable)(
         maxRows: 10,
         timeout: 5,
         poolMax: 1,
+        poolMaxExplicit: false,
+        maxResponseBytes: 1_000_000,
         allowMultiStatements: false,
         readOnlyQueries: false,
       };
