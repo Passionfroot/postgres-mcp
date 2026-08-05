@@ -19,35 +19,83 @@ function renderIncomingFks(table: MergedTable) {
   return `  <- ${sources.join(", ")}`;
 }
 
-export function formatRelationshipMap(schema: MergedSchema, databaseId: string) {
-  const mappedTables = schema.tables.filter((t) => t.prismaModelName !== null);
-  const sortedTables = [...mappedTables].sort((a, b) => a.sqlName.localeCompare(b.sqlName));
+/**
+ * Number of distinct FK edges the rendered map actually shows. An edge is visible if either end is
+ * a rendered table: as a `->` line on the source, or a `<-` line on the target. Counting over
+ * `schema.tables` instead would report edges between two tables the map never lists.
+ */
+function countVisibleFks(renderedTables: MergedTable[]) {
+  const edges = new Set<string>();
 
-  const totalFks = schema.tables.reduce((sum, t) => sum + t.outgoingFks.length, 0);
+  for (const table of renderedTables) {
+    for (const fk of table.outgoingFks) {
+      edges.add(`${table.sqlName}|${fk.viaColumn}|${fk.toTable}`);
+    }
+    for (const fk of table.incomingFks) {
+      edges.add(`${fk.fromTable}|${fk.fromColumn}|${table.sqlName}`);
+    }
+  }
 
-  const lines: string[] = [];
-  lines.push(
-    `# Schema: ${databaseId} (${mappedTables.length} tables, ${totalFks} FK relationships)`
-  );
-  lines.push("");
-  lines.push("Use search_objects to look up column detail for specific tables.");
+  return edges.size;
+}
+
+export interface FormatRelationshipMapOptions {
+  /**
+   * When false, no Prisma annotation is rendered and every database table is listed rather than
+   * only the Prisma-mapped ones. Defaults to true.
+   */
+  hasPrismaMapping?: boolean;
+}
+
+export function formatRelationshipMap(
+  schema: MergedSchema,
+  databaseId: string,
+  options: FormatRelationshipMapOptions = {}
+) {
+  const { hasPrismaMapping = true } = options;
+
+  // With a mapping loaded the map is deliberately an application-model overview, so unmapped
+  // tables are dropped. Without one that filter would empty the resource, so list everything.
+  const visibleTables = hasPrismaMapping
+    ? schema.tables.filter((t) => t.prismaModelName !== null)
+    : schema.tables;
+  const sortedTables = [...visibleTables].sort((a, b) => a.sqlName.localeCompare(b.sqlName));
+
+  const totalFks = countVisibleFks(sortedTables);
 
   // missing_table warnings from top-level driftWarnings
-  const missingTableWarnings = schema.driftWarnings.filter((w) => w.type === "missing_table");
+  const missingTableWarnings = hasPrismaMapping
+    ? schema.driftWarnings.filter((w) => w.type === "missing_table")
+    : [];
   const missingTableNames = new Set(missingTableWarnings.map((w) => w.tableName));
+
+  // These render as extra trailing entries below, on top of sortedTables, so the header total
+  // has to count them too or it undercounts whenever a Prisma model maps to a table missing
+  // from the database.
+  const trailingMissingTableWarnings = missingTableWarnings.filter(
+    (w) => !sortedTables.some((t) => t.sqlName === w.tableName)
+  );
+  const totalTables = sortedTables.length + trailingMissingTableWarnings.length;
+
+  const lines: string[] = [];
+  lines.push(`# Schema: ${databaseId} (${totalTables} tables, ${totalFks} FK relationships)`);
+  lines.push("");
+  lines.push("Use search_objects to look up column detail for specific tables.");
 
   for (const table of sortedTables) {
     lines.push("");
 
     const isMissingTable = missingTableNames.has(table.sqlName);
     if (isMissingTable) {
-      lines.push(
-        `${table.sqlName} (Prisma: ${table.prismaModelName}) -- TABLE MISSING IN DATABASE`
-      );
+      lines.push(`${table.sqlName} (Prisma: ${table.prismaModelName}) -- TABLE MISSING IN DATABASE`);
       continue;
     }
 
-    lines.push(`${table.sqlName} (Prisma: ${table.prismaModelName})`);
+    lines.push(
+      hasPrismaMapping && table.prismaModelName
+        ? `${table.sqlName} (Prisma: ${table.prismaModelName})`
+        : table.sqlName
+    );
 
     const outgoing = renderOutgoingFks(table);
     if (outgoing) lines.push(outgoing);
@@ -55,21 +103,22 @@ export function formatRelationshipMap(schema: MergedSchema, databaseId: string) 
     const incoming = renderIncomingFks(table);
     if (incoming) lines.push(incoming);
 
-    for (const warning of table.driftWarnings) {
-      lines.push(renderDriftWarning(warning));
+    // Drift is Prisma-vs-database by definition, and the detail text names Prisma models, fields
+    // and types. Without a mapping there is nothing to drift from.
+    if (hasPrismaMapping) {
+      for (const warning of table.driftWarnings) {
+        lines.push(renderDriftWarning(warning));
+      }
     }
   }
 
   // Render top-level missing_table warnings for tables not already in sortedTables
-  for (const warning of missingTableWarnings) {
-    const alreadyRendered = sortedTables.some((t) => t.sqlName === warning.tableName);
-    if (!alreadyRendered) {
-      // Find the Prisma model name from the warning detail
-      const modelNameMatch = warning.detail.match(/Prisma model "(\w+)"/);
-      const modelName = modelNameMatch ? modelNameMatch[1] : warning.tableName;
-      lines.push("");
-      lines.push(`${warning.tableName} (Prisma: ${modelName}) -- TABLE MISSING IN DATABASE`);
-    }
+  for (const warning of trailingMissingTableWarnings) {
+    // Find the Prisma model name from the warning detail
+    const modelNameMatch = warning.detail.match(/Prisma model "(\w+)"/);
+    const modelName = modelNameMatch ? modelNameMatch[1] : warning.tableName;
+    lines.push("");
+    lines.push(`${warning.tableName} (Prisma: ${modelName}) -- TABLE MISSING IN DATABASE`);
   }
 
   lines.push("");

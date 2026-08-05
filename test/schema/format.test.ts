@@ -132,6 +132,32 @@ describe("formatRelationshipMap", () => {
     expect(output).toContain("ghost_table (Prisma: GhostModel) -- TABLE MISSING IN DATABASE");
   });
 
+  it("counts missing-table entries in the header total", () => {
+    const schema = makeSchema(
+      [
+        makeTable({
+          sqlName: "creators",
+          prismaModelName: "Creator",
+        }),
+      ],
+      {
+        driftWarnings: [
+          {
+            type: "missing_table",
+            tableName: "ghost_table",
+            detail:
+              'Prisma model "GhostModel" maps to table "ghost_table" which does not exist in the database',
+          },
+        ],
+      }
+    );
+
+    const output = formatRelationshipMap(schema, "local");
+
+    // Body lists both `creators` and the trailing `ghost_table` entry, so the header must say 2.
+    expect(output).toContain("# Schema: local (2 tables, 0 FK relationships)");
+  });
+
   it("renders missing_column and type_mismatch drift warnings indented under table", () => {
     const schema = makeSchema([
       makeTable({
@@ -204,5 +230,132 @@ describe("formatRelationshipMap", () => {
     expect(lines[headerIdx + 2]).toBe(
       "Use search_objects to look up column detail for specific tables."
     );
+  });
+
+  it("counts only the FK edges the map actually shows", () => {
+    const schema = makeSchema([
+      makeTable({
+        sqlName: "creators",
+        prismaModelName: "Creator",
+        incomingFks: [{ fromTable: "audit_events", fromColumn: "creatorId" }],
+      }),
+      // Unmapped, so not rendered. Its FK to another unmapped table appears nowhere in the body.
+      makeTable({
+        sqlName: "audit_events",
+        prismaModelName: null,
+        outgoingFks: [
+          { toTable: "creators", toColumn: "id", viaColumn: "creatorId" },
+          { toTable: "_prisma_migrations", toColumn: "id", viaColumn: "migrationId" },
+        ],
+      }),
+      makeTable({ sqlName: "_prisma_migrations", prismaModelName: null }),
+    ]);
+
+    const output = formatRelationshipMap(schema, "local");
+
+    // audit_events -> creators is visible as the `<- audit_events` line on creators.
+    // audit_events -> _prisma_migrations is not visible anywhere, so it is not counted.
+    expect(output).toContain("# Schema: local (1 tables, 1 FK relationships)");
+  });
+
+  describe("no Prisma mapping loaded", () => {
+    it("renders every database table instead of an empty map", () => {
+      const schema = makeSchema([
+        makeTable({
+          sqlName: "posts",
+          prismaModelName: null,
+          outgoingFks: [{ toTable: "users", toColumn: "id", viaColumn: "author_id" }],
+        }),
+        makeTable({
+          sqlName: "users",
+          prismaModelName: null,
+          incomingFks: [{ fromTable: "posts", fromColumn: "author_id" }],
+        }),
+      ]);
+
+      const output = formatRelationshipMap(schema, "local", { hasPrismaMapping: false });
+
+      expect(output).toContain("\nposts\n");
+      expect(output).toContain("\nusers\n");
+      expect(output).toContain("  -> users.id");
+      expect(output).toContain("  <- posts");
+    });
+
+    it("renders a header count that matches the rendered body", () => {
+      const schema = makeSchema([
+        makeTable({
+          sqlName: "posts",
+          prismaModelName: null,
+          outgoingFks: [{ toTable: "users", toColumn: "id", viaColumn: "author_id" }],
+        }),
+        makeTable({ sqlName: "users", prismaModelName: null }),
+        makeTable({ sqlName: "_prisma_migrations", prismaModelName: null }),
+      ]);
+
+      const output = formatRelationshipMap(schema, "local", { hasPrismaMapping: false });
+
+      expect(output).toContain("# Schema: local (3 tables, 1 FK relationships)");
+    });
+
+    it("suppresses drift warnings, which are Prisma-vs-database by definition", () => {
+      const schema = makeSchema(
+        [
+          makeTable({
+            sqlName: "creators",
+            prismaModelName: null,
+            driftWarnings: [
+              {
+                type: "missing_column",
+                tableName: "creators",
+                detail:
+                  'Prisma field "legacyName" maps to column "legacy_name" which does not exist in table "creators"',
+              },
+              {
+                type: "type_mismatch",
+                tableName: "creators",
+                detail: 'Column "age": Prisma type "Int" expects integer but DB has "text"',
+              },
+            ],
+          }),
+        ],
+        {
+          driftWarnings: [
+            {
+              type: "missing_table",
+              tableName: "ghostTable",
+              detail: 'Prisma model "GhostModel" maps to table "ghostTable" which does not exist',
+            },
+          ],
+        }
+      );
+
+      const output = formatRelationshipMap(schema, "local", { hasPrismaMapping: false });
+
+      expect(output).not.toContain("⚠");
+      expect(output).not.toContain("TABLE MISSING IN DATABASE");
+      expect(output).not.toContain("ghostTable");
+    });
+
+    it("emits no Prisma text anywhere in the map", () => {
+      const schema = makeSchema(
+        [
+          makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
+          makeTable({ sqlName: "migrations", prismaModelName: null }),
+        ],
+        {
+          driftWarnings: [
+            {
+              type: "missing_table",
+              tableName: "ghostTable",
+              detail: 'Prisma model "GhostModel" maps to table "ghostTable" which does not exist',
+            },
+          ],
+        }
+      );
+
+      const output = formatRelationshipMap(schema, "local", { hasPrismaMapping: false });
+
+      expect(output).not.toMatch(/prisma/i);
+    });
   });
 });

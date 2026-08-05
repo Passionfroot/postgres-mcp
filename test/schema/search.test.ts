@@ -231,7 +231,7 @@ describe("formatSearchResults", () => {
       return null;
     };
 
-    const output = formatSearchResults(tables, enumResolver);
+    const output = formatSearchResults(tables, { enumResolver });
 
     expect(output).toContain("enum CollaborationStatus:");
     expect(output).toContain("DRAFT, ACTIVE, completed");
@@ -306,5 +306,71 @@ describe("formatSearchResults", () => {
     const output = formatSearchResults(tables);
 
     expect(output).toContain("(Prisma: legacyId)");
+  });
+
+  describe("hasPrismaMapping: false", () => {
+    it("omits the (no Prisma model) suffix that every table would otherwise carry", () => {
+      const tables = [
+        makeTable({
+          sqlName: "_prisma_migrations",
+          prismaModelName: null,
+          columns: [makeColumn({ sqlName: "id", dataType: "integer" })],
+        }),
+      ];
+
+      const output = formatSearchResults(tables, { hasPrismaMapping: false });
+
+      expect(output).toContain("_prisma_migrations\n");
+      expect(output).not.toContain("(no Prisma model)");
+    });
+
+    it("emits no Prisma text at all across headers and columns", () => {
+      const tables = [
+        makeTable({
+          sqlName: "creators",
+          prismaModelName: "Creator",
+          columns: [
+            makeColumn({ sqlName: "id", dataType: "text" }),
+            makeColumn({ sqlName: "legacy_id", dataType: "text", prismaFieldName: "legacyId" }),
+          ],
+        }),
+      ];
+
+      const output = formatSearchResults(tables, { hasPrismaMapping: false });
+
+      expect(output).toContain("creators\n");
+      expect(output).not.toMatch(/prisma/i);
+    });
+
+    it("still emits PK, columns, enums, and FK sections", () => {
+      const tables = [
+        makeTable({
+          sqlName: "collaborations",
+          prismaModelName: "Collaboration",
+          primaryKeys: ["id"],
+          columns: [
+            makeColumn({ sqlName: "id", dataType: "uuid", isPrimaryKey: true }),
+            makeColumn({
+              sqlName: "status",
+              dataType: "USER-DEFINED",
+              udtName: "CollaborationStatus",
+            }),
+          ],
+          outgoingFks: [{ toTable: "creators", toColumn: "id", viaColumn: "creatorId" }],
+          incomingFks: [{ fromTable: "invoices", fromColumn: "collaborationId" }],
+        }),
+      ];
+
+      const enumResolver = (udt: string) =>
+        udt === "CollaborationStatus" ? [{ label: "DRAFT", dbValue: "DRAFT" }] : null;
+
+      const output = formatSearchResults(tables, { enumResolver, hasPrismaMapping: false });
+
+      expect(output).toContain("PK: id");
+      expect(output).toContain("[PK]");
+      expect(output).toContain("enum CollaborationStatus: DRAFT");
+      expect(output).toContain("FK out: -> creators.id via creatorId");
+      expect(output).toContain("FK in:  <- invoices");
+    });
   });
 });

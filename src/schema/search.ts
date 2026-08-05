@@ -1,6 +1,9 @@
 import type { MergedColumn, MergedSchema, MergedTable } from "./types.js";
 
-export function searchTables(schema: MergedSchema, pattern: string): MergedTable[] {
+export function searchTables(
+  schema: MergedSchema,
+  pattern: string
+): MergedTable[] {
   const lowerPattern = pattern.toLowerCase();
 
   const exact: MergedTable[] = [];
@@ -19,7 +22,8 @@ export function searchTables(schema: MergedSchema, pattern: string): MergedTable
     }
 
     const isPartialSql = sqlLower.includes(lowerPattern);
-    const isPartialPrisma = prismaLower !== null && prismaLower.includes(lowerPattern);
+    const isPartialPrisma =
+      prismaLower !== null && prismaLower.includes(lowerPattern);
 
     if (isPartialSql || isPartialPrisma) {
       partial.push(table);
@@ -42,36 +46,56 @@ export interface EnumResolution {
 
 function formatEnumValues(resolution: EnumResolution) {
   const labels = resolution.values.map((v) => v.dbValue);
-  if (!resolution.isDbFallback || labels.length <= ENUM_FULL_RENDER_MAX) return labels.join(", ");
-  return `${labels.slice(0, ENUM_SAMPLE_SIZE).join(", ")}, … (${labels.length} values total)`;
+  if (!resolution.isDbFallback || labels.length <= ENUM_FULL_RENDER_MAX)
+    return labels.join(", ");
+  return `${labels.slice(0, ENUM_SAMPLE_SIZE).join(", ")}, … (${
+    labels.length
+  } values total)`;
 }
 
-function formatColumn(col: MergedColumn) {
-  const parts = [`    ${col.sqlName}`, col.dataType, col.isNullable ? "NULL" : "NOT NULL"];
+function formatColumn(col: MergedColumn, hasPrismaMapping: boolean) {
+  const parts = [
+    `    ${col.sqlName}`,
+    col.dataType,
+    col.isNullable ? "NULL" : "NOT NULL",
+  ];
 
   if (col.isPrimaryKey) parts.push("[PK]");
   if (col.columnDefault !== null) parts.push(`default: ${col.columnDefault}`);
-  if (col.prismaFieldName !== null) {
+  if (hasPrismaMapping && col.prismaFieldName !== null) {
     parts.push(`(Prisma: ${col.prismaFieldName})`);
   }
 
   return parts.join("  ");
 }
 
+export interface FormatSearchResultsOptions {
+  enumResolver?: (udtName: string) => EnumResolution | null;
+  /** When false, no Prisma annotation is rendered at all. Defaults to true. */
+  hasPrismaMapping?: boolean;
+}
+
 export function formatSearchResults(
   tables: MergedTable[],
-  enumResolver?: (udtName: string) => EnumResolution | null
+  options: FormatSearchResultsOptions = {}
 ) {
   if (tables.length === 0) return "No matching tables found.";
+
+  const { enumResolver, hasPrismaMapping = true } = options;
 
   const sections: string[] = [];
 
   for (const table of tables) {
     const lines: string[] = [];
 
-    const header = table.prismaModelName
-      ? `${table.sqlName} (Prisma: ${table.prismaModelName})`
-      : `${table.sqlName} (no Prisma model)`;
+    let header: string;
+    if (!hasPrismaMapping) {
+      header = table.sqlName;
+    } else if (table.prismaModelName) {
+      header = `${table.sqlName} (Prisma: ${table.prismaModelName})`;
+    } else {
+      header = `${table.sqlName} (no Prisma model)`;
+    }
     lines.push(header);
 
     if (table.primaryKeys.length > 0) {
@@ -81,12 +105,14 @@ export function formatSearchResults(
     if (table.columns.length > 0) {
       lines.push("  Columns:");
       for (const col of table.columns) {
-        lines.push(formatColumn(col));
+        lines.push(formatColumn(col, hasPrismaMapping));
 
         if (col.dataType === "USER-DEFINED" && enumResolver) {
           const resolution = enumResolver(col.udtName);
           if (resolution && resolution.values.length > 0) {
-            lines.push(`      enum ${col.udtName}: ${formatEnumValues(resolution)}`);
+            lines.push(
+              `      enum ${col.udtName}: ${formatEnumValues(resolution)}`
+            );
           }
         }
       }
@@ -100,7 +126,9 @@ export function formatSearchResults(
     }
 
     if (table.incomingFks.length > 0) {
-      const sources = [...new Set(table.incomingFks.map((fk) => fk.fromTable))].sort();
+      const sources = [
+        ...new Set(table.incomingFks.map((fk) => fk.fromTable)),
+      ].sort();
       lines.push(`  FK in:  <- ${sources.join(", ")}`);
     }
 

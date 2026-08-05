@@ -1,0 +1,382 @@
+import http from "node:http";
+import net from "node:net";
+import os from "node:os";
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { formatHostPort, isLoopbackHost, reachableHostPorts, sanitizeForLog, startHttpServer } from "../src/http.js";
+
+type HttpTransportOptions = Parameters<typeof startHttpServer>[0];
+
+async function freePort() {
+  return new Promise<number>((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address() as net.AddressInfo;
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+const running: { close(): Promise<void> }[] = [];
+
+async function start(overrides: Partial<HttpTransportOptions> = {}) {
+  const port = await freePort();
+  const server = await startHttpServer({
+    host: "127.0.0.1",
+    port,
+    createServer: () => new McpServer({ name: "test", version: "1" }),
+    ...overrides,
+  });
+  running.push(server);
+  return { ...server, port, base: `http://127.0.0.1:${port}` };
+}
+
+afterEach(async () => {
+  while (running.length) await running.pop()?.close();
+});
+
+const ACCEPT = "application/json, text/event-stream";
+
+function initializeBody(id = 1) {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+  });
+}
+
+async function initialize(base: string, headers: Record<string, string> = {}) {
+  const res = await fetch(`${base}/mcp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: ACCEPT, ...headers },
+    body: initializeBody(),
+  });
+  await res.text();
+  return { status: res.status, sessionId: res.headers.get("mcp-session-id") };
+}
+
+// fetch()/undici refuses to send a caller-set Host header (it's on the Fetch spec's forbidden
+// list and gets silently dropped), so spoofing one for a test needs the raw http module instead.
+function rawRequest(port: number, headers: http.OutgoingHttpHeaders, body: string) {
+  return new Promise<{ status?: number; text?: string }>((resolve) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, path: "/mcp", method: "POST", headers: { "Content-Type": "application/json", Accept: ACCEPT, ...headers } },
+      (res) => {
+        let text = "";
+        res.on("data", (c) => (text += c));
+        res.on("end", () => resolve({ status: res.statusCode, text }));
+      }
+    );
+    req.on("error", () => resolve({}));
+    req.end(body);
+  });
+}
+
+describe("isLoopbackHost", () => {
+  it("accepts the whole 127.0.0.0/8 range, not just 127.0.0.1", () => {
+    expect(isLoopbackHost("127.0.0.1")).toBe(true);
+    expect(isLoopbackHost("127.0.0.2")).toBe(true);
+    expect(isLoopbackHost("127.255.255.254")).toBe(true);
+    expect(isLoopbackHost("localhost")).toBe(true);
+    expect(isLoopbackHost("::1")).toBe(true);
+    expect(isLoopbackHost("::ffff:127.0.0.1")).toBe(true);
+  });
+
+  it("rejects addresses reachable from off the machine", () => {
+    expect(isLoopbackHost("0.0.0.0")).toBe(false);
+    expect(isLoopbackHost("::")).toBe(false);
+    expect(isLoopbackHost("10.0.0.1")).toBe(false);
+    expect(isLoopbackHost("128.0.0.1")).toBe(false);
+    expect(isLoopbackHost("example.com")).toBe(false);
+  });
+});
+
+describe("formatHostPort", () => {
+  it("brackets IPv6 literals and leaves everything else alone", () => {
+    expect(formatHostPort("::1", 7803)).toBe("[::1]:7803");
+    expect(formatHostPort("fe80::1", 80)).toBe("[fe80::1]:80");
+    expect(formatHostPort("127.0.0.1", 7803)).toBe("127.0.0.1:7803");
+    expect(formatHostPort("localhost", 7803)).toBe("localhost:7803");
+  });
+});
+
+describe("sanitizeForLog", () => {
+  it("flattens control characters so a peer cannot forge log lines", () => {
+    expect(sanitizeForLog("a\nb\rc\0d")).toBe("a b c d");
+  });
+
+  it("bounds the length", () => {
+    expect(sanitizeForLog("x".repeat(500))).toHaveLength(200);
+  });
+});
+
+describe("reachableHostPorts", () => {
+  it("returns just the bound address for a specific, non-wildcard bind", () => {
+    expect(reachableHostPorts("10.0.0.5", 7803)).toEqual(["10.0.0.5:7803"]);
+  });
+
+  it("expands a wildcard bind to the machine's real hostname/interfaces, never the wildcard string itself", () => {
+    const hostPorts = reachableHostPorts("0.0.0.0", 7803);
+    expect(hostPorts).not.toContain("0.0.0.0:7803");
+    expect(hostPorts).toContain(formatHostPort(os.hostname().toLowerCase(), 7803));
+
+    expect(reachableHostPorts("::", 7803)).not.toContain(formatHostPort("::", 7803));
+  });
+});
+
+describe("--host ::1", () => {
+  it("serves clients that send the bracketed Host header a real client sends", async () => {
+    const port = await freePort();
+    const server = await startHttpServer({
+      host: "::1",
+      port,
+      createServer: () => new McpServer({ name: "test", version: "1" }),
+    });
+    running.push(server);
+
+    expect(server.url).toBe(`http://[::1]:${port}/mcp`);
+    const { status } = await initialize(`http://[::1]:${port}`);
+    expect(status).toBe(200);
+  });
+});
+
+describe("--host 0.0.0.0", () => {
+  it("serves a real client's Host header and rejects a forged wildcard Host header", async () => {
+    const port = await freePort();
+    const server = await startHttpServer({
+      host: "0.0.0.0",
+      port,
+      token: "s3cret",
+      createServer: () => new McpServer({ name: "test", version: "1" }),
+    });
+    running.push(server);
+
+    // No real client ever sends the bind string "0.0.0.0:PORT" as its own Host header; it sends
+    // whatever address or name it dialed. The hostname is what reachableHostPorts always includes.
+    // Lowercase: that's what a real client's Host header looks like, and what the SDK's own
+    // node-server adapter requires byte-for-byte regardless of this fix (it parses Host through
+    // the URL class, which lowercases hostnames).
+    const realHost = formatHostPort(os.hostname().toLowerCase(), port);
+    const real = await rawRequest(port, { Host: realHost, Authorization: "Bearer s3cret" }, initializeBody());
+    expect(real.status).toBe(200);
+
+    const forged = await rawRequest(port, { Host: `0.0.0.0:${port}`, Authorization: "Bearer s3cret" }, initializeBody());
+    expect(forged.status).toBe(403);
+  });
+
+  it("gates /health behind the Host check too", async () => {
+    const port = await freePort();
+    const server = await startHttpServer({
+      host: "0.0.0.0",
+      port,
+      token: "s3cret",
+      createServer: () => new McpServer({ name: "test", version: "1" }),
+    });
+    running.push(server);
+
+    const forged = await new Promise<{ status?: number }>((resolve) => {
+      const req = http.request(
+        { host: "127.0.0.1", port, path: "/health", method: "GET", headers: { Host: `0.0.0.0:${port}` } },
+        (res) => resolve({ status: res.statusCode })
+      );
+      req.on("error", () => resolve({}));
+      req.end();
+    });
+    expect(forged.status).toBe(403);
+  });
+});
+
+describe("request body limits", () => {
+  it("answers 413 on the declared length, before the body is uploaded", async () => {
+    const server = await start();
+
+    const body = await new Promise<{ status?: number; json?: string }>((resolve) => {
+      const req = http.request(
+        {
+          host: "127.0.0.1",
+          port: server.port,
+          path: "/mcp",
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Content-Length": 5 * 1024 * 1024 },
+        },
+        (res) => {
+          let text = "";
+          res.on("data", (c) => (text += c));
+          res.on("end", () => resolve({ status: res.statusCode, json: text }));
+        }
+      );
+      req.on("error", () => resolve({}));
+      // Deliberately never finish the body: the declared length alone must be enough.
+      req.write("x".repeat(1024));
+    });
+
+    expect(body.status).toBe(413);
+    expect(JSON.parse(body.json ?? "{}").error.code).toBe(-32600);
+    expect((await initialize(server.base)).status).toBe(200);
+  });
+
+  it("applies the same cap to a request carrying an existing session id, not just to initialize", async () => {
+    const server = await start();
+    const { sessionId } = await initialize(server.base);
+
+    const body = await new Promise<{ status?: number; json?: string }>((resolve) => {
+      const req = http.request(
+        {
+          host: "127.0.0.1",
+          port: server.port,
+          path: "/mcp",
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": 5 * 1024 * 1024,
+            "mcp-session-id": sessionId ?? "",
+          },
+        },
+        (res) => {
+          let text = "";
+          res.on("data", (c) => (text += c));
+          res.on("end", () => resolve({ status: res.statusCode, json: text }));
+        }
+      );
+      req.on("error", () => resolve({}));
+      // Same trick as the no-session case above: never finish the body, since a bypass would
+      // fall through to the SDK's own unbounded req.json() and buffer the whole thing anyway.
+      req.write("x".repeat(1024));
+    });
+
+    expect(body.status).toBe(413);
+    expect(JSON.parse(body.json ?? "{}").error.code).toBe(-32600);
+  });
+
+  it("survives a chunked body far past V8's max string length", async () => {
+    const server = await start();
+
+    const result = await new Promise<{ status?: number; error?: string }>((resolve) => {
+      const req = http.request(
+        {
+          host: "127.0.0.1",
+          port: server.port,
+          path: "/mcp",
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Transfer-Encoding": "chunked" },
+        },
+        (res) => {
+          res.resume();
+          resolve({ status: res.statusCode });
+        }
+      );
+      req.on("error", (err) => resolve({ error: err.message }));
+      req.write("[");
+      const chunk = Buffer.alloc(1024 * 1024, "x");
+      let written = 0;
+      const pump = () => {
+        while (written < 32) {
+          written++;
+          if (!req.write(chunk)) return req.once("drain", pump);
+        }
+        req.end("]");
+      };
+      pump();
+    });
+
+    // Either the 413 lands or the upload is cut first; what matters is that the process is alive.
+    expect([413, undefined]).toContain(result.status);
+    expect((await initialize(server.base)).status).toBe(200);
+  });
+
+  it("answers 400 with a parse error for malformed JSON, not 500", async () => {
+    const server = await start();
+    const res = await fetch(`${server.base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: ACCEPT },
+      body: "{not json",
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.code).toBe(-32700);
+  });
+});
+
+describe("session lifecycle", () => {
+  it("refuses new sessions with 503 once the cap is reached", async () => {
+    const server = await start({ maxSessions: 2 });
+
+    expect((await initialize(server.base)).status).toBe(200);
+    expect((await initialize(server.base)).status).toBe(200);
+
+    const third = await fetch(`${server.base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: ACCEPT },
+      body: initializeBody(),
+    });
+    expect(third.status).toBe(503);
+    expect((await third.json()).error.message).toContain("Too many sessions");
+  });
+
+  it("reclaims sessions no client has touched", async () => {
+    const server = await start({ sessionIdleMs: 60, sessionSweepMs: 25 });
+    await initialize(server.base);
+
+    const sessions = async () => (await (await fetch(`${server.base}/health`)).json()).sessions;
+    expect(await sessions()).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(await sessions()).toBe(0);
+  });
+
+  it("keeps a session alive while it is being used", async () => {
+    const server = await start({ sessionIdleMs: 300, sessionSweepMs: 25 });
+    const { sessionId } = await initialize(server.base);
+
+    for (let i = 0; i < 6; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await fetch(`${server.base}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: ACCEPT, "mcp-session-id": sessionId ?? "" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" }),
+      }).then((r) => r.text());
+    }
+
+    const sessions = (await (await fetch(`${server.base}/health`)).json()).sessions;
+    expect(sessions).toBe(1);
+  });
+});
+
+describe("origin validation", () => {
+  it("rejects a cross-origin request with 403", async () => {
+    const server = await start();
+    const { status, sessionId } = await initialize(server.base, { Origin: "https://evil.example" });
+    expect(status).toBe(403);
+    expect(sessionId).toBeNull();
+  });
+
+  it("accepts a loopback origin and a request with no Origin at all", async () => {
+    const server = await start();
+    expect((await initialize(server.base, { Origin: `http://127.0.0.1:${server.port}` })).status).toBe(200);
+    expect((await initialize(server.base)).status).toBe(200);
+  });
+});
+
+describe("token auth", () => {
+  it("rejects a wrong or missing token and accepts the right one", async () => {
+    const server = await start({ token: "s3cret" });
+
+    expect((await initialize(server.base)).status).toBe(401);
+    expect((await initialize(server.base, { Authorization: "Bearer nope" })).status).toBe(401);
+    expect((await initialize(server.base, { Authorization: "Bearer s3cret" })).status).toBe(200);
+  });
+
+  it("keeps /health answering without a token but withholds the session count", async () => {
+    const server = await start({ token: "s3cret" });
+
+    const anonymous = await (await fetch(`${server.base}/health`)).json();
+    expect(anonymous).toEqual({ status: "ok" });
+
+    const authorized = await (
+      await fetch(`${server.base}/health`, { headers: { Authorization: "Bearer s3cret" } })
+    ).json();
+    expect(authorized).toEqual({ status: "ok", sessions: 0 });
+  });
+});
