@@ -214,9 +214,48 @@ describe("executeQuery", () => {
 
     await executeQuery(pool, "SELECT 1", 10, defaultOptions);
 
-    expect(
-      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client.release
-    ).toHaveBeenCalledTimes(1);
+    const release = (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client
+      .release;
+    expect(release).toHaveBeenCalledTimes(1);
+    // Falsy first argument, so pg-pool keeps the connection for reuse. `release()` and
+    // `release(undefined)` are equivalent to it, so assert the value rather than the arity.
+    expect(release.mock.calls[0][0]).toBeFalsy();
+  });
+
+  it("discards the connection when the client-side query timeout fires", async () => {
+    // pg rejects with this and leaves the server still executing on the connection. Releasing it
+    // clean puts a busy connection back into a pool whose default size is 1.
+    const queryFn = vi.fn().mockRejectedValue(new Error("Query read timeout"));
+    const pool = createMockPool(queryFn);
+
+    await expect(executeQuery(pool, "SELECT 1", 10, defaultOptions)).rejects.toThrow(
+      "Query read timeout"
+    );
+
+    const release = (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client
+      .release;
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release.mock.calls[0][0]).toBeInstanceOf(Error);
+  });
+
+  it("discards the connection when resetting session state fails", async () => {
+    // Leaving a pinned app.partner_id on a pooled connection would hand one caller's RLS scope to
+    // the next one.
+    const queryFn = vi.fn().mockImplementation((sql: string) => {
+      if (sql.startsWith("RESET")) return Promise.reject(new Error("connection lost"));
+      return Promise.resolve({ rows: [{ id: 1 }] });
+    });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT 1", 10, {
+      ...defaultOptions,
+      sessionVars: { "app.partner_id": "abc" },
+    });
+
+    const release = (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })._client
+      .release;
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release.mock.calls[0][0]).toBeInstanceOf(Error);
   });
 
   it("releases client after failed query", async () => {
