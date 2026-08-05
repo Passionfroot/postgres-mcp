@@ -225,10 +225,16 @@ export function mergeSchemas(prisma: PrismaMapping, db: DbMetadata): MergedSchem
   tables.sort((a, b) => a.sqlName.localeCompare(b.sqlName));
   unmappedTables.sort();
 
+  const dbEnums: Record<string, string[]> = {};
+  for (const ev of [...db.enumValues].sort((a, b) => a.sortOrder - b.sortOrder)) {
+    (dbEnums[ev.enumName] ??= []).push(ev.enumValue);
+  }
+
   return {
     tables,
     unmappedTables,
     driftWarnings: topLevelWarnings,
+    dbEnums,
   };
 }
 

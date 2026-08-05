@@ -96,4 +96,6 @@ export interface MergedSchema {
   tables: MergedTable[];
   unmappedTables: string[];
   driftWarnings: DriftWarning[];
+  /** DB-introspected enum labels by udt_name, in enumsortorder. Available without a Prisma schema. */
+  dbEnums: Record<string, string[]>;
 }

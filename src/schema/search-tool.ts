@@ -7,7 +7,12 @@ import type { Config } from "../types.js";
 import type { SchemaCache } from "./cache.js";
 
 import { logger } from "../logger.js";
-import { mcpErrorResult, mcpTextResult, resolveSource, truncateText } from "../mcp-helpers.js";
+import {
+  mcpErrorResult,
+  mcpTextResult,
+  resolveSource,
+  truncateText,
+} from "../mcp-helpers.js";
 import { formatSearchResults, searchTables } from "./search.js";
 
 export function registerSearchTool(
@@ -34,7 +39,9 @@ export function registerSearchTool(
       title: "Search Schema Objects",
       description,
       inputSchema: {
-        database: z.string().describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
+        database: z
+          .string()
+          .describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
         pattern: z.string().describe(patternDescription),
       },
     },
@@ -50,13 +57,35 @@ export function registerSearchTool(
           sessionVars: source.sessionVars,
         });
         const results = searchTables(schema, pattern);
-        const enumResolver = (udtName: string) => schemaCache.getEnumValues(udtName);
-        const formatted = formatSearchResults(results, { enumResolver, hasPrismaMapping });
+        const enumResolver = (udtName: string) => {
+          const prismaValues = schemaCache.getEnumValues(udtName);
+          if (prismaValues)
+            return { values: prismaValues, isDbFallback: false };
+
+          const dbValues = schema.dbEnums[udtName];
+          if (dbValues) {
+            return {
+              values: dbValues.map((value) => ({
+                label: value,
+                dbValue: value,
+              })),
+              isDbFallback: true,
+            };
+          }
+
+          return null;
+        };
+        const formatted = formatSearchResults(results, {
+          enumResolver,
+          hasPrismaMapping,
+        });
 
         return mcpTextResult(truncateText(formatted, source.maxResponseBytes));
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        logger.error(`search_objects error for database "${database}": ${message}`);
+        logger.error(
+          `search_objects error for database "${database}": ${message}`
+        );
 
         return mcpErrorResult(message);
       }

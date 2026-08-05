@@ -36,6 +36,24 @@ function makePrismaMapping(overrides: Partial<PrismaMapping> = {}): PrismaMappin
 }
 
 describe("mergeSchemas", () => {
+  it("collects DB enum values into dbEnums, ordered by sortOrder", () => {
+    const db = makeDbMetadata({
+      columns: [makeDbColumn({ tableName: "collaborations", columnName: "campaignStatus" })],
+      enumValues: [
+        { enumName: "CampaignCollaborationStatus", enumValue: "SAVED", sortOrder: 2 },
+        { enumName: "CampaignCollaborationStatus", enumValue: "IN_REVIEW", sortOrder: 1 },
+        { enumName: "CurrencyType", enumValue: "USD", sortOrder: 1 },
+      ],
+    });
+
+    const merged = mergeSchemas(makePrismaMapping(), db);
+
+    expect(merged.dbEnums).toEqual({
+      CampaignCollaborationStatus: ["IN_REVIEW", "SAVED"],
+      CurrencyType: ["USD"],
+    });
+  });
+
   it("merges a simple model with matching DB table", () => {
     const prisma = makePrismaMapping({
       models: [

@@ -32,6 +32,7 @@ function makeSchema(tables: MergedTable[]): MergedSchema {
     tables,
     unmappedTables: [],
     driftWarnings: [],
+    dbEnums: {},
   };
 }
 

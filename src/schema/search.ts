@@ -1,6 +1,9 @@
 import type { MergedColumn, MergedSchema, MergedTable } from "./types.js";
 
-export function searchTables(schema: MergedSchema, pattern: string): MergedTable[] {
+export function searchTables(
+  schema: MergedSchema,
+  pattern: string
+): MergedTable[] {
   const lowerPattern = pattern.toLowerCase();
 
   const exact: MergedTable[] = [];
@@ -19,7 +22,8 @@ export function searchTables(schema: MergedSchema, pattern: string): MergedTable
     }
 
     const isPartialSql = sqlLower.includes(lowerPattern);
-    const isPartialPrisma = prismaLower !== null && prismaLower.includes(lowerPattern);
+    const isPartialPrisma =
+      prismaLower !== null && prismaLower.includes(lowerPattern);
 
     if (isPartialSql || isPartialPrisma) {
       partial.push(table);
@@ -29,8 +33,32 @@ export function searchTables(schema: MergedSchema, pattern: string): MergedTable
   return [...exact, ...partial];
 }
 
+// Full label list for typical enums. Huge ones (e.g. Country, 245 labels) get a sample + count,
+// but only when resolved via the DB-introspection fallback (no Prisma schema available) -
+// Prisma-mapped enums keep rendering in full, as they did before that fallback existed.
+const ENUM_FULL_RENDER_MAX = 24;
+const ENUM_SAMPLE_SIZE = 8;
+
+export interface EnumResolution {
+  values: { label: string; dbValue: string }[];
+  isDbFallback: boolean;
+}
+
+function formatEnumValues(resolution: EnumResolution) {
+  const labels = resolution.values.map((v) => v.dbValue);
+  if (!resolution.isDbFallback || labels.length <= ENUM_FULL_RENDER_MAX)
+    return labels.join(", ");
+  return `${labels.slice(0, ENUM_SAMPLE_SIZE).join(", ")}, … (${
+    labels.length
+  } values total)`;
+}
+
 function formatColumn(col: MergedColumn, hasPrismaMapping: boolean) {
-  const parts = [`    ${col.sqlName}`, col.dataType, col.isNullable ? "NULL" : "NOT NULL"];
+  const parts = [
+    `    ${col.sqlName}`,
+    col.dataType,
+    col.isNullable ? "NULL" : "NOT NULL",
+  ];
 
   if (col.isPrimaryKey) parts.push("[PK]");
   if (col.columnDefault !== null) parts.push(`default: ${col.columnDefault}`);
@@ -42,7 +70,7 @@ function formatColumn(col: MergedColumn, hasPrismaMapping: boolean) {
 }
 
 export interface FormatSearchResultsOptions {
-  enumResolver?: (udtName: string) => { label: string; dbValue: string }[] | null;
+  enumResolver?: (udtName: string) => EnumResolution | null;
   /** When false, no Prisma annotation is rendered at all. Defaults to true. */
   hasPrismaMapping?: boolean;
 }
@@ -80,9 +108,11 @@ export function formatSearchResults(
         lines.push(formatColumn(col, hasPrismaMapping));
 
         if (col.dataType === "USER-DEFINED" && enumResolver) {
-          const values = enumResolver(col.udtName);
-          if (values && values.length > 0) {
-            lines.push(`      enum ${col.udtName}: ${values.map((v) => v.dbValue).join(", ")}`);
+          const resolution = enumResolver(col.udtName);
+          if (resolution && resolution.values.length > 0) {
+            lines.push(
+              `      enum ${col.udtName}: ${formatEnumValues(resolution)}`
+            );
           }
         }
       }
@@ -96,7 +126,9 @@ export function formatSearchResults(
     }
 
     if (table.incomingFks.length > 0) {
-      const sources = [...new Set(table.incomingFks.map((fk) => fk.fromTable))].sort();
+      const sources = [
+        ...new Set(table.incomingFks.map((fk) => fk.fromTable)),
+      ].sort();
       lines.push(`  FK in:  <- ${sources.join(", ")}`);
     }
 
