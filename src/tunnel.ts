@@ -22,10 +22,23 @@ export function parseDsnHostPort(dsn: string): { host: string; port: number } {
  * an SSH tunnel via ssh2 forwardOut(). pg.Pool connects to the local proxy as if it were the remote
  * database.
  */
-export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
+export function createTunnel(
+  config: TunnelConfig,
+  onDown?: (reason: string) => void
+): Promise<TunnelHandle> {
   return new Promise((resolve, reject) => {
     const ssh = new SSHClient();
     const activeSockets = new Set<net.Socket>();
+    // Once the tunnel is established the establishment promise is settled, so a later ssh error or
+    // close (e.g. the TCP socket dying across a laptop sleep) can no longer reject it. Route those
+    // to onDown instead, so the caller tears the tunnel + pool down and recreates them. Without
+    // this the dead tunnel lingers and queries wedge on it until the process is killed.
+    let settled = false;
+    // Set before the intentional shutdown in close() starts. ssh.end() emits its own "close" (and
+    // can emit "error") asynchronously, and without this flag that self-inflicted event is
+    // indistinguishable from a real death and fires onDown again for a tunnel that was already
+    // being torn down on purpose.
+    let closing = false;
 
     const proxyServer = net.createServer((socket) => {
       activeSockets.add(socket);
@@ -34,27 +47,39 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
       const srcAddr = socket.remoteAddress ?? "127.0.0.1";
       const srcPort = socket.remotePort ?? 0;
 
-      ssh.forwardOut(
-        srcAddr,
-        srcPort,
-        config.remoteHost,
-        config.remotePort,
-        (err, stream) => {
-          if (err) {
-            logger.error(`SSH forwardOut failed: ${err.message}`, {
-              remoteHost: config.remoteHost,
-              remotePort: config.remotePort,
-            });
-            socket.destroy();
-            return;
+      try {
+        ssh.forwardOut(
+          srcAddr,
+          srcPort,
+          config.remoteHost,
+          config.remotePort,
+          (err, stream) => {
+            if (err) {
+              logger.error(`SSH forwardOut failed: ${err.message}`, {
+                remoteHost: config.remoteHost,
+                remotePort: config.remotePort,
+              });
+              socket.destroy();
+              return;
+            }
+
+            socket.pipe(stream).pipe(socket);
+
+            stream.on("error", () => socket.destroy());
+            socket.on("error", () => stream.destroy());
           }
-
-          socket.pipe(stream).pipe(socket);
-
-          stream.on("error", () => socket.destroy());
-          socket.on("error", () => stream.destroy());
-        }
-      );
+        );
+      } catch (err) {
+        // forwardOut throws synchronously ("Not connected") if the ssh connection has already died.
+        // Destroy the incoming socket instead of letting the throw crash the whole process; the
+        // ssh error/close handler marks the pool dead so the tunnel is recreated on the next call.
+        logger.error(
+          `SSH forwardOut threw: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        socket.destroy();
+      }
     });
 
     proxyServer.on("error", (err) => {
@@ -73,11 +98,13 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
           `SSH tunnel established: 127.0.0.1:${addr.port} -> ${config.remoteHost}:${config.remotePort} via ${config.sshHost}`
         );
 
+        settled = true;
         resolve({
           localHost: "127.0.0.1",
           localPort: addr.port,
           close: () =>
             new Promise<void>((res) => {
+              closing = true;
               for (const socket of activeSockets) {
                 socket.destroy();
               }
@@ -93,9 +120,24 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
     });
 
     ssh.on("error", (err) => {
-      reject(
-        new Error(`SSH tunnel to ${config.sshHost} failed: ${err.message}`)
+      if (!settled) {
+        reject(
+          new Error(`SSH tunnel to ${config.sshHost} failed: ${err.message}`)
+        );
+        return;
+      }
+      if (closing) return;
+      logger.error(
+        `SSH tunnel to ${config.sshHost} errored after establishment: ${err.message}`
       );
+      onDown?.(`ssh error: ${err.message}`);
+    });
+
+    ssh.on("close", () => {
+      if (settled && !closing) {
+        logger.warn(`SSH tunnel to ${config.sshHost} closed`);
+        onDown?.("ssh connection closed");
+      }
     });
 
     let privateKey: Buffer;
@@ -116,6 +158,11 @@ export function createTunnel(config: TunnelConfig): Promise<TunnelHandle> {
       username: config.sshUser,
       privateKey,
       keepaliveInterval: config.keepaliveInterval,
+      // ssh2 trips on the 4th missed keepalive (`if (++kacount > kacountmax)`), so a dead peer
+      // (laptop sleep) surfaces as an ssh error/close after keepaliveInterval * (countMax + 1),
+      // currently 40s, rather than hanging indefinitely. Pinned rather than left to ssh2's default,
+      // which happens to be the same 3 today, because that interval is load-bearing here.
+      keepaliveCountMax: 3,
     });
   });
 }
