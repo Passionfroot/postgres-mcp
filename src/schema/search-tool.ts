@@ -7,7 +7,12 @@ import type { Config } from "../types.js";
 import type { SchemaCache } from "./cache.js";
 
 import { logger } from "../logger.js";
-import { mcpErrorResult, mcpTextResult, resolveSource } from "../mcp-helpers.js";
+import {
+  mcpErrorResult,
+  mcpTextResult,
+  resolveSource,
+  truncateText,
+} from "../mcp-helpers.js";
 import { formatSearchResults, searchTables } from "./search.js";
 
 export function registerSearchTool(
@@ -18,19 +23,26 @@ export function registerSearchTool(
 ) {
   const sourceIds = config.sources.map((s) => s.id);
 
+  // These strings sit in the client's system context on every turn. Without a mapping loaded no
+  // Prisma model name is ever searchable, so mentioning them only invites dead-end searches.
+  const { hasPrismaMapping } = schemaCache;
+  const description = hasPrismaMapping
+    ? "Search for tables by Prisma model name or SQL table name. Returns column detail including types, nullability, defaults, and enum values. Foreign keys are listed as 'FK out' (this table references another) and 'FK in' (another table references this one); incoming FKs are annotated with join cardinality, [1:1] or [1:many], and are joined on all the columns shown after 'via'. Use this to look up specific tables before writing queries."
+    : "Search for tables by SQL table name. Returns column detail including types, nullability, and defaults. Foreign keys are listed as 'FK out' (this table references another) and 'FK in' (another table references this one); incoming FKs are annotated with join cardinality, [1:1] or [1:many], and are joined on all the columns shown after 'via'. Use this to look up specific tables before writing queries.";
+  const patternDescription = hasPrismaMapping
+    ? "Table name or Prisma model name to search for (e.g., 'User', 'partnerUsers', 'collaboration')"
+    : "Table name to search for (e.g., 'partnerUsers', 'collaboration')";
+
   server.registerTool(
     "search_objects",
     {
       title: "Search Schema Objects",
-      description:
-        "Search for tables by Prisma model name or SQL table name. Returns column detail including types, nullability, defaults, and enum values. Foreign keys are listed as 'FK out' (this table references another) and 'FK in' (another table references this one); incoming FKs are annotated with join cardinality, [1:1] or [1:many], and are joined on all the columns shown after 'via'. Use this to look up specific tables before writing queries.",
+      description,
       inputSchema: {
-        database: z.string().describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
-        pattern: z
+        database: z
           .string()
-          .describe(
-            "Table name or Prisma model name to search for (e.g., 'User', 'partnerUsers', 'collaboration')"
-          ),
+          .describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
+        pattern: z.string().describe(patternDescription),
       },
     },
     async ({ database, pattern }) => {
@@ -45,13 +57,35 @@ export function registerSearchTool(
           sessionVars: source.sessionVars,
         });
         const results = searchTables(schema, pattern);
-        const enumResolver = (udtName: string) => schemaCache.getEnumValues(udtName);
-        const formatted = formatSearchResults(results, enumResolver);
+        const enumResolver = (udtName: string) => {
+          const prismaValues = schemaCache.getEnumValues(udtName);
+          if (prismaValues)
+            return { values: prismaValues, isDbFallback: false };
 
-        return mcpTextResult(formatted);
+          const dbValues = schema.dbEnums[udtName];
+          if (dbValues) {
+            return {
+              values: dbValues.map((value) => ({
+                label: value,
+                dbValue: value,
+              })),
+              isDbFallback: true,
+            };
+          }
+
+          return null;
+        };
+        const formatted = formatSearchResults(results, {
+          enumResolver,
+          hasPrismaMapping,
+        });
+
+        return mcpTextResult(truncateText(formatted, source.maxResponseBytes));
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        logger.error(`search_objects error for database "${database}": ${message}`);
+        logger.error(
+          `search_objects error for database "${database}": ${message}`
+        );
 
         return mcpErrorResult(message);
       }

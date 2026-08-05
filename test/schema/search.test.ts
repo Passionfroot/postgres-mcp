@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import type { MergedColumn, MergedSchema, MergedTable } from "../../src/schema/types.js";
+import type {
+  MergedColumn,
+  MergedSchema,
+  MergedTable,
+} from "../../src/schema/types.js";
 
 import { formatSearchResults, searchTables } from "../../src/schema/search.js";
 
@@ -18,7 +22,9 @@ function makeColumn(
   };
 }
 
-function makeTable(overrides: Partial<MergedTable> & Pick<MergedTable, "sqlName">): MergedTable {
+function makeTable(
+  overrides: Partial<MergedTable> & Pick<MergedTable, "sqlName">
+): MergedTable {
   return {
     prismaModelName: null,
     columns: [],
@@ -30,11 +36,15 @@ function makeTable(overrides: Partial<MergedTable> & Pick<MergedTable, "sqlName"
   };
 }
 
-function makeSchema(tables: MergedTable[], overrides?: Partial<MergedSchema>): MergedSchema {
+function makeSchema(
+  tables: MergedTable[],
+  overrides?: Partial<MergedSchema>
+): MergedSchema {
   return {
     tables,
     unmappedTables: [],
     driftWarnings: [],
+    dbEnums: {},
     ...overrides,
   };
 }
@@ -65,7 +75,9 @@ describe("searchTables", () => {
   });
 
   it("matches case-insensitively on exact match", () => {
-    const schema = makeSchema([makeTable({ sqlName: "partnerUsers", prismaModelName: "User" })]);
+    const schema = makeSchema([
+      makeTable({ sqlName: "partnerUsers", prismaModelName: "User" }),
+    ]);
 
     const results = searchTables(schema, "user");
 
@@ -89,7 +101,10 @@ describe("searchTables", () => {
 
   it("ranks exact matches before partial matches", () => {
     const schema = makeSchema([
-      makeTable({ sqlName: "campaign_creators", prismaModelName: "CampaignCreator" }),
+      makeTable({
+        sqlName: "campaign_creators",
+        prismaModelName: "CampaignCreator",
+      }),
       makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
     ]);
 
@@ -101,7 +116,9 @@ describe("searchTables", () => {
   });
 
   it("returns empty array when no match", () => {
-    const schema = makeSchema([makeTable({ sqlName: "creators", prismaModelName: "Creator" })]);
+    const schema = makeSchema([
+      makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
+    ]);
 
     const results = searchTables(schema, "nonexistent");
 
@@ -123,7 +140,10 @@ describe("searchTables", () => {
 
   it("matches on Prisma model name for tables with model mappings", () => {
     const schema = makeSchema([
-      makeTable({ sqlName: "collaborations", prismaModelName: "Collaboration" }),
+      makeTable({
+        sqlName: "collaborations",
+        prismaModelName: "Collaboration",
+      }),
       makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
     ]);
 
@@ -162,7 +182,9 @@ describe("formatSearchResults", () => {
             isNullable: true,
           }),
         ],
-        outgoingFks: [{ toTable: "creators", toColumn: "id", viaColumn: "creatorId" }],
+        outgoingFks: [
+          { toTable: "creators", toColumn: "id", viaColumn: "creatorId" },
+        ],
         incomingFks: [
           {
             fromTable: "invoices",
@@ -369,7 +391,9 @@ describe("formatSearchResults", () => {
       makeTable({
         sqlName: "_prisma_migrations",
         prismaModelName: null,
-        columns: [makeColumn({ sqlName: "id", dataType: "integer", udtName: "int4" })],
+        columns: [
+          makeColumn({ sqlName: "id", dataType: "integer", udtName: "int4" }),
+        ],
       }),
     ];
 
@@ -395,19 +419,78 @@ describe("formatSearchResults", () => {
 
     const enumResolver = (udtName: string) => {
       if (udtName === "CollaborationStatus") {
-        return [
-          { label: "DRAFT", dbValue: "DRAFT" },
-          { label: "ACTIVE", dbValue: "ACTIVE" },
-          { label: "COMPLETED", dbValue: "completed" },
-        ];
+        return {
+          values: [
+            { label: "DRAFT", dbValue: "DRAFT" },
+            { label: "ACTIVE", dbValue: "ACTIVE" },
+            { label: "COMPLETED", dbValue: "completed" },
+          ],
+          isDbFallback: false,
+        };
       }
       return null;
     };
 
-    const output = formatSearchResults(tables, enumResolver);
+    const output = formatSearchResults(tables, { enumResolver });
 
     expect(output).toContain("enum CollaborationStatus:");
     expect(output).toContain("DRAFT, ACTIVE, completed");
+  });
+
+  it("caps huge DB-fallback enums to a sample plus total count", () => {
+    const tables = [
+      makeTable({
+        sqlName: "creators",
+        columns: [
+          makeColumn({
+            sqlName: "country",
+            dataType: "USER-DEFINED",
+            udtName: "Country",
+          }),
+        ],
+      }),
+    ];
+
+    const values = Array.from({ length: 245 }, (_, i) => {
+      const label = `C${String(i).padStart(3, "0")}`;
+      return { label, dbValue: label };
+    });
+    const enumResolver = () => ({ values, isDbFallback: true });
+
+    const output = formatSearchResults(tables, { enumResolver });
+
+    expect(output).toContain(
+      "enum Country: C000, C001, C002, C003, C004, C005, C006, C007, … (245 values total)"
+    );
+    expect(output).not.toContain("C008");
+  });
+
+  it("renders a huge Prisma-mapped enum in full, without truncation", () => {
+    const tables = [
+      makeTable({
+        sqlName: "messages",
+        columns: [
+          makeColumn({
+            sqlName: "type",
+            dataType: "USER-DEFINED",
+            udtName: "MessageType",
+          }),
+        ],
+      }),
+    ];
+
+    const values = Array.from({ length: 45 }, (_, i) => {
+      const label = `TYPE_${String(i).padStart(3, "0")}`;
+      return { label, dbValue: label };
+    });
+    const enumResolver = () => ({ values, isDbFallback: false });
+
+    const output = formatSearchResults(tables, { enumResolver });
+
+    expect(output).toContain(
+      `enum MessageType: ${values.map((v) => v.dbValue).join(", ")}`
+    );
+    expect(output).not.toContain("values total");
   });
 
   it("returns 'No matching tables found.' when no tables", () => {
@@ -435,5 +518,87 @@ describe("formatSearchResults", () => {
     const output = formatSearchResults(tables);
 
     expect(output).toContain("(Prisma: legacyId)");
+  });
+
+  describe("hasPrismaMapping: false", () => {
+    it("omits the (no Prisma model) suffix that every table would otherwise carry", () => {
+      const tables = [
+        makeTable({
+          sqlName: "_prisma_migrations",
+          prismaModelName: null,
+          columns: [makeColumn({ sqlName: "id", dataType: "integer" })],
+        }),
+      ];
+
+      const output = formatSearchResults(tables, { hasPrismaMapping: false });
+
+      expect(output).toContain("_prisma_migrations\n");
+      expect(output).not.toContain("(no Prisma model)");
+    });
+
+    it("emits no Prisma text at all across headers and columns", () => {
+      const tables = [
+        makeTable({
+          sqlName: "creators",
+          prismaModelName: "Creator",
+          columns: [
+            makeColumn({ sqlName: "id", dataType: "text" }),
+            makeColumn({
+              sqlName: "legacy_id",
+              dataType: "text",
+              prismaFieldName: "legacyId",
+            }),
+          ],
+        }),
+      ];
+
+      const output = formatSearchResults(tables, { hasPrismaMapping: false });
+
+      expect(output).toContain("creators\n");
+      expect(output).not.toMatch(/prisma/i);
+    });
+
+    it("still emits PK, columns, enums, and FK sections", () => {
+      const tables = [
+        makeTable({
+          sqlName: "collaborations",
+          prismaModelName: "Collaboration",
+          primaryKeys: ["id"],
+          columns: [
+            makeColumn({ sqlName: "id", dataType: "uuid", isPrimaryKey: true }),
+            makeColumn({
+              sqlName: "status",
+              dataType: "USER-DEFINED",
+              udtName: "CollaborationStatus",
+            }),
+          ],
+          outgoingFks: [
+            { toTable: "creators", toColumn: "id", viaColumn: "creatorId" },
+          ],
+          incomingFks: [
+            { fromTable: "invoices", fromColumn: "collaborationId" },
+          ],
+        }),
+      ];
+
+      const enumResolver = (udt: string) =>
+        udt === "CollaborationStatus"
+          ? {
+              values: [{ label: "DRAFT", dbValue: "DRAFT" }],
+              isDbFallback: false,
+            }
+          : null;
+
+      const output = formatSearchResults(tables, {
+        enumResolver,
+        hasPrismaMapping: false,
+      });
+
+      expect(output).toContain("PK: id");
+      expect(output).toContain("[PK]");
+      expect(output).toContain("enum CollaborationStatus: DRAFT");
+      expect(output).toContain("FK out: -> creators.id via creatorId");
+      expect(output).toContain("FK in:  <- invoices");
+    });
   });
 });

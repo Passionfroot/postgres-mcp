@@ -9,7 +9,11 @@ import type {
   DbUniqueColumnSet,
 } from "./types.js";
 
-import { assertSafeGucName, escapeIdentifier, escapeLiteral } from "../sql-helpers.js";
+import {
+  assertSafeGucName,
+  escapeIdentifier,
+  escapeLiteral,
+} from "../sql-helpers.js";
 import { logger } from "../logger.js";
 
 /**
@@ -191,15 +195,35 @@ export async function introspectDatabase(
     return introspectWithSession(pool, options!);
   }
 
-  const [columnsResult, pksResult, fksResult, enumsResult, uniqueResult] = await Promise.all([
-    pool.query<ColumnRow>(COLUMNS_QUERY),
-    pool.query<PkRow>(PRIMARY_KEYS_QUERY),
-    pool.query<FkRow>(FOREIGN_KEYS_QUERY),
-    pool.query<EnumRow>(ENUM_VALUES_QUERY),
-    pool.query<UniqueColumnSetRow>(UNIQUE_COLUMN_SETS_QUERY),
-  ]);
+  // pool.query() acquires, runs, and releases a connection per call. Firing all five in parallel
+  // against the default pool_max of 1 queues four of them behind connectionTimeoutMillis instead
+  // of running them one after another on the connection that's already idle, so a cold-cache call
+  // can fail against a perfectly healthy database. Run them on a single acquired client instead.
+  //
+  // They must be sequential awaits, not Promise.all on that one client: pg arms each query's
+  // client-side query_timeout the moment .query() is called, not when it actually starts executing,
+  // so queued-but-not-yet-running queries fired via Promise.all still race the same clock and the
+  // later ones can time out before pg has even sent them.
+  const client = await pool.connect();
+  try {
+    const columnsResult = await client.query<ColumnRow>(COLUMNS_QUERY);
+    const pksResult = await client.query<PkRow>(PRIMARY_KEYS_QUERY);
+    const fksResult = await client.query<FkRow>(FOREIGN_KEYS_QUERY);
+    const enumsResult = await client.query<EnumRow>(ENUM_VALUES_QUERY);
+    const uniqueResult = await client.query<UniqueColumnSetRow>(
+      UNIQUE_COLUMN_SETS_QUERY
+    );
 
-  return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows, uniqueResult.rows);
+    return buildMetadata(
+      columnsResult.rows,
+      pksResult.rows,
+      fksResult.rows,
+      enumsResult.rows,
+      uniqueResult.rows
+    );
+  } finally {
+    client.release();
+  }
 }
 
 async function introspectWithSession(
@@ -207,6 +231,11 @@ async function introspectWithSession(
   options: IntrospectOptions
 ): Promise<DbMetadata> {
   const client = await pool.connect();
+  // Set when the connection cannot be trusted for reuse. Releasing without an error hands it
+  // straight back to the pool -- see executeQuery in ../query.ts for the same pattern. A pool at
+  // the default pool_max of 1 has only this connection, so the very next introspection or query
+  // call would run under whatever role / app.partner_id this call left set.
+  let discardReason: string | undefined;
   try {
     if (options.role) {
       await client.query(`SET ROLE ${escapeIdentifier(options.role)}`);
@@ -219,15 +248,32 @@ async function introspectWithSession(
       }
     }
 
-    const [columnsResult, pksResult, fksResult, enumsResult, uniqueResult] = await Promise.all([
-      client.query<ColumnRow>(COLUMNS_QUERY),
-      client.query<PkRow>(PRIMARY_KEYS_QUERY),
-      client.query<FkRow>(FOREIGN_KEYS_QUERY),
-      client.query<EnumRow>(ENUM_VALUES_QUERY),
-      client.query<UniqueColumnSetRow>(UNIQUE_COLUMN_SETS_QUERY),
-    ]);
+    // Sequential, not Promise.all: see introspectDatabase above -- pg arms each query's
+    // client-side query_timeout when .query() is called, not when it starts executing, so firing
+    // all five at once on one client races the same clock as the earlier queries still ahead of
+    // them in the connection's queue.
+    const columnsResult = await client.query<ColumnRow>(COLUMNS_QUERY);
+    const pksResult = await client.query<PkRow>(PRIMARY_KEYS_QUERY);
+    const fksResult = await client.query<FkRow>(FOREIGN_KEYS_QUERY);
+    const enumsResult = await client.query<EnumRow>(ENUM_VALUES_QUERY);
+    const uniqueResult = await client.query<UniqueColumnSetRow>(
+      UNIQUE_COLUMN_SETS_QUERY
+    );
 
-    return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows, uniqueResult.rows);
+    return buildMetadata(
+      columnsResult.rows,
+      pksResult.rows,
+      fksResult.rows,
+      enumsResult.rows,
+      uniqueResult.rows
+    );
+  } catch (err: unknown) {
+    // pg's client-side query_timeout rejects the caller but leaves the server still executing on
+    // this connection, so it must not go back into the pool.
+    if (err instanceof Error && err.message === "Query read timeout") {
+      discardReason = "client-side query timeout";
+    }
+    throw err;
   } finally {
     try {
       if (options.sessionVars) {
@@ -239,13 +285,19 @@ async function introspectWithSession(
         await client.query("RESET ROLE");
       }
     } catch (cleanupErr) {
-      logger.warn("Failed to reset introspection session state", {
-        error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+      // The role or session vars may still be set, so this connection must not serve another
+      // caller: leaking a pinned app.partner_id across callers would defeat RLS.
+      discardReason = "failed to reset introspection session state";
+      logger.warn("Failed to reset RLS session state; discarding connection", {
+        error:
+          cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
         role: options.role ?? "",
-        sessionVarKeys: options.sessionVars ? Object.keys(options.sessionVars).join(", ") : "",
+        sessionVarKeys: options.sessionVars
+          ? Object.keys(options.sessionVars).join(", ")
+          : "",
       });
     }
-    client.release();
+    client.release(discardReason ? new Error(discardReason) : undefined);
   }
 }
 
@@ -299,5 +351,12 @@ function buildMetadata(
       .map((s) => `${s.tableName}.${s.columnNames[0]}`)
   );
 
-  return { columns, primaryKeys, foreignKeys, enumValues, uniqueColumns, uniqueColumnSets };
+  return {
+    columns,
+    primaryKeys,
+    foreignKeys,
+    enumValues,
+    uniqueColumns,
+    uniqueColumnSets,
+  };
 }
