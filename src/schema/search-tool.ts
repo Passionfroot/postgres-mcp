@@ -45,10 +45,20 @@ export function registerSearchTool(
           sessionVars: source.sessionVars,
         });
         const results = searchTables(schema, pattern);
-        const enumResolver = (udtName: string) =>
-          schemaCache.getEnumValues(udtName) ??
-          schema.dbEnums[udtName]?.map((value) => ({ label: value, dbValue: value })) ??
-          null;
+        const enumResolver = (udtName: string) => {
+          const prismaValues = schemaCache.getEnumValues(udtName);
+          if (prismaValues) return { values: prismaValues, isDbFallback: false };
+
+          const dbValues = schema.dbEnums[udtName];
+          if (dbValues) {
+            return {
+              values: dbValues.map((value) => ({ label: value, dbValue: value })),
+              isDbFallback: true,
+            };
+          }
+
+          return null;
+        };
         const formatted = formatSearchResults(results, enumResolver);
 
         return mcpTextResult(formatted);

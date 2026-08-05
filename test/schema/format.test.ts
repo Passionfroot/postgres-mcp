@@ -21,6 +21,7 @@ function makeSchema(tables: MergedTable[], overrides?: Partial<MergedSchema>): M
     tables,
     unmappedTables: [],
     driftWarnings: [],
+    dbEnums: {},
     ...overrides,
   };
 }

@@ -219,11 +219,14 @@ describe("formatSearchResults", () => {
 
     const enumResolver = (udtName: string) => {
       if (udtName === "CollaborationStatus") {
-        return [
-          { label: "DRAFT", dbValue: "DRAFT" },
-          { label: "ACTIVE", dbValue: "ACTIVE" },
-          { label: "COMPLETED", dbValue: "completed" },
-        ];
+        return {
+          values: [
+            { label: "DRAFT", dbValue: "DRAFT" },
+            { label: "ACTIVE", dbValue: "ACTIVE" },
+            { label: "COMPLETED", dbValue: "completed" },
+          ],
+          isDbFallback: false,
+        };
       }
       return null;
     };
@@ -234,7 +237,7 @@ describe("formatSearchResults", () => {
     expect(output).toContain("DRAFT, ACTIVE, completed");
   });
 
-  it("caps huge enums to a sample plus total count", () => {
+  it("caps huge DB-fallback enums to a sample plus total count", () => {
     const tables = [
       makeTable({
         sqlName: "creators",
@@ -248,12 +251,34 @@ describe("formatSearchResults", () => {
       const label = `C${String(i).padStart(3, "0")}`;
       return { label, dbValue: label };
     });
-    const enumResolver = () => values;
+    const enumResolver = () => ({ values, isDbFallback: true });
 
     const output = formatSearchResults(tables, enumResolver);
 
     expect(output).toContain("enum Country: C000, C001, C002, C003, C004, C005, C006, C007, … (245 values total)");
     expect(output).not.toContain("C008");
+  });
+
+  it("renders a huge Prisma-mapped enum in full, without truncation", () => {
+    const tables = [
+      makeTable({
+        sqlName: "messages",
+        columns: [
+          makeColumn({ sqlName: "type", dataType: "USER-DEFINED", udtName: "MessageType" }),
+        ],
+      }),
+    ];
+
+    const values = Array.from({ length: 45 }, (_, i) => {
+      const label = `TYPE_${String(i).padStart(3, "0")}`;
+      return { label, dbValue: label };
+    });
+    const enumResolver = () => ({ values, isDbFallback: false });
+
+    const output = formatSearchResults(tables, enumResolver);
+
+    expect(output).toContain(`enum MessageType: ${values.map((v) => v.dbValue).join(", ")}`);
+    expect(output).not.toContain("values total");
   });
 
   it("returns 'No matching tables found.' when no tables", () => {
