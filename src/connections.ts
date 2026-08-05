@@ -69,6 +69,11 @@ export class ConnectionManager {
   private sources: Map<string, SourceConfig>;
   private pools: Map<string, PoolEntry> = new Map();
   private tunnels: Map<string, TunnelHandle> = new Map();
+  // Memoizes the in-flight creation promise per source, not just the resolved pool. The MCP SDK
+  // does not serialize tool calls, so without this, two concurrent first calls for a source that
+  // has no pool yet each build their own tunnel; one is orphaned, and its later close/error event
+  // (routed through onDown) can mark the survivor dead.
+  private pendingCreations: Map<string, Promise<pg.Pool>> = new Map();
 
   constructor(sources: SourceConfig[]) {
     this.sources = new Map(sources.map((s) => [s.id, s]));
@@ -90,12 +95,25 @@ export class ConnectionManager {
       return existing.pool;
     }
 
-    if (existing?.dead) {
-      logger.info(`Recreating dead pool for source "${sourceId}"`);
-      await this.destroyPoolAndTunnel(sourceId);
+    const pending = this.pendingCreations.get(sourceId);
+    if (pending) {
+      return pending;
     }
 
-    return this.createPool(source);
+    const creation = (async () => {
+      if (existing?.dead) {
+        logger.info(`Recreating dead pool for source "${sourceId}"`);
+        await this.destroyPoolAndTunnel(sourceId);
+      }
+      return this.createPool(source);
+    })();
+
+    this.pendingCreations.set(sourceId, creation);
+    try {
+      return await creation;
+    } finally {
+      this.pendingCreations.delete(sourceId);
+    }
   }
 
   async shutdown() {
@@ -121,6 +139,36 @@ export class ConnectionManager {
   private async createPool(source: SourceConfig) {
     let connectionString = source.dsn;
 
+    // Bound by identity, not just source.id: a stale close/error from a tunnel that has since been
+    // superseded (recreated) must not be able to kill the pool that replaced it. `pool` starts
+    // undefined and is filled in once constructed below; markDead compares against it by reference
+    // so it only ever affects the entry this exact createPool() call is responsible for.
+    let pool: pg.Pool | undefined;
+    let deadBeforeRegistration = false;
+
+    const markDead = (reason: string) => {
+      const entry = this.pools.get(source.id);
+      if (entry && pool && entry.pool === pool) {
+        logger.warn(
+          `Tunnel down for source "${source.id}" (${reason}); marking pool dead`
+        );
+        entry.dead = true;
+      } else if (!pool) {
+        // Fired in the gap between the tunnel resolving and this pool being registered below.
+        // Remember it so registration seeds the entry as already dead instead of losing the event.
+        logger.warn(
+          `Tunnel down for source "${source.id}" before pool registration (${reason}); will register dead`
+        );
+        deadBeforeRegistration = true;
+      } else {
+        // This tunnel/pool has already been superseded (its entry was replaced or removed by a
+        // recreation) -- a stale event from a torn-down generation, nothing left to mark.
+        logger.info(
+          `Ignoring stale tunnel-down event for source "${source.id}" (${reason}); already superseded`
+        );
+      }
+    };
+
     if (source.sshHost && source.sshUser && source.sshKey) {
       const { host: remoteHost, port: remotePort } = parseDsnHostPort(
         source.dsn
@@ -139,10 +187,7 @@ export class ConnectionManager {
           // The tunnel died after establishment (e.g. sleep killed the socket). Mark the pool dead
           // so the next getPool tears both down and recreates them, instead of wedging on the dead
           // tunnel until the process is killed.
-          logger.warn(
-            `Tunnel down for source "${source.id}" (${reason}); marking pool dead`
-          );
-          this.markPoolDead(source.id);
+          markDead(reason);
         }
       );
 
@@ -157,7 +202,7 @@ export class ConnectionManager {
     const statementTimeoutMs = source.timeout * 1000;
     const queryTimeoutMs = statementTimeoutMs + QUERY_TIMEOUT_GRACE_MS;
 
-    const pool = new pg.Pool({
+    pool = new pg.Pool({
       connectionString,
       max: source.poolMax,
       idleTimeoutMillis: 5_000,
@@ -172,10 +217,10 @@ export class ConnectionManager {
 
     pool.on("error", (err) => {
       logger.error(`Pool error for source "${source.id}": ${err.message}`);
-      this.markPoolDead(source.id);
+      markDead(err.message);
     });
 
-    this.pools.set(source.id, { pool, dead: false });
+    this.pools.set(source.id, { pool, dead: deadBeforeRegistration });
 
     const isTunneled = this.tunnels.has(source.id);
     logger.info(
@@ -185,13 +230,6 @@ export class ConnectionManager {
     );
 
     return pool;
-  }
-
-  private markPoolDead(sourceId: string) {
-    const entry = this.pools.get(sourceId);
-    if (entry) {
-      entry.dead = true;
-    }
   }
 
   private async destroyPoolAndTunnel(sourceId: string) {

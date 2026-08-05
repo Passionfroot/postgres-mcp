@@ -141,4 +141,25 @@ describe("createTunnel", () => {
     await expect(pending).rejects.toThrow(/auth failed/);
     expect(onDown).not.toHaveBeenCalled();
   });
+
+  it("does not call onDown for the close event resulting from its own close()", async () => {
+    const onDown = vi.fn();
+    const handle = await createTunnel(cfg, onDown);
+
+    await handle.close();
+    // Real ssh2 emits "close" asynchronously once end() finishes tearing down the TCP socket, well
+    // after close() has already resolved. Without a closing flag this is indistinguishable from an
+    // unexpected death and fires onDown again for a tunnel that was intentionally shut down.
+    shared.sshInstances.at(-1)!.emit("close");
+    expect(onDown).not.toHaveBeenCalled();
+  });
+
+  it("does not call onDown for an error firing after its own close()", async () => {
+    const onDown = vi.fn();
+    const handle = await createTunnel(cfg, onDown);
+
+    await handle.close();
+    shared.sshInstances.at(-1)!.emit("error", new Error("socket hang up"));
+    expect(onDown).not.toHaveBeenCalled();
+  });
 });

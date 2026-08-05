@@ -34,6 +34,11 @@ export function createTunnel(
     // to onDown instead, so the caller tears the tunnel + pool down and recreates them. Without
     // this the dead tunnel lingers and queries wedge on it until the process is killed.
     let settled = false;
+    // Set before the intentional shutdown in close() starts. ssh.end() emits its own "close" (and
+    // can emit "error") asynchronously, and without this flag that self-inflicted event is
+    // indistinguishable from a real death and fires onDown again for a tunnel that was already
+    // being torn down on purpose.
+    let closing = false;
 
     const proxyServer = net.createServer((socket) => {
       activeSockets.add(socket);
@@ -99,6 +104,7 @@ export function createTunnel(
           localPort: addr.port,
           close: () =>
             new Promise<void>((res) => {
+              closing = true;
               for (const socket of activeSockets) {
                 socket.destroy();
               }
@@ -120,6 +126,7 @@ export function createTunnel(
         );
         return;
       }
+      if (closing) return;
       logger.error(
         `SSH tunnel to ${config.sshHost} errored after establishment: ${err.message}`
       );
@@ -127,7 +134,7 @@ export function createTunnel(
     });
 
     ssh.on("close", () => {
-      if (settled) {
+      if (settled && !closing) {
         logger.warn(`SSH tunnel to ${config.sshHost} closed`);
         onDown?.("ssh connection closed");
       }

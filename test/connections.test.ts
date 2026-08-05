@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SourceConfig } from "../src/types.js";
@@ -5,14 +6,76 @@ import type { SourceConfig } from "../src/types.js";
 // vi.mock factories are hoisted above imports, so shared state must come from vi.hoisted.
 const shared = vi.hoisted(() => ({
   poolConfigs: [] as Record<string, unknown>[],
+  poolErrorHandlers: [] as ((err: Error) => void)[],
+  sshInstances: [] as EventEmitter[],
+  sshEndCalls: 0,
+  // When true, the next pg.Pool construction kills the most recent ssh tunnel synchronously from
+  // inside its own constructor -- i.e. after createTunnel() resolved but before ConnectionManager
+  // registers the pool entry.
+  killTunnelOnPoolConstruction: false,
 }));
+
+vi.mock("ssh2", async () => {
+  const { EventEmitter: EE } = await import("node:events");
+  class FakeSSH extends EE {
+    constructor() {
+      super();
+      shared.sshInstances.push(this);
+    }
+    connect() {
+      setImmediate(() => this.emit("ready"));
+      return this;
+    }
+    forwardOut() {}
+    // Real ssh2 end() closes the socket, and "close" lands once the TCP close completes; emitting
+    // it manually lets a test control exactly when it lands relative to recreation.
+    end() {
+      shared.sshEndCalls += 1;
+    }
+  }
+  return { default: { Client: FakeSSH } };
+});
+
+vi.mock("node:net", async (orig) => {
+  const actual = await orig<typeof import("node:net")>();
+  const { EventEmitter: EE } = await import("node:events");
+  let nextPort = 15432;
+  class FakeServer extends EE {
+    port = nextPort++;
+    listen(_p: number, _h: string, cb: () => void) {
+      setImmediate(cb);
+      return this;
+    }
+    address() {
+      return { port: this.port, family: "IPv4", address: "127.0.0.1" };
+    }
+    close(cb?: () => void) {
+      cb?.();
+      return this;
+    }
+  }
+  const createServer = () => new FakeServer();
+  return { ...actual, default: { ...actual.default, createServer }, createServer };
+});
+
+vi.mock("node:fs", async (orig) => {
+  const actual = await orig<typeof import("node:fs")>();
+  const readFileSync = () => Buffer.from("fake-key");
+  return { ...actual, default: { ...actual.default, readFileSync }, readFileSync };
+});
 
 vi.mock("pg", () => {
   class FakePool {
     constructor(config: Record<string, unknown>) {
       shared.poolConfigs.push(config);
+      if (shared.killTunnelOnPoolConstruction) {
+        shared.killTunnelOnPoolConstruction = false;
+        shared.sshInstances.at(-1)!.emit("close");
+      }
     }
-    on() {}
+    on(event: string, handler: (err: Error) => void) {
+      if (event === "error") shared.poolErrorHandlers.push(handler);
+    }
     async connect() {
       return { query: async () => ({ rows: [] }), release() {} };
     }
@@ -42,9 +105,23 @@ function source(overrides: Partial<SourceConfig> = {}): SourceConfig {
   } as SourceConfig;
 }
 
+function tunneledSource(overrides: Partial<SourceConfig> = {}): SourceConfig {
+  return source({
+    dsn: "postgres://u:p@db.internal:5432/test",
+    sshHost: "bastion",
+    sshUser: "u",
+    sshKey: "/fake/key",
+    ...overrides,
+  });
+}
+
 describe("pool timeouts", () => {
   beforeEach(() => {
     shared.poolConfigs.length = 0;
+    shared.poolErrorHandlers.length = 0;
+    shared.sshInstances.length = 0;
+    shared.sshEndCalls = 0;
+    shared.killTunnelOnPoolConstruction = false;
   });
 
   /**
@@ -82,5 +159,111 @@ describe("pool timeouts", () => {
 
     expect(shared.poolConfigs[0].statement_timeout).toBe(5_000);
     expect(shared.poolConfigs[0].query_timeout as number).toBeGreaterThan(5_000);
+  });
+});
+
+describe("tunnel recreation races", () => {
+  const tick = () => new Promise((r) => setImmediate(() => setImmediate(r)));
+
+  beforeEach(() => {
+    shared.poolConfigs.length = 0;
+    shared.poolErrorHandlers.length = 0;
+    shared.sshInstances.length = 0;
+    shared.sshEndCalls = 0;
+    shared.killTunnelOnPoolConstruction = false;
+  });
+
+  it("a stale close from a superseded tunnel does not kill the pool that replaced it", async () => {
+    const manager = new ConnectionManager([tunneledSource()]);
+
+    await manager.getPool("test");
+    expect(shared.poolConfigs.length).toBe(1);
+    const oldSsh = shared.sshInstances[0];
+
+    // A pool-level error marks the pool dead while the tunnel is still alive.
+    shared.poolErrorHandlers[0](new Error("idle client error"));
+
+    // Recreate: destroyPoolAndTunnel ends the old pool and calls ssh.end() on the old tunnel, then
+    // a fresh tunnel + pool are built and stored under the same source id.
+    await manager.getPool("test");
+    expect(shared.poolConfigs.length).toBe(2);
+    expect(shared.sshInstances.length).toBe(2);
+
+    // The OLD ssh connection's close now lands (a FIN to an unreachable peer can sit in FIN_WAIT
+    // for a while). It must not be able to mark whatever pool is currently registered -- the
+    // healthy pool 2 -- dead.
+    oldSsh.emit("close");
+    await tick();
+
+    const pool = await manager.getPool("test");
+    expect(pool).toBe(await manager.getPool("test"));
+    expect(shared.poolConfigs.length).toBe(2);
+    expect(shared.sshInstances.length).toBe(2);
+  });
+
+  it("tunnel.close() does not fire onDown for its own resulting close event", async () => {
+    const manager = new ConnectionManager([tunneledSource()]);
+
+    await manager.getPool("test");
+    shared.poolErrorHandlers[0](new Error("idle client error"));
+
+    // destroyPoolAndTunnel awaits tunnel.close(), which calls ssh.end() -- our fake client counts
+    // that call but (unlike real ssh2) does not itself emit "close". Emit it here to model the
+    // real async "close" landing after the intentional shutdown already completed.
+    await manager.getPool("test");
+    expect(shared.sshEndCalls).toBe(1);
+
+    shared.sshInstances[0].emit("close");
+    await tick();
+
+    // Still just the recreated pool; the self-inflicted close must not trigger another teardown.
+    expect(shared.poolConfigs.length).toBe(2);
+  });
+
+  it("recovers when the tunnel dies in the gap between resolving and pool registration", async () => {
+    const manager = new ConnectionManager([tunneledSource()]);
+    // Kills the tunnel synchronously from inside the (fake) pg.Pool constructor -- after
+    // createTunnel() resolved but before ConnectionManager registers the pool entry.
+    shared.killTunnelOnPoolConstruction = true;
+
+    await manager.getPool("test");
+    expect(shared.poolConfigs.length).toBe(1);
+
+    // A correct implementation recreates on the next access instead of wedging on a pool that was
+    // registered "alive" over an already-dead tunnel.
+    await manager.getPool("test");
+    expect(shared.poolConfigs.length).toBe(2);
+  });
+});
+
+describe("concurrent getPool", () => {
+  beforeEach(() => {
+    shared.poolConfigs.length = 0;
+    shared.poolErrorHandlers.length = 0;
+    shared.sshInstances.length = 0;
+    shared.sshEndCalls = 0;
+    shared.killTunnelOnPoolConstruction = false;
+  });
+
+  it("two concurrent first calls for the same source build only one tunnel and one pool", async () => {
+    const manager = new ConnectionManager([tunneledSource()]);
+
+    const [a, b] = await Promise.all([manager.getPool("test"), manager.getPool("test")]);
+
+    expect(shared.sshInstances.length).toBe(1);
+    expect(shared.poolConfigs.length).toBe(1);
+    expect(a).toBe(b);
+  });
+
+  it("two concurrent calls on a dead pool recreate only once", async () => {
+    const manager = new ConnectionManager([tunneledSource()]);
+    await manager.getPool("test");
+    shared.poolErrorHandlers[0](new Error("idle client error"));
+
+    const [a, b] = await Promise.all([manager.getPool("test"), manager.getPool("test")]);
+
+    expect(shared.poolConfigs.length).toBe(2);
+    expect(shared.sshInstances.length).toBe(2);
+    expect(a).toBe(b);
   });
 });
