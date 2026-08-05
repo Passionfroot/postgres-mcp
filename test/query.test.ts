@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { logger } from "../src/logger.js";
 import {
   assertReadOnlyQuery,
   ensureLimit,
@@ -31,9 +32,50 @@ describe("ensureLimit", () => {
     );
   });
 
-  it("passes multi-statement SQL through when allowed", () => {
-    const sql = "SELECT 1; SELECT 2";
+  it("rejects a batch with two row-returning statements when multi-statement is allowed", () => {
+    // Decided from the AST, so it fails before the batch reaches the database.
+    expect(() => ensureLimit("SELECT 1; SELECT 2", 100, true)).toThrow(
+      "more than one statement that returns rows"
+    );
+  });
+
+  it("pushes the LIMIT onto the batch's SELECT instead of leaving it unbounded", () => {
+    const result = ensureLimit(
+      "SET statement_timeout = '5000'; SELECT n FROM t",
+      100,
+      true
+    );
+    expect(result).toMatch(/SET statement_timeout = '5000'/i);
+    expect(result).toMatch(/LIMIT 100/i);
+  });
+
+  it("pushes the LIMIT onto the SELECT inside a transaction batch", () => {
+    const result = ensureLimit("BEGIN; SELECT n FROM t; COMMIT", 100, true);
+    expect(result).toMatch(/SELECT n FROM "?t"? LIMIT 100/i);
+    expect(result).toMatch(/COMMIT/i);
+  });
+
+  it("preserves an existing LIMIT on the batch's SELECT", () => {
+    const sql = "SET statement_timeout = '5000'; SELECT n FROM t LIMIT 5";
     expect(ensureLimit(sql, 100, true)).toBe(sql);
+  });
+
+  it("leaves a batch with no row-returning statement alone", () => {
+    const sql = "SET a.b = '1'; SET c.d = '2'";
+    expect(ensureLimit(sql, 100, true)).toBe(sql);
+  });
+
+  it("does not try to put a LIMIT on SHOW", () => {
+    const sql = "SET statement_timeout = '5000'; SHOW statement_timeout";
+    expect(ensureLimit(sql, 100, true)).toBe(sql);
+  });
+
+  it("passes an unparseable multi-statement batch through the regex fallback", () => {
+    // astify cannot read `TABLE t`, so there is no AST to push a LIMIT onto.
+    const sql = "SET statement_timeout = '5000'; TABLE t";
+    expect(ensureLimit(sql, 100, true)).toBe(
+      "SET statement_timeout = '5000'; TABLE t LIMIT 100"
+    );
   });
 
   it("leaves non-SELECT statements unchanged", () => {
@@ -713,13 +755,20 @@ describe("executeQuery", () => {
     const queryFn = vi.fn().mockResolvedValue({ rows: [{ id: 1 }] });
     const pool = createMockPool(queryFn);
 
-    await executeQuery(pool, "SELECT 1; SELECT 2", 100, {
-      readonly: false,
-      allowMultiStatements: true,
-      readOnlyQueries: false,
-    });
+    await executeQuery(
+      pool,
+      "SET statement_timeout = '5000'; SELECT 2 LIMIT 1",
+      100,
+      {
+        readonly: false,
+        allowMultiStatements: true,
+        readOnlyQueries: false,
+      }
+    );
 
-    expect(queryFn.mock.calls.at(-1)?.[0]).toBe("SELECT 1; SELECT 2");
+    expect(queryFn.mock.calls.at(-1)?.[0]).toBe(
+      "SET statement_timeout = '5000'; SELECT 2 LIMIT 1"
+    );
   });
 
   it("detects truncation when rows exceed maxRows", async () => {
@@ -949,5 +998,255 @@ describe("executeQuery", () => {
     await expect(
       executeQuery(pool, "SELECT * FROM creators", 100, defaultOptions)
     ).rejects.toThrow("search_objects");
+  });
+
+  describe("multi-statement result handling", () => {
+    const multiStatementOptions = {
+      readonly: false,
+      allowMultiStatements: true,
+    };
+
+    // Shapes measured against PostgreSQL 16 (`fields` is what separates a row-returning
+    // statement from one that only reports a command tag):
+    //   SET / BEGIN / COMMIT      rows 0, fields 0
+    //   SELECT                    rows n, fields n
+    //   SELECT ... WHERE false    rows 0, fields n
+    //   SHOW                      rows 1, fields 1
+    const setResult = { rows: [], rowCount: null, command: "SET", fields: [] };
+    const beginResult = {
+      rows: [],
+      rowCount: null,
+      command: "BEGIN",
+      fields: [],
+    };
+    const commitResult = {
+      rows: [],
+      rowCount: null,
+      command: "COMMIT",
+      fields: [],
+    };
+    const selectResult = (rows: Record<string, unknown>[]) => ({
+      rows,
+      rowCount: rows.length,
+      command: "SELECT",
+      fields: [{ name: "id" }],
+    });
+
+    it("returns the last row-returning result when node-postgres returns an array", async () => {
+      // node-postgres returns an ARRAY of QueryResults (not a single QueryResult) when the
+      // server executed more than one command. This reproduces that shape.
+      const queryFn = vi
+        .fn()
+        .mockResolvedValue([setResult, selectResult([{ id: 1 }, { id: 2 }])]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "SET statement_timeout = '5000'; SELECT id FROM users",
+        100,
+        multiStatementOptions
+      );
+
+      expect(result.rows).toEqual([{ id: 1 }, { id: 2 }]);
+      expect(result.rowCount).toBe(2);
+      expect(result.truncated).toBe(false);
+    });
+
+    it("returns the SELECT, not the trailing COMMIT, for a transaction batch", async () => {
+      const queryFn = vi
+        .fn()
+        .mockResolvedValue([
+          beginResult,
+          selectResult([{ id: 1 }]),
+          commitResult,
+        ]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "BEGIN; SELECT id FROM users; COMMIT",
+        100,
+        multiStatementOptions
+      );
+
+      expect(result.rows).toEqual([{ id: 1 }]);
+      expect(result.rowCount).toBe(1);
+    });
+
+    it("returns the SELECT when an earlier statement also returned rows (SHOW; SELECT)", async () => {
+      // SHOW returns a row. Keying the ambiguity check on rows rejected this batch; keying it
+      // on the AST lets it through and the runtime path picks the last row-returning result.
+      const queryFn = vi.fn().mockResolvedValue([
+        {
+          rows: [{ statement_timeout: "5s" }],
+          rowCount: null,
+          command: "SHOW",
+          fields: [{ name: "statement_timeout" }],
+        },
+        selectResult([{ id: 1 }]),
+      ]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "SHOW statement_timeout; SELECT id FROM users",
+        100,
+        multiStatementOptions
+      );
+
+      expect(result.rows).toEqual([{ id: 1 }]);
+    });
+
+    it("treats a zero-row SELECT as the row-returning result, not the SET before it", async () => {
+      const queryFn = vi.fn().mockResolvedValue([setResult, selectResult([])]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "SET statement_timeout = '5000'; SELECT id FROM users WHERE false",
+        100,
+        multiStatementOptions
+      );
+
+      expect(result.rows).toEqual([]);
+      expect(result.rowCount).toBe(0);
+      expect(result.truncated).toBe(false);
+    });
+
+    it("applies max_rows truncation to the chosen result set", async () => {
+      const rows = Array.from({ length: 11 }, (_, i) => ({ id: i + 1 }));
+      const queryFn = vi
+        .fn()
+        .mockResolvedValue([setResult, selectResult(rows)]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "SET statement_timeout = '5000'; SELECT id FROM users",
+        10,
+        multiStatementOptions
+      );
+
+      expect(result.truncated).toBe(true);
+      expect(result.rowCount).toBe(10);
+      expect(result.rows).toHaveLength(10);
+    });
+
+    it("rejects two row-returning statements before sending anything to the database", async () => {
+      const queryFn = vi.fn();
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(
+          pool,
+          "SELECT id FROM a; SELECT id FROM b",
+          100,
+          multiStatementOptions
+        )
+      ).rejects.toThrow("more than one statement that returns rows");
+      expect(queryFn).not.toHaveBeenCalled();
+    });
+
+    it("rejects a write batch with two row-returning statements before it can commit", async () => {
+      const queryFn = vi.fn();
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(
+          pool,
+          "INSERT INTO a (n) VALUES (1) RETURNING n; SELECT n FROM a",
+          100,
+          multiStatementOptions
+        )
+      ).rejects.toThrow("more than one statement that returns rows");
+      expect(queryFn).not.toHaveBeenCalled();
+    });
+
+    it("still rejects two row-returning results at runtime when the parser could not check", async () => {
+      // Fallback for batches astify rejects: the ambiguity is only visible in the results.
+      const queryFn = vi
+        .fn()
+        .mockResolvedValue([
+          selectResult([{ id: 1 }]),
+          selectResult([{ id: 2 }]),
+        ]);
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(pool, "TABLE a; TABLE b", 100, multiStatementOptions)
+      ).rejects.toThrow("more than one statement that returns rows");
+    });
+
+    it("handles an all-empty batch (e.g. SET; SET) without error", async () => {
+      const queryFn = vi.fn().mockResolvedValue([setResult, setResult]);
+      const pool = createMockPool(queryFn);
+
+      const result = await executeQuery(
+        pool,
+        "SET a.b = '1'; SET c.d = '2'",
+        100,
+        multiStatementOptions
+      );
+
+      expect(result.rows).toEqual([]);
+      expect(result.rowCount).toBe(0);
+      expect(result.truncated).toBe(false);
+    });
+
+    it("still rejects multi-statement SQL when allowMultiStatements is false (guard unchanged)", async () => {
+      // This exercises ensureLimit's existing guard, not the array handling — it must keep
+      // rejecting before a query is ever sent, on both read-only and non-read-only sources.
+      const queryFn = vi.fn();
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(pool, "SELECT 1; SELECT 2", 100, defaultOptions)
+      ).rejects.toThrow("Multi-statement queries are not allowed");
+      expect(queryFn).not.toHaveBeenCalled();
+    });
+
+    it("still rejects multi-statement SQL on a readonly + allowMultiStatements:false source", async () => {
+      const queryFn = vi.fn();
+      const pool = createMockPool(queryFn);
+
+      await expect(
+        executeQuery(pool, "SELECT 1; SELECT 2", 100, {
+          readonly: true,
+          allowMultiStatements: false,
+        })
+      ).rejects.toThrow("Multi-statement queries are not allowed");
+      expect(queryFn).not.toHaveBeenCalled();
+    });
+
+    it("rejects an array of results on a source that did not allow multiple statements", async () => {
+      // The smuggling shape: node-sql-parser reads the payload as one SELECT (so ensureLimit
+      // sees nothing to reject) and PostgreSQL runs three commands. Selecting the last
+      // row-returning result here would hand back the smuggled statement's rows on the
+      // success path, where the audit log records it as an ordinary read.
+      const queryFn = vi
+        .fn()
+        .mockResolvedValue([
+          selectResult([]),
+          setResult,
+          selectResult([{ id: 1, tenant: "b" }]),
+        ]);
+      const pool = createMockPool(queryFn);
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+      await expect(
+        executeQuery(
+          pool,
+          "SELECT 'x\\' FROM t WHERE 1=0; SET app.partner_id TO \"tenantB\"; SELECT * FROM t; --'",
+          100,
+          defaultOptions
+        )
+      ).rejects.toThrow("Multi-statement queries are not allowed");
+
+      expect(warn).toHaveBeenCalledWith(
+        "Multi-statement batch on a source that does not allow one",
+        expect.objectContaining({ statements: 3 })
+      );
+      warn.mockRestore();
+    });
   });
 });

@@ -92,136 +92,164 @@ afterAll(async () => {
   if (pool) await pool.end();
 });
 
-describe.skipIf(!isDbAvailable)("read-only guard against a two-tenant RLS fixture", () => {
-  it("scopes a plain SELECT to tenant A (scalar policy)", async () => {
-    const result = await executeQuery(pool, "SELECT * FROM rls_t", 10, tenantAOptions);
-
-    expect(result.rows).toEqual([{ id: 1, tenant_id: "tenantA", secret: "A-secret" }]);
-  });
-
-  it("scopes a plain SELECT to tenant A (EXISTS-subquery policy)", async () => {
-    const result = await executeQuery(pool, "SELECT * FROM rls_messages", 10, tenantAOptions);
-
-    expect(result.rows).toEqual([{ id: 1, thread_id: 1, body: "A-message" }]);
-  });
-
-  it("allows EXPLAIN without ANALYZE through to the server", async () => {
-    const result = await executeQuery(
-      pool,
-      "EXPLAIN SELECT * FROM rls_t",
-      10,
-      tenantAOptions
-    );
-
-    expect(result.rows.length).toBeGreaterThan(0);
-    expect(JSON.stringify(result.rows)).toContain("rls_t");
-  });
-
-  // Every payload proven to re-point tenant scope on this fixture shape. The guard has
-  // to reject each one before it reaches the connection, and no tenant B value may
-  // appear in anything the caller gets back.
-  const payloads: Array<[string, string]> = [
-    [
-      "set_config in WHERE",
-      "SELECT * FROM rls_t WHERE set_config('app.partner_id','tenantB',false) IS NOT NULL",
-    ],
-    [
-      "set_config in a materialized CTE",
-      "WITH x AS MATERIALIZED (SELECT set_config('app.partner_id','tenantB',false)) SELECT * FROM rls_t CROSS JOIN x",
-    ],
-    [
-      "set_config in the select list",
-      "SELECT set_config('app.partner_id','tenantB',false), rls_t.* FROM rls_t",
-    ],
-    [
-      "SET ROLE smuggled past a backslash-terminated literal",
-      String.raw`SELECT 'x\'; SET ROLE postgres; SELECT * FROM rls_t; --'`,
-    ],
-    [
-      "SET of the tenant GUC smuggled past a backslash-terminated literal",
-      String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM rls_t; --'`,
-    ],
-    [
-      "SET of the tenant GUC against the EXISTS policy",
-      String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM rls_messages; --'`,
-    ],
-    [
-      "SET of the tenant GUC smuggled past a backslash-terminated identifier",
-      String.raw`SELECT "x\"; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`,
-    ],
-    [
-      "SET ROLE smuggled past a backslash-terminated identifier",
-      String.raw`SELECT 1 AS "x\"; SET ROLE postgres; SELECT * FROM rls_t; --"`,
-    ],
-    [
-      "identifier bypass with an odd backslash run of three",
-      String.raw`SELECT "x\\\"; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`,
-    ],
-  ];
-
-  it.each(payloads)("rejects %s", async (_label, sql) => {
-    await expect(executeQuery(pool, sql, 10, tenantAOptions)).rejects.toThrow(
-      ReadOnlyQueryError
-    );
-  });
-
-  it("leaves tenant scope intact after a rejected attempt", async () => {
-    for (const [, sql] of payloads) {
-      await executeQuery(pool, sql, 10, tenantAOptions).catch(() => undefined);
-    }
-
-    const after = await executeQuery(pool, "SELECT * FROM rls_t", 10, tenantAOptions);
-    expect(JSON.stringify(after.rows)).not.toContain("B-secret");
-  });
-
-  // Guards the premise. If Postgres ever stopped executing the smuggled statements,
-  // the tests above would pass for the wrong reason.
-  it("confirms Postgres really does execute the smuggled statements", async () => {
-    const client = await pool.connect();
-    try {
-      await client.query("SET ROLE rls_tenant_reader");
-      await client.query("SET app.partner_id = 'tenantA'");
-
-      const scoped = await client.query("SELECT * FROM rls_t");
-      expect(scoped.rows).toEqual([{ id: 1, tenant_id: "tenantA", secret: "A-secret" }]);
-
-      const smuggled = await client.query(
-        String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM rls_t; --'`
+describe.skipIf(!isDbAvailable)(
+  "read-only guard against a two-tenant RLS fixture",
+  () => {
+    it("scopes a plain SELECT to tenant A (scalar policy)", async () => {
+      const result = await executeQuery(
+        pool,
+        "SELECT * FROM rls_t",
+        10,
+        tenantAOptions
       );
-      const results = Array.isArray(smuggled) ? smuggled : [smuggled];
 
-      expect(results).toHaveLength(3);
-      expect(JSON.stringify(results.map((r) => r.rows))).toContain("B-secret");
-    } finally {
-      await client.query("RESET ALL").catch(() => undefined);
-      await client.query("RESET ROLE").catch(() => undefined);
-      client.release();
-    }
-  });
+      expect(result.rows).toEqual([
+        { id: 1, tenant_id: "tenantA", secret: "A-secret" },
+      ]);
+    });
 
-  // Guards the premise for the identifier half. Same check as above, one lexer branch over.
-  it("confirms Postgres executes statements smuggled past a quoted identifier", async () => {
-    const client = await pool.connect();
-    try {
-      await client.query("SET ROLE rls_tenant_reader");
-      await client.query("SET app.partner_id = 'tenantA'");
-
-      // Reads backstop_src so the first statement resolves against a real `x\` column;
-      // without it the batch aborts at 42703 before reaching the smuggled SET.
-      const smuggled = await client.query(
-        String.raw`SELECT "x\" FROM backstop_src; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`
+    it("scopes a plain SELECT to tenant A (EXISTS-subquery policy)", async () => {
+      const result = await executeQuery(
+        pool,
+        "SELECT * FROM rls_messages",
+        10,
+        tenantAOptions
       );
-      const results = Array.isArray(smuggled) ? smuggled : [smuggled];
 
-      expect(results).toHaveLength(3);
-      expect(JSON.stringify(results.map((r) => r.rows))).toContain("B-secret");
-    } finally {
-      await client.query("RESET ALL").catch(() => undefined);
-      await client.query("RESET ROLE").catch(() => undefined);
-      client.release();
-    }
-  });
-});
+      expect(result.rows).toEqual([{ id: 1, thread_id: 1, body: "A-message" }]);
+    });
+
+    it("allows EXPLAIN without ANALYZE through to the server", async () => {
+      const result = await executeQuery(
+        pool,
+        "EXPLAIN SELECT * FROM rls_t",
+        10,
+        tenantAOptions
+      );
+
+      expect(result.rows.length).toBeGreaterThan(0);
+      expect(JSON.stringify(result.rows)).toContain("rls_t");
+    });
+
+    // Every payload proven to re-point tenant scope on this fixture shape. The guard has
+    // to reject each one before it reaches the connection, and no tenant B value may
+    // appear in anything the caller gets back.
+    const payloads: Array<[string, string]> = [
+      [
+        "set_config in WHERE",
+        "SELECT * FROM rls_t WHERE set_config('app.partner_id','tenantB',false) IS NOT NULL",
+      ],
+      [
+        "set_config in a materialized CTE",
+        "WITH x AS MATERIALIZED (SELECT set_config('app.partner_id','tenantB',false)) SELECT * FROM rls_t CROSS JOIN x",
+      ],
+      [
+        "set_config in the select list",
+        "SELECT set_config('app.partner_id','tenantB',false), rls_t.* FROM rls_t",
+      ],
+      [
+        "SET ROLE smuggled past a backslash-terminated literal",
+        String.raw`SELECT 'x\'; SET ROLE postgres; SELECT * FROM rls_t; --'`,
+      ],
+      [
+        "SET of the tenant GUC smuggled past a backslash-terminated literal",
+        String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM rls_t; --'`,
+      ],
+      [
+        "SET of the tenant GUC against the EXISTS policy",
+        String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM rls_messages; --'`,
+      ],
+      [
+        "SET of the tenant GUC smuggled past a backslash-terminated identifier",
+        String.raw`SELECT "x\"; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`,
+      ],
+      [
+        "SET ROLE smuggled past a backslash-terminated identifier",
+        String.raw`SELECT 1 AS "x\"; SET ROLE postgres; SELECT * FROM rls_t; --"`,
+      ],
+      [
+        "identifier bypass with an odd backslash run of three",
+        String.raw`SELECT "x\\\"; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`,
+      ],
+    ];
+
+    it.each(payloads)("rejects %s", async (_label, sql) => {
+      await expect(executeQuery(pool, sql, 10, tenantAOptions)).rejects.toThrow(
+        ReadOnlyQueryError
+      );
+    });
+
+    it("leaves tenant scope intact after a rejected attempt", async () => {
+      for (const [, sql] of payloads) {
+        await executeQuery(pool, sql, 10, tenantAOptions).catch(
+          () => undefined
+        );
+      }
+
+      const after = await executeQuery(
+        pool,
+        "SELECT * FROM rls_t",
+        10,
+        tenantAOptions
+      );
+      expect(JSON.stringify(after.rows)).not.toContain("B-secret");
+    });
+
+    // Guards the premise. If Postgres ever stopped executing the smuggled statements,
+    // the tests above would pass for the wrong reason.
+    it("confirms Postgres really does execute the smuggled statements", async () => {
+      const client = await pool.connect();
+      try {
+        await client.query("SET ROLE rls_tenant_reader");
+        await client.query("SET app.partner_id = 'tenantA'");
+
+        const scoped = await client.query("SELECT * FROM rls_t");
+        expect(scoped.rows).toEqual([
+          { id: 1, tenant_id: "tenantA", secret: "A-secret" },
+        ]);
+
+        const smuggled = await client.query(
+          String.raw`SELECT 'x\'; SET app.partner_id TO "tenantB"; SELECT * FROM rls_t; --'`
+        );
+        const results = Array.isArray(smuggled) ? smuggled : [smuggled];
+
+        expect(results).toHaveLength(3);
+        expect(JSON.stringify(results.map((r) => r.rows))).toContain(
+          "B-secret"
+        );
+      } finally {
+        await client.query("RESET ALL").catch(() => undefined);
+        await client.query("RESET ROLE").catch(() => undefined);
+        client.release();
+      }
+    });
+
+    // Guards the premise for the identifier half. Same check as above, one lexer branch over.
+    it("confirms Postgres executes statements smuggled past a quoted identifier", async () => {
+      const client = await pool.connect();
+      try {
+        await client.query("SET ROLE rls_tenant_reader");
+        await client.query("SET app.partner_id = 'tenantA'");
+
+        // Reads backstop_src so the first statement resolves against a real `x\` column;
+        // without it the batch aborts at 42703 before reaching the smuggled SET.
+        const smuggled = await client.query(
+          String.raw`SELECT "x\" FROM backstop_src; SET app.partner_id TO 'tenantB'; SELECT * FROM rls_t; --"`
+        );
+        const results = Array.isArray(smuggled) ? smuggled : [smuggled];
+
+        expect(results).toHaveLength(3);
+        expect(JSON.stringify(results.map((r) => r.rows))).toContain(
+          "B-secret"
+        );
+      } finally {
+        await client.query("RESET ALL").catch(() => undefined);
+        await client.query("RESET ROLE").catch(() => undefined);
+        client.release();
+      }
+    });
+  }
+);
 
 // The lexer is not the only defence. These exercise the server-side one on its own, with
 // the payload injected through expandStar so it lands AFTER assertReadOnlyQuery has run:
@@ -230,7 +258,9 @@ describe.skipIf(!isDbAvailable)("extended-protocol backstop", () => {
   const injectSmuggledInsert = () => SMUGGLED_INSERT;
 
   async function probeRowCount() {
-    const result = await pool.query("SELECT count(*)::int AS c FROM backstop_probe");
+    const result = await pool.query(
+      "SELECT count(*)::int AS c FROM backstop_probe"
+    );
     return result.rows[0].c as number;
   }
 
@@ -254,8 +284,9 @@ describe.skipIf(!isDbAvailable)("extended-protocol backstop", () => {
   // Guards the premise: without the backstop the same payload really does write. If the
   // simple protocol ever stopped executing it, the test above would pass for free.
   //
-  // executeQuery's result handling predates multi-statement support and trips over the
-  // array pg returns for a batch. That is pre-existing and unrelated to protocol gating,
+  // Without the backstop the payload still errors, because executeQuery rejects the array of
+  // results that comes back from a source that did not allow multiple statements. That
+  // rejection happens after the server has already run the INSERT, which is the whole point,
   // so these two assert on the side effect rather than the return value.
   it("confirms the simple protocol runs the smuggled INSERT", async () => {
     const err = await executeQuery(pool, "SELECT 1", 10, {
@@ -263,7 +294,10 @@ describe.skipIf(!isDbAvailable)("extended-protocol backstop", () => {
       allowMultiStatements: false,
       readOnlyQueries: false,
       expandStar: injectSmuggledInsert,
-    }).then(() => null, (caught: unknown) => caught);
+    }).then(
+      () => null,
+      (caught: unknown) => caught
+    );
 
     expect(String(err ?? "")).not.toMatch(/42601/);
     expect(await probeRowCount()).toBe(1);
@@ -278,7 +312,10 @@ describe.skipIf(!isDbAvailable)("extended-protocol backstop", () => {
       "SELECT 1 AS a; INSERT INTO backstop_probe VALUES (9)",
       10,
       { readonly: false, allowMultiStatements: true, readOnlyQueries: false }
-    ).then(() => null, (caught: unknown) => caught);
+    ).then(
+      () => null,
+      (caught: unknown) => caught
+    );
 
     expect(String(err ?? "")).not.toMatch(/42601/);
     expect(await probeRowCount()).toBe(1);

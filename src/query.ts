@@ -169,6 +169,7 @@ function collectFunctionNames(node: unknown, acc: Set<string>): void {
 // backslash escapes inside those, so the two lexers agree), doubled '' quotes and
 // comments all produce identical statement boundaries on both sides. Rejecting them
 // would add false positives and close nothing.
+//
 // A comment glued directly onto an identifier or quoted token with no separating
 // whitespace, e.g. `set_config--x\n(...)`. node-sql-parser folds `--x` into the
 // identifier itself (it names the function `set_config--x`, which matches nothing
@@ -426,11 +427,47 @@ export function assertReadOnlyQuery(sql: string): void {
   }
 }
 
+// Thrown for both multi-statement rejections so the parse-failure fallback in ensureLimit can
+// tell them apart from a parser error by type rather than by matching on the message text.
+class MultiStatementError extends Error {}
+
+const MULTI_STATEMENT_NOT_ALLOWED =
+  "Multi-statement queries are not allowed on this source. Send one statement at a time.";
+
+const AMBIGUOUS_BATCH =
+  "Multi-statement query has more than one statement that returns rows; only the final " +
+  "statement's result set can be returned. Combine the statements into a single query " +
+  "(e.g. a CTE or UNION) or send them as separate queries.";
+
+// Whether a statement produces the data the caller asked for. Measured against PostgreSQL 16
+// rather than assumed: SELECT and SHOW come back with populated `fields`,
+// INSERT/UPDATE/DELETE only with a RETURNING clause, and SET/BEGIN/COMMIT never do.
+//
+// SHOW is deliberately excluded. It does return a row, but it reports session state, the same
+// thing SET writes, so `SHOW x; SELECT y` is a batch about y and not an ambiguous one. Its row
+// is still returned when nothing else in the batch produces one.
+function isDataStatement(ast: { type?: string; returning?: unknown }) {
+  switch (ast?.type) {
+    case "select":
+      return true;
+    case "insert":
+    case "update":
+    case "delete":
+    case "replace":
+      return Boolean(ast.returning);
+    default:
+      return false;
+  }
+}
+
 /**
- * Parse the SQL, and if it's a single SELECT without a LIMIT, append one.
+ * Parse the SQL and append a LIMIT to the statement whose rows the caller gets back.
  *
- * When allowMultiStatements is false, rejects multi-statement queries. On parse failure, falls back
- * to a regex-based LIMIT append rather than running unlimited queries.
+ * When allowMultiStatements is false, rejects multi-statement queries. A batch that parses is
+ * also rejected here, before it reaches the database, if more than one of its statements returns
+ * rows: deciding that on the results instead would mean a write batch had already committed by
+ * the time the caller is told to resend it. On parse failure, falls back to a regex-based LIMIT
+ * append rather than running unlimited queries.
  */
 export function ensureLimit(
   sql: string,
@@ -443,11 +480,32 @@ export function ensureLimit(
     const statements = Array.isArray(raw) ? raw : [raw];
     if (statements.length > 1) {
       if (!allowMultiStatements) {
-        throw new Error(
-          "Multi-statement queries are not allowed on this source. Send one statement at a time."
-        );
+        throw new MultiStatementError(MULTI_STATEMENT_NOT_ALLOWED);
       }
-      return sql;
+
+      const dataStatements = statements.filter(isDataStatement);
+      if (dataStatements.length > 1) {
+        throw new MultiStatementError(AMBIGUOUS_BATCH);
+      }
+
+      // Push the LIMIT onto the batch's one data statement so the server stops producing
+      // rows, instead of sending them all across the wire to be sliced here. Only a SELECT
+      // takes a LIMIT; a RETURNING clause is bounded by the rows it wrote.
+      const [target] = dataStatements;
+      if (target?.type !== "select" || target.limit?.value?.length) return sql;
+
+      target.limit = {
+        seperator: "",
+        value: [{ type: "number", value: limit }],
+      };
+      try {
+        return parser.sqlify(raw, PG_OPT);
+      } catch {
+        // The batch parses but does not survive a round trip. Send the original text: the
+        // regex fallback below would append the LIMIT after the batch's last statement,
+        // which is a different query.
+        return sql;
+      }
     }
     const ast = statements[0];
     if (ast.type !== "select") return sql;
@@ -460,9 +518,8 @@ export function ensureLimit(
 
     return parser.sqlify(ast, PG_OPT);
   } catch (err) {
-    // Re-throw our own multi-statement error
-    if (err instanceof Error && err.message.includes("Multi-statement"))
-      throw err;
+    // Re-throw our own multi-statement rejections
+    if (err instanceof MultiStatementError) throw err;
 
     // Parser failed — apply regex fallback LIMIT instead of running unlimited
     if (!HAS_LIMIT_RE.test(sql) && !STARTS_WITH_EXPLAIN_RE.test(sql)) {
@@ -556,12 +613,46 @@ export async function executeQuery(
     //
     // Gated on readOnlyQueries because allow_multi_statements is an independent setting
     // and `SELECT 1; SELECT 2` is legitimate for a source that enables it.
-    const result = await client.query(
+    const queryResult = await client.query(
       options.readOnlyQueries
         ? { text: limitedSql, queryMode: "extended" }
         : limitedSql
     );
-    const rows: Record<string, unknown>[] = result.rows;
+    // node-postgres types client.query() as returning a single QueryResult, but the driver
+    // returns an ARRAY of them, one per statement, whenever the server executed more than one
+    // command. That is not limited to allow_multi_statements sources: input that the SQL
+    // parser reads as one statement and PostgreSQL splits into several arrives here too (see
+    // findStatementBoundaryHazard), so nothing below assumes the source opted in.
+    const results: pg.QueryResult[] = Array.isArray(queryResult)
+      ? queryResult
+      : [queryResult];
+
+    if (results.length > 1 && !options.allowMultiStatements) {
+      // ensureLimit saw one statement and the server ran several, so this input split at a
+      // boundary the parser does not agree with. Returning rows here would put a smuggled
+      // batch on the success path, where the audit log records it as an ordinary read.
+      logger.warn("Multi-statement batch on a source that does not allow one", {
+        statements: results.length,
+        commands: results.map((r) => r.command).join(", "),
+      });
+      throw new Error(MULTI_STATEMENT_NOT_ALLOWED);
+    }
+
+    // Runtime fallback for batches ensureLimit could not check, i.e. the ones the parser
+    // could not read. `fields` is the signal, not `rows`: on PostgreSQL 16, SELECT ... WHERE
+    // false returns zero rows with populated fields, while SET, BEGIN and COMMIT return
+    // neither. SHOW is skipped for the same reason it is at parse time: it reports session
+    // state rather than competing for the batch's answer.
+    const rowReturning = results.filter((r) => r.fields?.length);
+    if (rowReturning.filter((r) => r.command !== "SHOW").length > 1) {
+      throw new Error(AMBIGUOUS_BATCH);
+    }
+
+    // The batch's answer is its last row-returning result, not its last result: `BEGIN;
+    // SELECT ...; COMMIT` has to return the SELECT. With none (`SET a; SET b`) every result
+    // is empty, so the last one stands in.
+    const chosen = rowReturning.at(-1) ?? results[results.length - 1];
+    const rows: Record<string, unknown>[] = chosen.rows ?? [];
 
     const isTruncated = rows.length > maxRows;
     const slicedRows = isTruncated ? rows.slice(0, maxRows) : rows;
