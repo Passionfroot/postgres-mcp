@@ -58,4 +58,14 @@ describe("truncateText", () => {
     expect(Buffer.byteLength(capped)).toBeLessThanOrEqual(500);
     expect(capped).toContain("[truncated:");
   });
+
+  it("never returns more bytes than the input, even when the marker alone is bigger than the cap", () => {
+    const input = "x".repeat(10_000);
+    const capped = truncateText(input, 50);
+
+    // A negative Buffer.subarray end counts from the end of the buffer instead of clamping to
+    // zero, which used to return the whole 10 KB input back out for a 50-byte cap.
+    expect(Buffer.byteLength(capped)).toBeLessThan(Buffer.byteLength(input));
+    expect(capped).toContain("[truncated:");
+  });
 });

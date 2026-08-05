@@ -63,6 +63,9 @@ export function serializeQueryResult(result: QueryResult, maxResponseBytes: numb
 export function truncateText(text: string, maxResponseBytes: number) {
   if (Buffer.byteLength(text) <= maxResponseBytes) return text;
   const marker = `\n\n[truncated: output exceeded max_response_bytes (${maxResponseBytes})]`;
-  const keep = maxResponseBytes - Buffer.byteLength(marker);
+  // A tiny maxResponseBytes can be smaller than the marker itself. A negative end index on
+  // subarray counts from the end of the buffer rather than clamping to zero, which returned
+  // nearly the whole input back out. Floor at 0 so the kept prefix is empty, not "everything".
+  const keep = Math.max(0, maxResponseBytes - Buffer.byteLength(marker));
   return Buffer.from(text, "utf8").subarray(0, keep).toString("utf8") + marker;
 }

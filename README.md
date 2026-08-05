@@ -55,9 +55,10 @@ Set `pool_max` explicitly if you want a different ceiling. Sizing it below the n
 ### Security
 
 - Binding a non-loopback address without `--token` is refused at startup rather than warned about. `localhost`, `127.0.0.0/8` and `::1` all count as loopback.
-- The `Host` header must match the bound address, which is what blocks DNS rebinding. `Origin`, when a request sends one, must be a loopback origin for the bound port; a cross-origin browser request gets `403`. Requests with no `Origin` at all are allowed, because MCP clients are not browsers and do not send one.
+- The `Host` header must match the bound address, which is what blocks DNS rebinding. Bound to a specific address, that address is the only match; bound to the wildcard `0.0.0.0` or `::`, the machine's non-internal interface addresses and hostname are matched instead, since no real client ever sends the wildcard itself as `Host`. `Origin`, when a request sends one, must be a loopback origin for the bound port; a cross-origin browser request gets `403`. Requests with no `Origin` at all are allowed, because MCP clients are not browsers and do not send one.
 - Prefer `POSTGRES_MCP_TOKEN` or `--token-file` over `--token`: an argv token is visible to any process that can run `ps`.
-- `GET /health` answers without a token so a supervisor can probe it, but it only reports the session count to an authorized caller.
+- `GET /health` answers without a token so a supervisor can probe it, subject to the same `Host` check as `/mcp`; it only reports the session count to an authorized caller.
+- The transport is plain HTTP with no TLS: no certificate/key option exists. Binding non-loopback sends the bearer token and every request in cleartext. Put a reverse proxy or an SSH tunnel in front for any use beyond a trusted local network.
 
 ### HTTP is refused for per-tenant configs
 

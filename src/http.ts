@@ -1,6 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import net from "node:net";
+import os from "node:os";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -73,11 +74,50 @@ export function formatHostPort(host: string, port: number) {
 }
 
 /**
+ * A client never sends the wildcard address as its own Host header; it sends whatever address
+ * or name it dialed. Bound to `0.0.0.0` or `::`, the wildcard itself is not a `Host` any real
+ * request can match, so list the machine's actual non-internal interfaces (and its hostname)
+ * instead. Bound to a specific address, that address is what clients dial, so it alone matches.
+ */
+export function reachableHostPorts(host: string, port: number) {
+  if (host !== "0.0.0.0" && host !== "::") {
+    return [formatHostPort(host, port)];
+  }
+
+  // Lowercase: a Host header's hostname is case-insensitive, and the SDK's own transport (via
+  // @hono/node-server) parses it through the URL class, which lowercases hostnames on the way
+  // through and then rejects any request whose raw Host header doesn't match that lowercase
+  // form byte-for-byte. os.hostname() is whatever case the machine was named with.
+  const hostPorts = [formatHostPort(os.hostname().toLowerCase(), port)];
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const addr of addrs ?? []) {
+      if (addr.internal) continue;
+      hostPorts.push(formatHostPort(addr.address, port));
+    }
+  }
+  return hostPorts;
+}
+
+/**
  * An error message can carry text a peer chose (a bad URL, a rejected header value). Flatten
  * control characters so it cannot forge log lines, and bound the length.
  */
 export function sanitizeForLog(value: string) {
   return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 200);
+}
+
+/**
+ * Reads a POST body under MAX_BODY_BYTES. Rejects on the declared Content-Length before
+ * reading a byte when the client sends one; the streaming cap inside readBody covers
+ * chunked uploads that declare nothing. Shared by every request path that can carry a
+ * body, so none of them can fall through to the SDK's own unbounded `req.json()`.
+ */
+function readCappedBody(req: IncomingMessage) {
+  const declaredLength = Number(req.headers["content-length"]);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
+    throw new BodyTooLargeError(`Request body exceeds ${MAX_BODY_BYTES} bytes`);
+  }
+  return readBody(req);
 }
 
 function readBody(req: IncomingMessage) {
@@ -131,12 +171,22 @@ export async function startHttpServer(options: HttpTransportOptions) {
   const isLoopback = isLoopbackHost(options.host);
   const boundHostPort = formatHostPort(options.host, options.port);
   const allowedHosts = [
-    ...new Set([boundHostPort, `localhost:${options.port}`, `127.0.0.1:${options.port}`, `[::1]:${options.port}`]),
+    ...new Set([
+      ...reachableHostPorts(options.host, options.port),
+      `localhost:${options.port}`,
+      `127.0.0.1:${options.port}`,
+      `[::1]:${options.port}`,
+    ]),
   ];
   // The SDK only reads Origin when allowedOrigins is non-empty, and it lets a request with no
   // Origin through either way. That is deliberate here: MCP clients are not browsers and send
   // none, while a browser always does, so a cross-origin page gets 403.
   const allowedOrigins = allowedHosts.flatMap((hostPort) => [`http://${hostPort}`, `https://${hostPort}`]);
+
+  function isAllowedHost(req: IncomingMessage) {
+    const host = req.headers.host;
+    return typeof host === "string" && allowedHosts.includes(host);
+  }
 
   // On loopback the OS already limits reach to this machine. Off loopback it doesn't,
   // so refuse to expose the sources to the network without a token.
@@ -227,6 +277,13 @@ export async function startHttpServer(options: HttpTransportOptions) {
       try {
         const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
+        // Ahead of every other check, including /health: a Host header that doesn't match is
+        // exactly the DNS-rebinding shape, and /health leaking the live session count to it is
+        // as much a rebinding target as /mcp is.
+        if (!isAllowedHost(req)) {
+          return rpcError(res, 403, -32000, `Invalid Host header: ${sanitizeForLog(req.headers.host ?? "")}`);
+        }
+
         if (url.pathname === "/health") {
           // Liveness has to work without a token. The session count is operational detail, so it
           // only goes to a caller that is authorized (or to anyone when no token is configured).
@@ -246,7 +303,9 @@ export async function startHttpServer(options: HttpTransportOptions) {
 
         if (existing) {
           existing.lastSeen = Date.now();
-          return await existing.transport.handleRequest(req, res);
+          // Only POST carries a body; the SDK dispatches GET (SSE) and DELETE without reading one.
+          const body = req.method === "POST" ? await readCappedBody(req) : undefined;
+          return await existing.transport.handleRequest(req, res, body);
         }
 
         // A session id we don't know is 404 per the spec, distinct from the 400 below for a
@@ -259,14 +318,7 @@ export async function startHttpServer(options: HttpTransportOptions) {
           return rpcError(res, 400, -32000, "Missing session. Send an initialize request first.");
         }
 
-        // Reject on the declared length before reading a byte when the client sends one; the
-        // streaming cap in readBody covers chunked uploads that declare nothing.
-        const declaredLength = Number(req.headers["content-length"]);
-        if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
-          throw new BodyTooLargeError(`Request body exceeds ${MAX_BODY_BYTES} bytes`);
-        }
-
-        const body = await readBody(req);
+        const body = await readCappedBody(req);
         if (!isInitializeRequest(body)) {
           return rpcError(res, 400, -32000, "Missing session. Send an initialize request first.");
         }
