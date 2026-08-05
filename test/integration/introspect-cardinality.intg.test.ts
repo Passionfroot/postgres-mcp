@@ -37,6 +37,15 @@ const XSCHEMA_USERS = `${P}xschema_users`;
 const XSCHEMA_REF = `${P}xschema_ref`;
 const XSCHEMA_LOCAL_REF = `${P}xschema_local_ref`;
 
+// Composite FK whose declared column order is the reverse of alphabetical order.
+const ORD_PARENT = `${P}ord_parent`;
+const ORD_CHILD = `${P}ord_child`;
+
+// Referencing-column privilege without referenced-column privilege.
+const PRIV_PARENT = `${P}priv_parent`;
+const PRIV_CHILD = `${P}priv_child`;
+const PRIV_ROLE = `${P}priv_role`;
+
 const OTHER_SCHEMA = `${P}other`;
 
 const ALL_TABLES = [
@@ -55,6 +64,10 @@ const ALL_TABLES = [
   XSCHEMA_REF,
   XSCHEMA_LOCAL_REF,
   XSCHEMA_USERS,
+  ORD_CHILD,
+  ORD_PARENT,
+  PRIV_CHILD,
+  PRIV_PARENT,
 ];
 
 let pool: pg.Pool;
@@ -64,6 +77,7 @@ async function dropFixtures() {
     await pool.query(`DROP TABLE IF EXISTS public."${t}" CASCADE`);
   }
   await pool.query(`DROP SCHEMA IF EXISTS "${OTHER_SCHEMA}" CASCADE`);
+  await pool.query(`DROP ROLE IF EXISTS "${PRIV_ROLE}"`);
 }
 
 beforeAll(async () => {
@@ -138,6 +152,26 @@ beforeAll(async () => {
   await pool.query(
     `CREATE TABLE "${XSCHEMA_LOCAL_REF}" (id int PRIMARY KEY, uid int REFERENCES public."${XSCHEMA_USERS}"(id))`
   );
+
+  // A composite FK declared (zulu_id, alpha_id), the reverse of alphabetical order. Sorting
+  // FK rows by from_column instead of declared ordinal position would report this pair
+  // reversed against ord_parent's own (zulu_id, alpha_id) PK order.
+  await pool.query(
+    `CREATE TABLE "${ORD_PARENT}" (zulu_id text, alpha_id text, PRIMARY KEY (zulu_id, alpha_id))`
+  );
+  await pool.query(
+    `CREATE TABLE "${ORD_CHILD}" (zulu_id text, alpha_id text, FOREIGN KEY (zulu_id, alpha_id) REFERENCES "${ORD_PARENT}"(zulu_id, alpha_id))`
+  );
+
+  // A role with column-level SELECT on the referencing column only, not on the column it
+  // references. Reports zest_mcp_reader-shaped grants: privilege on the child, none on the
+  // parent whose own schema output never even lists this FK.
+  await pool.query(`CREATE TABLE "${PRIV_PARENT}" (id int PRIMARY KEY)`);
+  await pool.query(
+    `CREATE TABLE "${PRIV_CHILD}" (id int PRIMARY KEY, fk int REFERENCES "${PRIV_PARENT}"(id))`
+  );
+  await pool.query(`CREATE ROLE "${PRIV_ROLE}"`);
+  await pool.query(`GRANT SELECT ("fk") ON "${PRIV_CHILD}" TO "${PRIV_ROLE}"`);
 });
 
 afterAll(async () => {
@@ -186,6 +220,46 @@ describe.skipIf(!isAvailable)("FK cardinality introspection", () => {
     expect(compFks).toHaveLength(2);
     const pairs = new Set(compFks.map((f) => `${f.fromColumn}->${f.toColumn}`));
     expect(pairs).toEqual(new Set(["pa->a", "pb->b"]));
+  });
+
+  it("orders composite FK rows by declared position, not alphabetically by column name", async () => {
+    const metadata = await introspectDatabase(pool);
+
+    const ordFks = metadata.foreignKeys.filter(
+      (f) => f.fromTable === ORD_CHILD && f.toTable === ORD_PARENT
+    );
+
+    // Declared order is (zulu_id, alpha_id). Sorting by from_column would report alpha_id
+    // first, which reads as pairing children.alpha_id against parents.zulu_id.
+    expect(ordFks.map((f) => f.fromColumn)).toEqual(["zulu_id", "alpha_id"]);
+
+    const output = await renderTable(ORD_PARENT);
+    expect(output).toContain(`<- ${ORD_CHILD} via (zulu_id, alpha_id)`);
+    expect(output).not.toContain(`via (alpha_id, zulu_id)`);
+  });
+
+  it("omits an FK the role cannot see on the referenced side, instead of erroring", async () => {
+    const metadata = await introspectDatabase(pool, { role: PRIV_ROLE });
+
+    // PRIV_ROLE has SELECT on priv_child.fk but nothing on priv_parent.id: the FK must not
+    // surface, and introspection must not throw a raw permission-denied error.
+    const fk = metadata.foreignKeys.find(
+      (f) => f.fromTable === PRIV_CHILD && f.toTable === PRIV_PARENT
+    );
+    expect(fk).toBeUndefined();
+
+    // Control: granting the referenced column too makes the same FK appear, proving the
+    // omission above is caused by the missing referenced-column privilege, not something else.
+    await pool.query(`GRANT SELECT ("id") ON "${PRIV_PARENT}" TO "${PRIV_ROLE}"`);
+    try {
+      const withGrant = await introspectDatabase(pool, { role: PRIV_ROLE });
+      const grantedFk = withGrant.foreignKeys.find(
+        (f) => f.fromTable === PRIV_CHILD && f.toTable === PRIV_PARENT
+      );
+      expect(grantedFk).toBeDefined();
+    } finally {
+      await pool.query(`REVOKE SELECT ("id") ON "${PRIV_PARENT}" FROM "${PRIV_ROLE}"`);
+    }
   });
 
   it("treats a single-column UNIQUE INDEX as a uniqueness source for cardinality", async () => {

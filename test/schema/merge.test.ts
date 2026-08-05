@@ -926,6 +926,42 @@ describe("mergeSchemas", () => {
 
       expect(parents.incomingFks.every((fk) => fk.isUnique === null)).toBe(true);
     });
+
+    it("infers a composite FK as 1:1 from a unique index on a subset of its columns", () => {
+      const db = makeDbMetadata({
+        columns: [
+          makeDbColumn({ tableName: "children", columnName: "pa", ordinalPosition: 1 }),
+          makeDbColumn({ tableName: "children", columnName: "pb", ordinalPosition: 2 }),
+          makeDbColumn({ tableName: "parents", columnName: "a", ordinalPosition: 1 }),
+          makeDbColumn({ tableName: "parents", columnName: "b", ordinalPosition: 2 }),
+        ],
+        foreignKeys: [
+          {
+            constraintName: "children_pa_pb_fkey",
+            fromTable: "children",
+            fromColumn: "pa",
+            toTable: "parents",
+            toColumn: "a",
+          },
+          {
+            constraintName: "children_pa_pb_fkey",
+            fromTable: "children",
+            fromColumn: "pb",
+            toTable: "parents",
+            toColumn: "b",
+          },
+        ],
+        // No index on (pa, pb), but pa alone is unique, and a candidate key stays a key once
+        // pb is added to it, so the FK is still 1:1.
+        uniqueColumns: [],
+        uniqueColumnSets: [{ tableName: "children", columnNames: ["pa"] }],
+      });
+
+      const result = mergeSchemas(makePrismaMapping(), db);
+      const parents = result.tables.find((t) => t.sqlName === "parents")!;
+
+      expect(parents.incomingFks.every((fk) => fk.isUnique === true)).toBe(true);
+    });
   });
 
   it("sorts tables by sqlName and unmappedTables alphabetically", () => {

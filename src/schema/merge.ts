@@ -96,34 +96,38 @@ function deduplicateFks(dbFks: DbForeignKey[], prismaFks: DbForeignKey[]) {
 }
 
 /**
- * Uniqueness knowledge for the whole database. `columns`/`columnSets` being undefined means
- * "not introspected", which must stay distinguishable from "introspected, nothing unique":
- * defaulting the former to empty would relabel every genuine 1:1 as 1:many.
+ * Uniqueness knowledge for the whole database. `columns`/`columnSetsByTable` being undefined
+ * means "not introspected", which must stay distinguishable from "introspected, nothing
+ * unique": defaulting the former to empty would relabel every genuine 1:1 as 1:many.
  */
 interface UniquenessIndex {
   columns: Set<string> | undefined;
-  columnSets: Set<string> | undefined;
-}
-
-function columnSetKey(tableName: string, columnNames: string[]) {
-  // Uniqueness is a property of the set, so index column order does not matter.
-  return `${tableName}.${[...columnNames].sort().join(",")}`;
+  columnSetsByTable: Map<string, string[][]> | undefined;
 }
 
 function buildUniquenessIndex(db: DbMetadata): UniquenessIndex {
   // Normalizes both the Set and the array form (a Set does not survive a JSON round-trip).
   const columns = db.uniqueColumns ? new Set(db.uniqueColumns) : undefined;
 
-  const columnSets = db.uniqueColumnSets
-    ? new Set(db.uniqueColumnSets.map((s) => columnSetKey(s.tableName, s.columnNames)))
+  const columnSetsByTable = db.uniqueColumnSets
+    ? groupBy(db.uniqueColumnSets, (s) => s.tableName)
     : undefined;
 
-  return { columns, columnSets };
+  return {
+    columns,
+    columnSetsByTable: columnSetsByTable
+      ? new Map([...columnSetsByTable].map(([table, sets]) => [table, sets.map((s) => s.columnNames)]))
+      : undefined,
+  };
 }
 
 /**
  * Whether an FK's referencing column set is unique, so the join yields at most one row.
  * Returns null when uniqueness cannot be decided from the metadata available.
+ *
+ * A unique index over a subset of the FK's columns proves the whole column set is unique too
+ * (a candidate key stays a key once you add more columns to it), so this checks for any known
+ * unique set contained in fkColumns, not just an exact match against it.
  */
 function isFkUnique(
   tableName: string,
@@ -137,8 +141,11 @@ function isFkUnique(
 
   // Single-column uniqueness can never decide a composite FK, so without the column sets
   // there is nothing to answer with.
-  if (!uniqueness.columnSets) return null;
-  return uniqueness.columnSets.has(columnSetKey(tableName, fkColumns));
+  if (!uniqueness.columnSetsByTable) return null;
+
+  const fkColumnSet = new Set(fkColumns);
+  const knownSets = uniqueness.columnSetsByTable.get(tableName) ?? [];
+  return knownSets.some((set) => set.every((col) => fkColumnSet.has(col)));
 }
 
 /**

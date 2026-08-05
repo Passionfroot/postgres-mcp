@@ -57,6 +57,32 @@ describe("introspectDatabase", () => {
       expect(fkSql).toContain("'SELECT'");
     });
 
+    it("checks privilege on both the referencing and the referenced column", async () => {
+      const queryFn = vi.fn().mockResolvedValue(emptyResult);
+      const pool = createMockPool(queryFn);
+
+      await introspectDatabase(pool);
+
+      const fkSql = queryFn.mock.calls[2][0] as string;
+      // A role with SELECT only on the referencing side would otherwise report an FK into a
+      // table it cannot see at all, instead of omitting it.
+      expect(fkSql).toContain("has_column_privilege(con.conrelid, a.attnum, 'SELECT')");
+      expect(fkSql).toContain("has_column_privilege(con.confrelid, af.attnum, 'SELECT')");
+    });
+
+    it("orders composite FK rows by constraint and declared position, not by column name", async () => {
+      const queryFn = vi.fn().mockResolvedValue(emptyResult);
+      const pool = createMockPool(queryFn);
+
+      await introspectDatabase(pool);
+
+      const fkSql = queryFn.mock.calls[2][0] as string;
+      // Sorting by from_column instead of cols.ord scrambles a composite FK's column order
+      // relative to the parent table's own column order.
+      expect(fkSql).toContain("ORDER BY from_table, con.conname, cols.ord");
+      expect(fkSql).not.toContain("ORDER BY from_table, from_column, cols.ord");
+    });
+
     it("constrains both sides of a foreign key to the public schema", async () => {
       const queryFn = vi.fn().mockResolvedValue(emptyResult);
       const pool = createMockPool(queryFn);

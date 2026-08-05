@@ -48,7 +48,9 @@ ORDER BY tc.table_name, kcu.ordinal_position
  * Use pg_constraint instead of information_schema for FK discovery. The information_schema
  * views (constraint_column_usage) require ownership or REFERENCES privilege on the referenced
  * table, so roles with only column-level SELECT grants (like zest_mcp_reader) see zero FKs.
- * pg_constraint is visible to all roles and filtered by has_column_privilege on the FK column.
+ * pg_constraint is visible to all roles and filtered by has_column_privilege on both the FK
+ * column and the referenced column, so a FK is omitted rather than erroring when the role
+ * lacks privilege on either side.
  *
  * Both sides are constrained to schema 'public'. Only relnames are returned, so a FK pointing
  * at another schema would otherwise be reported against the same-named public table.
@@ -74,7 +76,8 @@ JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = cols.conkey
 JOIN pg_attribute af ON af.attrelid = con.confrelid AND af.attnum = cols.confkey
 WHERE con.contype = 'f' AND n.nspname = 'public' AND fn.nspname = 'public'
   AND has_column_privilege(con.conrelid, a.attnum, 'SELECT')
-ORDER BY from_table, from_column, cols.ord
+  AND has_column_privilege(con.confrelid, af.attnum, 'SELECT')
+ORDER BY from_table, con.conname, cols.ord
 `;
 
 /**
