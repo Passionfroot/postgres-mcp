@@ -3,6 +3,11 @@
 # The MCP reads this file on startup — no build step needed.
 # prisma_schema_path = "~/work/myproject/prisma/schema.prisma"
 
+# Leaving prisma_schema_path unset runs the server in plain-SQL mode: no
+# `(Prisma: ModelName)` / `(no Prisma model)` / `(Prisma: fieldName)` annotations,
+# no Prisma wording in the tool descriptions, and the schema:// map lists every
+# table in the database instead of only the Prisma-mapped ones. No flag needed.
+
 # Production: locked down, tunneled, read-only
 [[sources]]
 id = "production"

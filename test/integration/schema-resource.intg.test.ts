@@ -92,7 +92,7 @@ describe.skipIf(!isDbAvailable)("full schema pipeline integration", () => {
     const pool = await connectionManager.getPool("local");
 
     const dbMetadata = await introspectDatabase(pool);
-    const merged = mergeSchemas(null, dbMetadata);
+    const merged = mergeSchemas({ models: [], enums: [] }, dbMetadata);
 
     const tableWithColumns = merged.tables.find((t) => t.columns.length > 1);
     expect(tableWithColumns).toBeDefined();
@@ -134,8 +134,14 @@ describe.skipIf(!isDbAvailable)("createSchemaCache integration", () => {
     expect(schema.tables.length).toBeGreaterThan(0);
     expect(schema.tables.every((t) => t.prismaModelName === null)).toBe(true);
 
-    const output = formatRelationshipMap(schema, "local");
-    expect(output).toContain("0 tables");
+    // Without a mapping the map lists every database table. Filtering to Prisma-mapped tables
+    // here would leave the resource empty, which is what it used to serve.
+    expect(cache.hasPrismaMapping).toBe(false);
+    const output = formatRelationshipMap(schema, "local", { hasPrismaMapping: false });
+    expect(output).toContain(`${schema.tables.length} tables`);
+    for (const table of schema.tables) {
+      expect(output).toContain(table.sqlName);
+    }
   });
 
   it("search_objects still finds tables when prismaSchemaPath is omitted", async () => {
