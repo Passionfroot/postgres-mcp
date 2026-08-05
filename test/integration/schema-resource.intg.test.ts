@@ -13,7 +13,8 @@ import { mergeSchemas } from "../../src/schema/merge.js";
 import { parsePrismaFiles } from "../../src/schema/prisma-parser.js";
 import { searchTables } from "../../src/schema/search.js";
 
-const TEST_DSN = process.env.POSTGRES_MCP_TEST_DSN ?? "postgresql://localhost/postgres";
+const TEST_DSN =
+  process.env.POSTGRES_MCP_TEST_DSN ?? "postgresql://localhost/postgres";
 
 const localSource: SourceConfig = {
   id: "local",
@@ -92,6 +93,9 @@ describe.skipIf(!isDbAvailable)("full schema pipeline integration", () => {
     const pool = await connectionManager.getPool("local");
 
     const dbMetadata = await introspectDatabase(pool);
+    // An empty mapping is what createSchemaCache builds when no prisma_schema_path is
+    // configured, which is every production source. mergeSchemas takes a PrismaMapping,
+    // never null, so passing null here never matched the code under test.
     const merged = mergeSchemas({ models: [], enums: [] }, dbMetadata);
 
     const tableWithColumns = merged.tables.find((t) => t.columns.length > 1);
@@ -137,7 +141,9 @@ describe.skipIf(!isDbAvailable)("createSchemaCache integration", () => {
     // Without a mapping the map lists every database table. Filtering to Prisma-mapped tables
     // here would leave the resource empty, which is what it used to serve.
     expect(cache.hasPrismaMapping).toBe(false);
-    const output = formatRelationshipMap(schema, "local", { hasPrismaMapping: false });
+    const output = formatRelationshipMap(schema, "local", {
+      hasPrismaMapping: false,
+    });
     expect(output).toContain(`${schema.tables.length} tables`);
     for (const table of schema.tables) {
       expect(output).toContain(table.sqlName);
