@@ -5,6 +5,9 @@ export interface SourceConfig {
   maxRows: number;
   timeout: number;
   poolMax: number;
+  /** True when the config named pool_max, so --http knows not to override a deliberate value. */
+  poolMaxExplicit: boolean;
+  maxResponseBytes: number;
   allowMultiStatements: boolean;
   readOnlyQueries: boolean;
   role?: string;

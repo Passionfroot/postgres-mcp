@@ -16,6 +16,8 @@ const localSource: SourceConfig = {
   maxRows: 10,
   timeout: 5,
   poolMax: 1,
+  poolMaxExplicit: false,
+  maxResponseBytes: 1_000_000,
   allowMultiStatements: false,
 };
 
@@ -156,6 +158,10 @@ describe.skipIf(!isDbAvailable)("execute_sql integration", () => {
       maxRows: 10,
       timeout: 1,
       poolMax: 1,
+      poolMaxExplicit: false,
+      maxResponseBytes: 1_000_000,
+  poolMaxExplicit: false,
+  maxResponseBytes: 1_000_000,
       allowMultiStatements: false,
     };
     const timeoutManager = new ConnectionManager([timeoutSource]);
@@ -179,6 +185,8 @@ describe.skipIf(!isDbAvailable)("readonly enforcement integration", () => {
     maxRows: 10,
     timeout: 5,
     poolMax: 1,
+  poolMaxExplicit: false,
+  maxResponseBytes: 1_000_000,
     allowMultiStatements: false,
   };
 

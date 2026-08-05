@@ -6,13 +6,16 @@ import { z } from "zod";
 
 import type { AuditLogConfig, Config, SourceConfig } from "./types.js";
 
+import { logger } from "./logger.js";
+
 export const sourceConfigSchema = z.object({
   id: z.string().min(1, "Source id is required"),
   dsn: z.string().min(1, "Source dsn is required"),
   readonly: z.boolean().optional().default(false),
   max_rows: z.number().int().positive().optional().default(1000),
   timeout: z.number().positive().optional().default(10),
-  pool_max: z.number().int().positive().optional().default(1),
+  pool_max: z.number().int().positive().optional(),
+  max_response_bytes: z.number().int().positive().optional().default(1_000_000),
   allow_multi_statements: z.boolean().optional().default(false),
   // Answer only read-only SELECT queries: reject SET/RESET/SET ROLE, non-SELECT
   // statements, and server-side file/program access. Defaults on for any source
@@ -26,6 +29,17 @@ export const sourceConfigSchema = z.object({
   ssh_user: z.string().optional(),
   ssh_key: z.string().optional(),
 });
+
+/** One process per client, so one connection per client is the whole budget. */
+export const DEFAULT_POOL_MAX = 1;
+
+/**
+ * Under --http one process serves every client, so pool_max stops being a per-client budget and
+ * becomes a per-server one. Left at 1 the clients queue behind each other on a single connection.
+ * 10 matches what 10 stdio sessions already asked of the database, so the ceiling is unchanged
+ * while concurrent clients stop serializing.
+ */
+export const HTTP_DEFAULT_POOL_MAX = 10;
 
 const auditLogSchema = z.object({
   log_file: z.string().min(1, "Audit log file path is required"),
@@ -72,7 +86,9 @@ function toSourceConfig(raw: z.infer<typeof sourceConfigSchema>): SourceConfig {
     readonly: raw.readonly,
     maxRows: raw.max_rows,
     timeout: raw.timeout,
-    poolMax: raw.pool_max,
+    poolMax: raw.pool_max ?? DEFAULT_POOL_MAX,
+    poolMaxExplicit: raw.pool_max !== undefined,
+    maxResponseBytes: raw.max_response_bytes,
     allowMultiStatements: raw.allow_multi_statements,
     readOnlyQueries: raw.read_only_queries ?? Boolean(raw.role || raw.session_vars),
     role: raw.role,
@@ -122,4 +138,30 @@ export function loadConfig(filePath: string): Config {
   const auditLog = result.data.audit_log ? toAuditLogConfig(result.data.audit_log) : undefined;
 
   return { sources, prismaSchemaPath, auditLog };
+}
+
+/**
+ * Raise the pool ceiling for sources that never named one, because under --http a pool_max of 1
+ * makes every client wait its turn on a single connection and past the MCP client's 60s request
+ * timeout that surfaces as an unexplained failure rather than as slowness.
+ */
+export function applyHttpPoolDefaults(config: Config): Config {
+  const sources = config.sources.map((source) => {
+    if (source.poolMaxExplicit) {
+      if (source.poolMax < 4) {
+        logger.warn(
+          `Source "${source.id}" sets pool_max = ${source.poolMax}. Under --http that is the ceiling for ` +
+            "the whole server, so concurrent clients will serialize on it."
+        );
+      }
+      return source;
+    }
+    logger.info(
+      `Source "${source.id}": raising pool_max ${source.poolMax} -> ${HTTP_DEFAULT_POOL_MAX} for --http ` +
+        "(shared across clients; set pool_max explicitly to override)"
+    );
+    return { ...source, poolMax: HTTP_DEFAULT_POOL_MAX };
+  });
+
+  return { ...config, sources };
 }

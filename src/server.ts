@@ -8,7 +8,12 @@ import type { Config } from "./types.js";
 
 import { expandStarColumns } from "./expand-star.js";
 import { logger } from "./logger.js";
-import { mcpErrorResult, mcpTextResult, resolveSource } from "./mcp-helpers.js";
+import {
+  mcpErrorResult,
+  mcpTextResult,
+  resolveSource,
+  serializeQueryResult,
+} from "./mcp-helpers.js";
 import { executeQuery, ReadOnlyQueryError } from "./query.js";
 import { registerSchemaResource } from "./schema/resource.js";
 import { registerSearchTool } from "./schema/search-tool.js";
@@ -34,7 +39,9 @@ export function createServer(
 
   const sourceIds = config.sources.map((s) => s.id);
 
-  const readonlySources = config.sources.filter((s) => s.readonly).map((s) => s.id);
+  const readonlySources = config.sources
+    .filter((s) => s.readonly)
+    .map((s) => s.id);
   const readonlyNote =
     readonlySources.length > 0
       ? ` Sources configured as read-only: ${readonlySources.join(", ")}.`
@@ -45,7 +52,9 @@ export function createServer(
     .map((s) => s.id);
   const restrictedNote =
     restrictedSources.length > 0
-      ? ` Sources that accept ONLY read-only SELECT statements: ${restrictedSources.join(", ")}.` +
+      ? ` Sources that accept ONLY read-only SELECT statements: ${restrictedSources.join(
+          ", "
+        )}.` +
         " On these, do not send SET, RESET, SET ROLE, set_config(), DDL, DML, transaction control," +
         " or multiple statements in one call. They are rejected before reaching the database." +
         " EXPLAIN without ANALYZE is allowed; EXPLAIN ANALYZE is not."
@@ -57,7 +66,9 @@ export function createServer(
       title: "Execute SQL",
       description: `Execute SQL against a configured PostgreSQL database. Returns JSON rows.${readonlyNote}${restrictedNote}`,
       inputSchema: {
-        database: z.string().describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
+        database: z
+          .string()
+          .describe(`Database source ID. Available: ${sourceIds.join(", ")}`),
         query: z.string().describe("SQL query to execute"),
       },
     },
@@ -90,7 +101,9 @@ export function createServer(
           truncated: result.truncated,
         });
 
-        return mcpTextResult(JSON.stringify(result, null, 2));
+        return mcpTextResult(
+          serializeQueryResult(result, source.maxResponseBytes)
+        );
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         // The guard rejecting a query is a security event, not a syntax error. Both
@@ -103,7 +116,9 @@ export function createServer(
             reason: err.reason,
           });
         }
-        logger.error(`execute_sql error for database "${database}": ${message}`);
+        logger.error(
+          `execute_sql error for database "${database}": ${message}`
+        );
 
         auditLog.log({
           source: database,

@@ -6,6 +6,7 @@ import type { ConnectionManager } from "../connections.js";
 import type { Config } from "../types.js";
 import type { SchemaCache } from "./cache.js";
 
+import { truncateText } from "../mcp-helpers.js";
 import { formatRelationshipMap } from "./format.js";
 
 export function registerSchemaResource(
@@ -57,7 +58,7 @@ export function registerSchemaResource(
         contents: [
           {
             uri: uri.href,
-            text,
+            text: truncateText(text, source.maxResponseBytes),
           },
         ],
       };

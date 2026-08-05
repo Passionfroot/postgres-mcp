@@ -36,7 +36,10 @@ session_vars = { "app.tenant_id" = "$TENANT_ID" }
 id = "local"
 dsn = "postgres://localhost/mydb"
 timeout = 30
+# Per client on stdio, per server under --http. Sources that omit it get 10 under --http.
 pool_max = 3
+# Byte cap on a single tool response. max_rows bounds rows, not bytes.
+# max_response_bytes = 1000000
 allow_multi_statements = true
 read_only_queries = false
 

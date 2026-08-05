@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { loadConfig } from "../src/config.js";
+import { HTTP_DEFAULT_POOL_MAX, applyHttpPoolDefaults, loadConfig } from "../src/config.js";
 
 const tmpDir = os.tmpdir();
 const createdFiles: string[] = [];
@@ -52,6 +52,8 @@ ssh_key = "/absolute/path/to/key.pem"
       maxRows: 500,
       timeout: 60,
       poolMax: 1,
+      poolMaxExplicit: false,
+      maxResponseBytes: 1_000_000,
       allowMultiStatements: false,
       readOnlyQueries: false,
       role: undefined,
@@ -74,6 +76,8 @@ dsn = "postgres://localhost/mydb"
     expect(config.sources[0].maxRows).toBe(1000);
     expect(config.sources[0].timeout).toBe(10);
     expect(config.sources[0].poolMax).toBe(1);
+    expect(config.sources[0].poolMaxExplicit).toBe(false);
+    expect(config.sources[0].maxResponseBytes).toBe(1_000_000);
     expect(config.sources[0].allowMultiStatements).toBe(false);
     expect(config.sources[0].sshHost).toBeUndefined();
     expect(config.sources[0].sshUser).toBeUndefined();
@@ -320,5 +324,62 @@ dsn = "postgres://localhost/snaplet_db"
       "local",
       "snaplet",
     ]);
+  });
+});
+
+describe("applyHttpPoolDefaults", () => {
+  it("raises pool_max for sources that never set one", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/mydb"
+`;
+    const config = applyHttpPoolDefaults(loadConfig(writeTempToml(toml)));
+
+    expect(config.sources[0].poolMax).toBe(HTTP_DEFAULT_POOL_MAX);
+  });
+
+  it("leaves an explicit pool_max alone, including an explicit 1", () => {
+    const toml = `
+[[sources]]
+id = "pinned"
+dsn = "postgres://localhost/a"
+pool_max = 1
+
+[[sources]]
+id = "sized"
+dsn = "postgres://localhost/b"
+pool_max = 3
+`;
+    const config = applyHttpPoolDefaults(loadConfig(writeTempToml(toml)));
+
+    expect(config.sources[0].poolMax).toBe(1);
+    expect(config.sources[1].poolMax).toBe(3);
+  });
+
+  it("does not mutate the config it was given", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/mydb"
+`;
+    const original = loadConfig(writeTempToml(toml));
+    applyHttpPoolDefaults(original);
+
+    expect(original.sources[0].poolMax).toBe(1);
+  });
+});
+
+describe("max_response_bytes", () => {
+  it("reads a per-source override", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/mydb"
+max_response_bytes = 250000
+`;
+    const config = loadConfig(writeTempToml(toml));
+
+    expect(config.sources[0].maxResponseBytes).toBe(250_000);
   });
 });

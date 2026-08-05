@@ -13,6 +13,9 @@ const shared = vi.hoisted(() => ({
   // inside its own constructor -- i.e. after createTunnel() resolved but before ConnectionManager
   // registers the pool entry.
   killTunnelOnPoolConstruction: false,
+  // When true, the next ssh connect() fails instead of becoming ready, simulating a tunnel that
+  // never establishes (e.g. the bastion refuses the connection).
+  failNextConnect: false,
 }));
 
 vi.mock("ssh2", async () => {
@@ -23,6 +26,11 @@ vi.mock("ssh2", async () => {
       shared.sshInstances.push(this);
     }
     connect() {
+      if (shared.failNextConnect) {
+        shared.failNextConnect = false;
+        setImmediate(() => this.emit("error", new Error("connection refused")));
+        return this;
+      }
       setImmediate(() => this.emit("ready"));
       return this;
     }
@@ -55,13 +63,21 @@ vi.mock("node:net", async (orig) => {
     }
   }
   const createServer = () => new FakeServer();
-  return { ...actual, default: { ...actual.default, createServer }, createServer };
+  return {
+    ...actual,
+    default: { ...actual.default, createServer },
+    createServer,
+  };
 });
 
 vi.mock("node:fs", async (orig) => {
   const actual = await orig<typeof import("node:fs")>();
   const readFileSync = () => Buffer.from("fake-key");
-  return { ...actual, default: { ...actual.default, readFileSync }, readFileSync };
+  return {
+    ...actual,
+    default: { ...actual.default, readFileSync },
+    readFileSync,
+  };
 });
 
 vi.mock("pg", () => {
@@ -85,7 +101,10 @@ vi.mock("pg", () => {
     default: {
       Pool: FakePool,
       // connections.ts registers tz-naive type parsers at import time.
-      types: { setTypeParser: () => {}, builtins: { DATE: 1082, TIMESTAMP: 1114 } },
+      types: {
+        setTypeParser: () => {},
+        builtins: { DATE: 1082, TIMESTAMP: 1114 },
+      },
     },
   };
 });
@@ -115,14 +134,17 @@ function tunneledSource(overrides: Partial<SourceConfig> = {}): SourceConfig {
   });
 }
 
+function resetShared() {
+  shared.poolConfigs.length = 0;
+  shared.poolErrorHandlers.length = 0;
+  shared.sshInstances.length = 0;
+  shared.sshEndCalls = 0;
+  shared.killTunnelOnPoolConstruction = false;
+  shared.failNextConnect = false;
+}
+
 describe("pool timeouts", () => {
-  beforeEach(() => {
-    shared.poolConfigs.length = 0;
-    shared.poolErrorHandlers.length = 0;
-    shared.sshInstances.length = 0;
-    shared.sshEndCalls = 0;
-    shared.killTunnelOnPoolConstruction = false;
-  });
+  beforeEach(resetShared);
 
   /**
    * These three collapsed onto one value is what broke queries against a healthy database:
@@ -158,20 +180,16 @@ describe("pool timeouts", () => {
     await manager.getPool("test");
 
     expect(shared.poolConfigs[0].statement_timeout).toBe(5_000);
-    expect(shared.poolConfigs[0].query_timeout as number).toBeGreaterThan(5_000);
+    expect(shared.poolConfigs[0].query_timeout as number).toBeGreaterThan(
+      5_000
+    );
   });
 });
 
 describe("tunnel recreation races", () => {
   const tick = () => new Promise((r) => setImmediate(() => setImmediate(r)));
 
-  beforeEach(() => {
-    shared.poolConfigs.length = 0;
-    shared.poolErrorHandlers.length = 0;
-    shared.sshInstances.length = 0;
-    shared.sshEndCalls = 0;
-    shared.killTunnelOnPoolConstruction = false;
-  });
+  beforeEach(resetShared);
 
   it("a stale close from a superseded tunnel does not kill the pool that replaced it", async () => {
     const manager = new ConnectionManager([tunneledSource()]);
@@ -237,18 +255,15 @@ describe("tunnel recreation races", () => {
 });
 
 describe("concurrent getPool", () => {
-  beforeEach(() => {
-    shared.poolConfigs.length = 0;
-    shared.poolErrorHandlers.length = 0;
-    shared.sshInstances.length = 0;
-    shared.sshEndCalls = 0;
-    shared.killTunnelOnPoolConstruction = false;
-  });
+  beforeEach(resetShared);
 
   it("two concurrent first calls for the same source build only one tunnel and one pool", async () => {
     const manager = new ConnectionManager([tunneledSource()]);
 
-    const [a, b] = await Promise.all([manager.getPool("test"), manager.getPool("test")]);
+    const [a, b] = await Promise.all([
+      manager.getPool("test"),
+      manager.getPool("test"),
+    ]);
 
     expect(shared.sshInstances.length).toBe(1);
     expect(shared.poolConfigs.length).toBe(1);
@@ -260,10 +275,36 @@ describe("concurrent getPool", () => {
     await manager.getPool("test");
     shared.poolErrorHandlers[0](new Error("idle client error"));
 
-    const [a, b] = await Promise.all([manager.getPool("test"), manager.getPool("test")]);
+    const [a, b] = await Promise.all([
+      manager.getPool("test"),
+      manager.getPool("test"),
+    ]);
 
     expect(shared.poolConfigs.length).toBe(2);
     expect(shared.sshInstances.length).toBe(2);
     expect(a).toBe(b);
+  });
+});
+
+describe("getPool caching", () => {
+  beforeEach(resetShared);
+
+  it("returns the cached pool on later sequential calls", async () => {
+    const manager = new ConnectionManager([tunneledSource()]);
+
+    const first = await manager.getPool("test");
+    const second = await manager.getPool("test");
+
+    expect(shared.sshInstances.length).toBe(1);
+    expect(second).toBe(first);
+  });
+
+  it("does not cache a failed creation", async () => {
+    const manager = new ConnectionManager([tunneledSource()]);
+    shared.failNextConnect = true;
+
+    await expect(manager.getPool("test")).rejects.toThrow("connection refused");
+    await expect(manager.getPool("test")).resolves.toBeDefined();
+    expect(shared.sshInstances.length).toBe(2);
   });
 });

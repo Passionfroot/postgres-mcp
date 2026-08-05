@@ -12,14 +12,57 @@ If you don't use Prisma, the server still works — it just shows the raw databa
 
 ```
 Claude Code session
-  └── MCP server (stdio subprocess)
-        ├── pg.Pool (max 1 connection per source)
+  └── MCP server (stdio subprocess; or one shared --http process for every session)
+        ├── pg.Pool (max 1 connection per source on stdio, 10 under --http)
         │     └── SSH tunnel (if configured) → bastion → PostgreSQL
         ├── Schema cache (Prisma + DB introspection merged)
         └── Audit log (optional rotating file)
 ```
 
-Each Claude Code session spawns one MCP server process. The server connects lazily to configured database sources on first query. Connections idle-timeout after 5 seconds and are recreated on demand.
+Over stdio, each Claude Code session spawns one MCP server process. The server connects lazily to configured database sources on first query. Connections idle-timeout after 5 seconds and are recreated on demand.
+
+## Transports
+
+stdio is the default: one process per client, which is what the per-tenant setup below relies on.
+
+`--http` serves Streamable HTTP on `127.0.0.1:7803/mcp` instead, so one process handles every client and the connection pool and schema cache are shared rather than rebuilt per session.
+
+| Flag | Default | |
+|---|---|---|
+| `--stdio` | on | One process per client |
+| `--http` | off | Streamable HTTP, shared across clients |
+| `--port <n>` | 7803 | `POSTGRES_MCP_PORT` |
+| `--host <addr>` | 127.0.0.1 | `POSTGRES_MCP_HOST` |
+| `--token <secret>` | none | Require `Authorization: Bearer <secret>`. `POSTGRES_MCP_TOKEN` |
+| `--token-file <path>` | none | Read the token from a file |
+
+An unknown flag is warned about and ignored rather than refused, so a pinned consumer passing a flag an older build ignored still starts.
+
+### What is shared, and what that costs
+
+Everything below is per server, not per client, and every client shares it:
+
+| | Shared behaviour under `--http` |
+|---|---|
+| Connection pool | `pool_max` becomes a **per-server** budget. Sources that do not set it get `10` under `--http` instead of the stdio default of `1`. A source that sets `pool_max` explicitly keeps its value, and if that value is small its clients queue behind each other on it. |
+| Schema cache | Introspected once per database for the whole server, not once per client. |
+| Response size | Every response is capped at `max_response_bytes` (default 1 MB). Rows past the cap are dropped and the result is marked `truncated` with a `truncatedReason`. `max_rows` only bounds the row count, which is not the same thing when a row holds 100 kB of text. |
+| Sessions | At most 256 live sessions; past that `initialize` answers `503`. A session untouched for 30 minutes is reclaimed. `GET /health` reports the live count. |
+| Request bodies | Capped at 4 MB; a larger one gets `413`. |
+
+Set `pool_max` explicitly if you want a different ceiling. Sizing it below the number of clients that query at once means they serialize, and a client that waits longer than its own request timeout (60 s in the MCP TypeScript SDK) sees a timeout rather than slowness.
+
+### Security
+
+- Binding a non-loopback address without `--token` is refused at startup rather than warned about. `localhost`, `127.0.0.0/8` and `::1` all count as loopback.
+- The `Host` header must match the bound address, which is what blocks DNS rebinding. Bound to a specific address, that address is the only match; bound to the wildcard `0.0.0.0` or `::`, the machine's non-internal interface addresses and hostname are matched instead, since no real client ever sends the wildcard itself as `Host`. `Origin`, when a request sends one, must be a loopback origin for the bound port; a cross-origin browser request gets `403`. Requests with no `Origin` at all are allowed, because MCP clients are not browsers and do not send one.
+- Prefer `POSTGRES_MCP_TOKEN` or `--token-file` over `--token`: an argv token is visible to any process that can run `ps`.
+- `GET /health` answers without a token so a supervisor can probe it, subject to the same `Host` check as `/mcp`; it only reports the session count to an authorized caller.
+- The transport is plain HTTP with no TLS: no certificate/key option exists. Binding non-loopback sends the bearer token and every request in cleartext. Put a reverse proxy or an SSH tunnel in front for any use beyond a trusted local network.
+
+### HTTP is refused for per-tenant configs
+
+A source with `session_vars` pins one tenant's identity, such as `app.partner_id`, for the life of the process, and RLS is the only thing enforcing that boundary. One server shared across clients cannot honour a per-process pin, so `--http` refuses to start when any source sets `session_vars`. Use stdio for those.
 
 ## Setup
 
@@ -101,7 +144,8 @@ Returns a lean relationship map: tables, their Prisma model names, and FK connec
 | `readonly`               | `false`    | Enforce read-only sessions via `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` |
 | `timeout`                | `10`       | Statement timeout in seconds                                                          |
 | `max_rows`               | `1000`     | Maximum rows returned per query (auto-appended as LIMIT)                              |
-| `pool_max`               | `1`        | Maximum connections in the pool                                                       |
+| `pool_max`               | `1`        | Maximum connections in the pool. Per client on stdio; per server under `--http`, where sources that omit it get `10` |
+| `max_response_bytes`     | `1000000`  | Maximum bytes in a single tool response. Rows past it are dropped and the result marked `truncated` |
 | `allow_multi_statements` | `false`    | Allow semicolon-separated multi-statement queries                                     |
 | `read_only_queries`      | see below  | Answer only read-only `SELECT` queries; reject everything else. Defaults to `true` when `role` or `session_vars` is set, else `false` |
 | `role`                   | —          | `SET ROLE` to this role for each query (e.g. a restricted RLS reader)                 |
@@ -239,11 +283,13 @@ See the example file for the full template.
 
 ## Connection Count Impact
 
-Each MCP session opens at most `pool_max` connections per source (default: 1). With 10 engineers:
+On stdio each MCP session is its own process and opens at most `pool_max` connections per source (default: 1). With 10 engineers:
 
 - **Default config**: 10 sessions × 1 connection = 10 connections
 - **Idle release**: Connections drop after 5s of inactivity, so active count is typically lower
 - **SSH tunnels**: One tunnel per session per SSH-enabled source
+
+Under `--http` it is one process for everyone, so the ceiling is `pool_max` connections and one tunnel per source in total, no matter how many clients connect.
 
 ## Development
 

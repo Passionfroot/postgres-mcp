@@ -20,6 +20,21 @@ function getErrorMessage(err: unknown) {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Resolves true if the promise settled in time, false if the deadline won. */
+async function withTimeout(promise: Promise<unknown>, ms: number) {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * Rewrite a PostgreSQL DSN's host and port while preserving user, password, database, and query
  * parameters.
@@ -57,6 +72,13 @@ const KEEPALIVE_INTERVAL_MS = 10_000;
  */
 const QUERY_TIMEOUT_GRACE_MS = 2_000;
 const CONNECT_TIMEOUT_GRACE_MS = 5_000;
+
+/**
+ * pool.end() waits for every checked-out client to come back, so a query still running holds it
+ * open forever. Bound it: the caller is either shutting down or replacing a dead pool, and in both
+ * cases hanging is worse than dropping the sockets.
+ */
+const POOL_END_TIMEOUT_MS = 2_000;
 
 /**
  * Manages the full connection lifecycle for all configured database sources.
@@ -208,9 +230,11 @@ export class ConnectionManager {
       idleTimeoutMillis: 5_000,
       statement_timeout: statementTimeoutMs,
       allowExitOnIdle: true,
-      // Bound acquiring a connection so a half-dead tunnel, where the peer never answers and the
-      // ssh keepalive has not tripped yet, fails instead of hanging. Together with the tunnel's
-      // onDown above, the next call recreates the pool and tunnel rather than wedging.
+      // Bound acquiring a connection so an unreachable host fails on the source's own timescale
+      // instead of waiting out the OS TCP timeout (which took over a minute despite timeout = 5),
+      // and so a half-dead tunnel -- peer never answers, ssh keepalive not tripped yet -- fails
+      // instead of hanging. Together with the tunnel's onDown above, the next call recreates the
+      // pool and tunnel rather than wedging.
       connectionTimeoutMillis: queryTimeoutMs + CONNECT_TIMEOUT_GRACE_MS,
       query_timeout: queryTimeoutMs,
     });
@@ -236,7 +260,15 @@ export class ConnectionManager {
     const poolEntry = this.pools.get(sourceId);
     if (poolEntry) {
       try {
-        await poolEntry.pool.end();
+        const ended = await withTimeout(
+          poolEntry.pool.end(),
+          POOL_END_TIMEOUT_MS
+        );
+        if (!ended) {
+          logger.warn(
+            `Pool for source "${sourceId}" still had a query in flight after ${POOL_END_TIMEOUT_MS}ms; abandoning it`
+          );
+        }
       } catch (err) {
         logger.error(
           `Error ending pool for source "${sourceId}": ${getErrorMessage(err)}`
