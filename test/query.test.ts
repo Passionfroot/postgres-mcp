@@ -316,16 +316,43 @@ describe("assertReadOnlyQuery", () => {
   // closing quote and none of them an even run. These are a spread of the shapes it found:
   // different surrounding clauses, different smuggled statements, different trailers.
   it.each([
-    ["bare select item", String.raw`SELECT "x\"; SET app.partner_id TO 'tenantB' --"`],
-    ["select item with FROM", String.raw`SELECT "x\" FROM t; INSERT INTO sideeffect VALUES (1) --"`],
-    ["select item with WHERE", String.raw`SELECT "x\" WHERE 1=1; DROP TABLE sideeffect --"`],
-    ["select item with ORDER BY", String.raw`SELECT "x\" ORDER BY 1; SELECT 424242 AS injected --"`],
+    [
+      "bare select item",
+      String.raw`SELECT "x\"; SET app.partner_id TO 'tenantB' --"`,
+    ],
+    [
+      "select item with FROM",
+      String.raw`SELECT "x\" FROM t; INSERT INTO sideeffect VALUES (1) --"`,
+    ],
+    [
+      "select item with WHERE",
+      String.raw`SELECT "x\" WHERE 1=1; DROP TABLE sideeffect --"`,
+    ],
+    [
+      "select item with ORDER BY",
+      String.raw`SELECT "x\" ORDER BY 1; SELECT 424242 AS injected --"`,
+    ],
     ["qualified column", String.raw`SELECT t."x\" FROM t; RESET ROLE --"`],
-    ["second of two select items", String.raw`SELECT 3, "x\"; UPDATE sideeffect SET n = 2 --"`],
-    ["inside a CTE", String.raw`WITH c AS (SELECT "x\"; CREATE TABLE zz (i int) --") SELECT * FROM c`],
-    ["odd backslash run of three", String.raw`SELECT "x\\\"; SELECT 424242 AS injected --"`],
-    ["empty identifier body", String.raw`SELECT "\"; SET app.partner_id TO 'tenantB' --"`],
-    ["block-comment trailer", String.raw`SELECT "x\"; SELECT 424242 AS injected /*"*/`],
+    [
+      "second of two select items",
+      String.raw`SELECT 3, "x\"; UPDATE sideeffect SET n = 2 --"`,
+    ],
+    [
+      "inside a CTE",
+      String.raw`WITH c AS (SELECT "x\"; CREATE TABLE zz (i int) --") SELECT * FROM c`,
+    ],
+    [
+      "odd backslash run of three",
+      String.raw`SELECT "x\\\"; SELECT 424242 AS injected --"`,
+    ],
+    [
+      "empty identifier body",
+      String.raw`SELECT "\"; SET app.partner_id TO 'tenantB' --"`,
+    ],
+    [
+      "block-comment trailer",
+      String.raw`SELECT "x\"; SELECT 424242 AS injected /*"*/`,
+    ],
   ])("rejects an identifier bypass: %s", (_label, sql) => {
     expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
   });
@@ -345,7 +372,10 @@ describe("assertReadOnlyQuery", () => {
   // lexers, so tightening past the odd-run rule would only add false positives.
   it.each([
     ["backslash mid-identifier", String.raw`SELECT 1 AS "a\b"`],
-    ["even backslash run before the closing quote", String.raw`SELECT 1 AS "a\\"`],
+    [
+      "even backslash run before the closing quote",
+      String.raw`SELECT 1 AS "a\\"`,
+    ],
     ["Windows path in an identifier", String.raw`SELECT "C:\temp\dir" FROM t`],
   ])("allows %s", (_label, sql) => {
     expect(() => assertReadOnlyQuery(sql)).not.toThrow();
@@ -361,9 +391,12 @@ describe("assertReadOnlyQuery", () => {
   it.each([
     ["quoted identifier", String.raw`SELECT 1 AS "a\""b"`],
     ["string literal", String.raw`SELECT 'a\''b'`],
-  ])("conservatively rejects a backslash before a doubled quote in a %s", (_label, sql) => {
-    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
-  });
+  ])(
+    "conservatively rejects a backslash before a doubled quote in a %s",
+    (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+    }
+  );
 
   // Constructs verified against PostgreSQL 16 to produce identical statement
   // boundaries in node-sql-parser and the server. They must stay allowed so nobody
@@ -372,14 +405,26 @@ describe("assertReadOnlyQuery", () => {
     ["backslash mid-literal (regex)", String.raw`SELECT 'a' ~ '\d+'`],
     ["Windows path literal", String.raw`SELECT 'C:\temp\file' AS p`],
     ["E-string with escapes", String.raw`SELECT E'tab\there'`],
-    ["E-string ending in a backslash escape", String.raw`SELECT E'x\'; SELECT 1; --'`],
+    [
+      "E-string ending in a backslash escape",
+      String.raw`SELECT E'x\'; SELECT 1; --'`,
+    ],
     ["dollar-quoted string", `SELECT $$a'; SELECT 1; --$$`],
     ["tagged dollar-quoted string", `SELECT $t$a'; SELECT 1; --$t$`],
     ["doubled quote escape", `SELECT 'x''; SELECT 1; --'`],
     ["backslash-quote inside a line comment", "SELECT 1 -- a\\'; SELECT 2\n"],
-    ["backslash-quote inside a block comment", String.raw`SELECT 1 /* a\'; SELECT 2; */`],
-    ["backslash-quote inside a quoted identifier", String.raw`SELECT 1 AS "a\'; SELECT 2; --"`],
-    ["typed literal after an identifier ending in e", `SELECT date'2026-01-01'`],
+    [
+      "backslash-quote inside a block comment",
+      String.raw`SELECT 1 /* a\'; SELECT 2; */`,
+    ],
+    [
+      "backslash-quote inside a quoted identifier",
+      String.raw`SELECT 1 AS "a\'; SELECT 2; --"`,
+    ],
+    [
+      "typed literal after an identifier ending in e",
+      `SELECT date'2026-01-01'`,
+    ],
   ])("allows %s", (_label, sql) => {
     expect(() => assertReadOnlyQuery(sql)).not.toThrow();
   });
@@ -441,9 +486,12 @@ describe("assertReadOnlyQuery", () => {
       "bare trailing -- with no text before the newline",
       "SELECT set_config--\n('app.partner_id','tenantB',false) FROM t LIMIT 10",
     ],
-  ])("rejects a comment glued onto a dangerous function (%s)", (_label, sql) => {
-    expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
-  });
+  ])(
+    "rejects a comment glued onto a dangerous function (%s)",
+    (_label, sql) => {
+      expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
+    }
+  );
 
   it("names the comment-glue reason", () => {
     let reason = "";
@@ -454,14 +502,22 @@ describe("assertReadOnlyQuery", () => {
     } catch (err) {
       reason = (err as ReadOnlyQueryError).reason;
     }
-    expect(reason).toContain("a comment starts immediately after an identifier");
+    expect(reason).toContain(
+      "a comment starts immediately after an identifier"
+    );
   });
 
   // A comment that is NOT glued to the preceding token stays allowed; this is what
   // distinguishes the fix from simply banning comments outright.
   it.each([
-    ["line comment with a leading space", "SELECT * FROM t -- trailing note\nLIMIT 10"],
-    ["block comment with a leading space", "SELECT * FROM t /* note */ LIMIT 10"],
+    [
+      "line comment with a leading space",
+      "SELECT * FROM t -- trailing note\nLIMIT 10",
+    ],
+    [
+      "block comment with a leading space",
+      "SELECT * FROM t /* note */ LIMIT 10",
+    ],
   ])("still allows %s", (_label, sql) => {
     expect(() => assertReadOnlyQuery(sql)).not.toThrow();
   });
@@ -469,7 +525,10 @@ describe("assertReadOnlyQuery", () => {
   describe("EXPLAIN", () => {
     it.each([
       ["bare", "EXPLAIN SELECT * FROM collaborations"],
-      ["with options", "EXPLAIN (COSTS OFF, FORMAT JSON) SELECT * FROM collaborations"],
+      [
+        "with options",
+        "EXPLAIN (COSTS OFF, FORMAT JSON) SELECT * FROM collaborations",
+      ],
       ["VERBOSE", "EXPLAIN VERBOSE SELECT * FROM collaborations"],
     ])("allows EXPLAIN %s", (_label, sql) => {
       expect(() => assertReadOnlyQuery(sql)).not.toThrow();
@@ -478,7 +537,10 @@ describe("assertReadOnlyQuery", () => {
     // ANALYZE actually runs the statement it explains.
     it.each([
       ["legacy syntax", "EXPLAIN ANALYZE SELECT * FROM collaborations"],
-      ["option syntax", "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM collaborations"],
+      [
+        "option syntax",
+        "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM collaborations",
+      ],
       ["British spelling", "EXPLAIN ANALYSE SELECT * FROM collaborations"],
     ])("rejects EXPLAIN ANALYZE (%s)", (_label, sql) => {
       expect(() => assertReadOnlyQuery(sql)).toThrow(ReadOnlyQueryError);
@@ -725,10 +787,52 @@ describe("executeQuery", () => {
 
     await executeQuery(pool, "SELECT 1", 10, defaultOptions);
 
-    expect(
-      (pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } })
-        ._client.release
-    ).toHaveBeenCalledTimes(1);
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
+    expect(release).toHaveBeenCalledTimes(1);
+    // Falsy first argument, so pg-pool keeps the connection for reuse. `release()` and
+    // `release(undefined)` are equivalent to it, so assert the value rather than the arity.
+    expect(release.mock.calls[0][0]).toBeFalsy();
+  });
+
+  it("discards the connection when the client-side query timeout fires", async () => {
+    // pg rejects with this and leaves the server still executing on the connection. Releasing it
+    // clean puts a busy connection back into a pool whose default size is 1.
+    const queryFn = vi.fn().mockRejectedValue(new Error("Query read timeout"));
+    const pool = createMockPool(queryFn);
+
+    await expect(
+      executeQuery(pool, "SELECT 1", 10, defaultOptions)
+    ).rejects.toThrow("Query read timeout");
+
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release.mock.calls[0][0]).toBeInstanceOf(Error);
+  });
+
+  it("discards the connection when resetting session state fails", async () => {
+    // Leaving a pinned app.partner_id on a pooled connection would hand one caller's RLS scope to
+    // the next one.
+    const queryFn = vi.fn().mockImplementation((sql: string) => {
+      if (sql.startsWith("RESET"))
+        return Promise.reject(new Error("connection lost"));
+      return Promise.resolve({ rows: [{ id: 1 }] });
+    });
+    const pool = createMockPool(queryFn);
+
+    await executeQuery(pool, "SELECT 1", 10, {
+      ...defaultOptions,
+      sessionVars: { "app.partner_id": "abc" },
+    });
+
+    const release = (
+      pool as unknown as { _client: { release: ReturnType<typeof vi.fn> } }
+    )._client.release;
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release.mock.calls[0][0]).toBeInstanceOf(Error);
   });
 
   it("releases client after failed query", async () => {

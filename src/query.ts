@@ -206,7 +206,8 @@ function findStatementBoundaryHazard(sql: string): string | null {
     const char = sql[i];
 
     if (char === "-" && sql[i + 1] === "-") {
-      if (COMMENT_GLUE_CHAR_RE.test(sql[i - 1] ?? "")) return COMMENT_GLUE_HAZARD;
+      if (COMMENT_GLUE_CHAR_RE.test(sql[i - 1] ?? ""))
+        return COMMENT_GLUE_HAZARD;
       const newline = sql.indexOf("\n", i);
       i = newline === -1 ? sql.length : newline + 1;
       continue;
@@ -214,7 +215,8 @@ function findStatementBoundaryHazard(sql: string): string | null {
 
     // PostgreSQL block comments nest.
     if (char === "/" && sql[i + 1] === "*") {
-      if (COMMENT_GLUE_CHAR_RE.test(sql[i - 1] ?? "")) return COMMENT_GLUE_HAZARD;
+      if (COMMENT_GLUE_CHAR_RE.test(sql[i - 1] ?? ""))
+        return COMMENT_GLUE_HAZARD;
       let depth = 1;
       i += 2;
       while (i < sql.length && depth > 0) {
@@ -261,7 +263,10 @@ function findStatementBoundaryHazard(sql: string): string | null {
 
     // Dollar-quoted string: no escapes at all inside, ends at the matching tag.
     // A bare `$1` placeholder is not a dollar quote.
-    const dollarTag = char === "$" ? /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i)) : null;
+    const dollarTag =
+      char === "$"
+        ? /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i))
+        : null;
     if (dollarTag) {
       const tag = dollarTag[0];
       const close = sql.indexOf(tag, i + tag.length);
@@ -385,7 +390,7 @@ export function assertReadOnlyQuery(sql: string): void {
       "This source only answers read-only SELECT queries, and this statement could not be " +
         "parsed to verify that, so it was rejected. The guard's parser is stricter than " +
         "PostgreSQL: a reserved word used as a bare alias (AS set, AS order) or an operator " +
-        "it does not know are the usual causes. Quote the alias (AS \"set\") or express the " +
+        'it does not know are the usual causes. Quote the alias (AS "set") or express the ' +
         "same read another way."
     );
   }
@@ -512,6 +517,9 @@ export async function executeQuery(
   );
 
   const client = await pool.connect();
+  // Set when the connection cannot be trusted for reuse. Releasing without an error hands it
+  // straight back to the pool, and at the default pool_max of 1 it is the only connection there.
+  let discardReason: string | undefined;
   try {
     if (options.role) {
       await client.query(`SET ROLE ${escapeIdentifier(options.role)}`);
@@ -564,6 +572,12 @@ export async function executeQuery(
       truncated: isTruncated,
     };
   } catch (err: unknown) {
+    // pg's client-side query_timeout rejects the caller but leaves the server still executing on
+    // this connection, so it must not go back into the pool.
+    if (err instanceof Error && err.message === "Query read timeout") {
+      discardReason = "client-side query timeout";
+    }
+
     if (!isPgError(err)) throw err;
 
     if (err.code === "57014") {
@@ -596,20 +610,18 @@ export async function executeQuery(
         await client.query("RESET ROLE");
       }
     } catch (cleanupErr) {
-      logger.warn(
-        "Failed to reset RLS session state; connection may be discarded by pool",
-        {
-          error:
-            cleanupErr instanceof Error
-              ? cleanupErr.message
-              : String(cleanupErr),
-          role: options.role ?? "",
-          sessionVarKeys: options.sessionVars
-            ? Object.keys(options.sessionVars).join(", ")
-            : "",
-        }
-      );
+      // The role or session vars may still be set, so this connection must not serve another
+      // caller: leaking a pinned app.partner_id across callers would defeat RLS.
+      discardReason = "failed to reset session state";
+      logger.warn("Failed to reset RLS session state; discarding connection", {
+        error:
+          cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        role: options.role ?? "",
+        sessionVarKeys: options.sessionVars
+          ? Object.keys(options.sessionVars).join(", ")
+          : "",
+      });
     }
-    client.release();
+    client.release(discardReason ? new Error(discardReason) : undefined);
   }
 }
