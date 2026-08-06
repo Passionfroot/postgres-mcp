@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { loadConfig } from "../src/config.js";
+import { HTTP_DEFAULT_POOL_MAX, applyHttpPoolDefaults, loadConfig } from "../src/config.js";
 
 const tmpDir = os.tmpdir();
 const createdFiles: string[] = [];
@@ -52,7 +52,10 @@ ssh_key = "/absolute/path/to/key.pem"
       maxRows: 500,
       timeout: 60,
       poolMax: 1,
+      poolMaxExplicit: false,
+      maxResponseBytes: 1_000_000,
       allowMultiStatements: false,
+      readOnlyQueries: false,
       role: undefined,
       sessionVars: undefined,
       sshHost: "bastion.example.com",
@@ -73,6 +76,8 @@ dsn = "postgres://localhost/mydb"
     expect(config.sources[0].maxRows).toBe(1000);
     expect(config.sources[0].timeout).toBe(10);
     expect(config.sources[0].poolMax).toBe(1);
+    expect(config.sources[0].poolMaxExplicit).toBe(false);
+    expect(config.sources[0].maxResponseBytes).toBe(1_000_000);
     expect(config.sources[0].allowMultiStatements).toBe(false);
     expect(config.sources[0].sshHost).toBeUndefined();
     expect(config.sources[0].sshUser).toBeUndefined();
@@ -99,7 +104,9 @@ id = "test"
 dsn = "postgres://user:pass@\${TEST_PG_HOST}/db"
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.sources[0].dsn).toBe("postgres://user:pass@db.example.com/db");
+    expect(config.sources[0].dsn).toBe(
+      "postgres://user:pass@db.example.com/db"
+    );
     delete process.env.TEST_PG_HOST;
   });
 
@@ -110,7 +117,9 @@ dsn = "postgres://user:pass@\${TEST_PG_HOST}/db"
 id = "test"
 dsn = "postgres://user:$NONEXISTENT_VAR_12345@host/db"
 `;
-    expect(() => loadConfig(writeTempToml(toml))).toThrow("NONEXISTENT_VAR_12345");
+    expect(() => loadConfig(writeTempToml(toml))).toThrow(
+      "NONEXISTENT_VAR_12345"
+    );
     expect(() => loadConfig(writeTempToml(toml))).toThrow("not set");
   });
 
@@ -122,7 +131,9 @@ dsn = "postgres://localhost/db"
 ssh_key = "~/.ssh/key.pem"
 `;
     const config = loadConfig(writeTempToml(toml));
-    expect(config.sources[0].sshKey).toBe(path.join(os.homedir(), ".ssh/key.pem"));
+    expect(config.sources[0].sshKey).toBe(
+      path.join(os.homedir(), ".ssh/key.pem")
+    );
     expect(config.sources[0].sshKey).not.toContain("~");
   });
 
@@ -138,7 +149,9 @@ ssh_key = "~/.ssh/key.pem"
 id = "test
 dsn = missing closing quote
 `;
-    expect(() => loadConfig(writeTempToml(toml))).toThrow("Failed to parse TOML");
+    expect(() => loadConfig(writeTempToml(toml))).toThrow(
+      "Failed to parse TOML"
+    );
   });
 
   it("throws on missing required field (id)", () => {
@@ -227,6 +240,63 @@ dsn = "postgres://localhost/db"
     expect(config.sources[0].sessionVars).toBeUndefined();
   });
 
+  it("ignores an unknown top-level key without failing to load", () => {
+    const toml = `
+include_prisma_info = false
+
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/db"
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources).toHaveLength(1);
+    expect(config).not.toHaveProperty("includePrismaInfo");
+  });
+
+  it("defaults readOnlyQueries off for a plain source", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/db"
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].readOnlyQueries).toBe(false);
+  });
+
+  it("defaults readOnlyQueries on when role pins the source", () => {
+    const toml = `
+[[sources]]
+id = "tenant"
+dsn = "postgres://localhost/db"
+role = "zest_mcp_reader"
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].readOnlyQueries).toBe(true);
+  });
+
+  it("defaults readOnlyQueries on when session_vars pin the source", () => {
+    const toml = `
+[[sources]]
+id = "tenant"
+dsn = "postgres://localhost/db"
+session_vars = { "app.partner_id" = "p1" }
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].readOnlyQueries).toBe(true);
+  });
+
+  it("lets an explicit read_only_queries override the default", () => {
+    const toml = `
+[[sources]]
+id = "tenant"
+dsn = "postgres://localhost/db"
+role = "zest_mcp_reader"
+read_only_queries = false
+`;
+    const config = loadConfig(writeTempToml(toml));
+    expect(config.sources[0].readOnlyQueries).toBe(false);
+  });
+
   it("parses multiple sources", () => {
     const toml = `
 [[sources]]
@@ -248,6 +318,68 @@ dsn = "postgres://localhost/snaplet_db"
 `;
     const config = loadConfig(writeTempToml(toml));
     expect(config.sources).toHaveLength(4);
-    expect(config.sources.map((s) => s.id)).toEqual(["production", "staging", "local", "snaplet"]);
+    expect(config.sources.map((s) => s.id)).toEqual([
+      "production",
+      "staging",
+      "local",
+      "snaplet",
+    ]);
+  });
+});
+
+describe("applyHttpPoolDefaults", () => {
+  it("raises pool_max for sources that never set one", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/mydb"
+`;
+    const config = applyHttpPoolDefaults(loadConfig(writeTempToml(toml)));
+
+    expect(config.sources[0].poolMax).toBe(HTTP_DEFAULT_POOL_MAX);
+  });
+
+  it("leaves an explicit pool_max alone, including an explicit 1", () => {
+    const toml = `
+[[sources]]
+id = "pinned"
+dsn = "postgres://localhost/a"
+pool_max = 1
+
+[[sources]]
+id = "sized"
+dsn = "postgres://localhost/b"
+pool_max = 3
+`;
+    const config = applyHttpPoolDefaults(loadConfig(writeTempToml(toml)));
+
+    expect(config.sources[0].poolMax).toBe(1);
+    expect(config.sources[1].poolMax).toBe(3);
+  });
+
+  it("does not mutate the config it was given", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/mydb"
+`;
+    const original = loadConfig(writeTempToml(toml));
+    applyHttpPoolDefaults(original);
+
+    expect(original.sources[0].poolMax).toBe(1);
+  });
+});
+
+describe("max_response_bytes", () => {
+  it("reads a per-source override", () => {
+    const toml = `
+[[sources]]
+id = "local"
+dsn = "postgres://localhost/mydb"
+max_response_bytes = 250000
+`;
+    const config = loadConfig(writeTempToml(toml));
+
+    expect(config.sources[0].maxResponseBytes).toBe(250_000);
   });
 });

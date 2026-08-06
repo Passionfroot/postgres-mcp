@@ -12,8 +12,9 @@ import { introspectDatabase } from "../../src/schema/introspect.js";
 import { mergeSchemas } from "../../src/schema/merge.js";
 import { parsePrismaFiles } from "../../src/schema/prisma-parser.js";
 import { searchTables } from "../../src/schema/search.js";
+import { resolveTestDb, TEST_DSN as TEST_DSN_ENV } from "./test-db.js";
 
-const TEST_DSN = process.env.POSTGRES_MCP_TEST_DSN ?? "postgresql://localhost/postgres";
+const TEST_DSN = TEST_DSN_ENV ?? "";
 
 const localSource: SourceConfig = {
   id: "local",
@@ -22,34 +23,48 @@ const localSource: SourceConfig = {
   maxRows: 10,
   timeout: 5,
   poolMax: 1,
+  poolMaxExplicit: false,
+  maxResponseBytes: 1_000_000,
   allowMultiStatements: false,
+  readOnlyQueries: false,
 };
 
-async function checkDbAvailable() {
-  try {
-    const testPool = new pg.Pool({ connectionString: TEST_DSN, max: 1 });
-    await testPool.query("SELECT 1");
-    await testPool.end();
-    return true;
-  } catch {
-    return false;
-  }
-}
+const { isAvailable: isDbAvailable } = await resolveTestDb();
 
-const isDbAvailable = await checkDbAvailable();
+// Self-provisioned fixtures so the pipeline assertions (tables/columns/PKs > 0) hold against
+// any target DB, rather than assuming the public schema is already populated.
+const FIXTURE_PARENT = "pgmcp_res_parent";
+const FIXTURE_CHILD = "pgmcp_res_child";
 
 let connectionManager: ConnectionManager;
 
-beforeAll(() => {
-  if (isDbAvailable) {
-    connectionManager = new ConnectionManager([localSource]);
-  }
+async function createFixtures(pool: pg.Pool) {
+  await dropFixtures(pool);
+  await pool.query(
+    `CREATE TABLE "${FIXTURE_PARENT}" (id text PRIMARY KEY, name text)`
+  );
+  await pool.query(
+    `CREATE TABLE "${FIXTURE_CHILD}" (id text PRIMARY KEY, parent_id text REFERENCES "${FIXTURE_PARENT}"(id))`
+  );
+}
+
+async function dropFixtures(pool: pg.Pool) {
+  await pool.query(`DROP TABLE IF EXISTS "${FIXTURE_CHILD}" CASCADE`);
+  await pool.query(`DROP TABLE IF EXISTS "${FIXTURE_PARENT}" CASCADE`);
+}
+
+beforeAll(async () => {
+  if (!isDbAvailable) return;
+  connectionManager = new ConnectionManager([localSource]);
+  const pool = await connectionManager.getPool("local");
+  await createFixtures(pool);
 });
 
 afterAll(async () => {
-  if (connectionManager) {
-    await connectionManager.shutdown();
-  }
+  if (!connectionManager) return;
+  const pool = await connectionManager.getPool("local");
+  await dropFixtures(pool);
+  await connectionManager.shutdown();
 });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -92,7 +107,10 @@ describe.skipIf(!isDbAvailable)("full schema pipeline integration", () => {
     const pool = await connectionManager.getPool("local");
 
     const dbMetadata = await introspectDatabase(pool);
-    const merged = mergeSchemas(null, dbMetadata);
+    // An empty mapping is what createSchemaCache builds when no prisma_schema_path is
+    // configured, which is every production source. mergeSchemas takes a PrismaMapping,
+    // never null, so passing null here never matched the code under test.
+    const merged = mergeSchemas({ models: [], enums: [] }, dbMetadata);
 
     const tableWithColumns = merged.tables.find((t) => t.columns.length > 1);
     expect(tableWithColumns).toBeDefined();
@@ -134,8 +152,16 @@ describe.skipIf(!isDbAvailable)("createSchemaCache integration", () => {
     expect(schema.tables.length).toBeGreaterThan(0);
     expect(schema.tables.every((t) => t.prismaModelName === null)).toBe(true);
 
-    const output = formatRelationshipMap(schema, "local");
-    expect(output).toContain("0 tables");
+    // Without a mapping the map lists every database table. Filtering to Prisma-mapped tables
+    // here would leave the resource empty, which is what it used to serve.
+    expect(cache.hasPrismaMapping).toBe(false);
+    const output = formatRelationshipMap(schema, "local", {
+      hasPrismaMapping: false,
+    });
+    expect(output).toContain(`${schema.tables.length} tables`);
+    for (const table of schema.tables) {
+      expect(output).toContain(table.sqlName);
+    }
   });
 
   it("search_objects still finds tables when prismaSchemaPath is omitted", async () => {

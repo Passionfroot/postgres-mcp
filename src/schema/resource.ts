@@ -6,6 +6,7 @@ import type { ConnectionManager } from "../connections.js";
 import type { Config } from "../types.js";
 import type { SchemaCache } from "./cache.js";
 
+import { truncateText } from "../mcp-helpers.js";
 import { formatRelationshipMap } from "./format.js";
 
 export function registerSchemaResource(
@@ -27,7 +28,9 @@ export function registerSchemaResource(
     }),
     {
       title: "Database Schema",
-      description: "Lean relationship map showing tables, Prisma model names, and FK relationships",
+      description: schemaCache.hasPrismaMapping
+        ? "Lean relationship map showing tables, Prisma model names, and FK relationships"
+        : "Lean relationship map showing tables and FK relationships",
       mimeType: "text/plain",
     },
     async (uri, variables) => {
@@ -47,13 +50,15 @@ export function registerSchemaResource(
         role: source.role,
         sessionVars: source.sessionVars,
       });
-      const text = formatRelationshipMap(schema, database);
+      const text = formatRelationshipMap(schema, database, {
+        hasPrismaMapping: schemaCache.hasPrismaMapping,
+      });
 
       return {
         contents: [
           {
             uri: uri.href,
-            text,
+            text: truncateText(text, source.maxResponseBytes),
           },
         ],
       };

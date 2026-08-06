@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import type { MergedColumn, MergedSchema, MergedTable } from "../../src/schema/types.js";
+import type {
+  MergedColumn,
+  MergedSchema,
+  MergedTable,
+} from "../../src/schema/types.js";
 
 import { formatSearchResults, searchTables } from "../../src/schema/search.js";
 
@@ -18,7 +22,9 @@ function makeColumn(
   };
 }
 
-function makeTable(overrides: Partial<MergedTable> & Pick<MergedTable, "sqlName">): MergedTable {
+function makeTable(
+  overrides: Partial<MergedTable> & Pick<MergedTable, "sqlName">
+): MergedTable {
   return {
     prismaModelName: null,
     columns: [],
@@ -30,11 +36,15 @@ function makeTable(overrides: Partial<MergedTable> & Pick<MergedTable, "sqlName"
   };
 }
 
-function makeSchema(tables: MergedTable[], overrides?: Partial<MergedSchema>): MergedSchema {
+function makeSchema(
+  tables: MergedTable[],
+  overrides?: Partial<MergedSchema>
+): MergedSchema {
   return {
     tables,
     unmappedTables: [],
     driftWarnings: [],
+    dbEnums: {},
     ...overrides,
   };
 }
@@ -65,7 +75,9 @@ describe("searchTables", () => {
   });
 
   it("matches case-insensitively on exact match", () => {
-    const schema = makeSchema([makeTable({ sqlName: "partnerUsers", prismaModelName: "User" })]);
+    const schema = makeSchema([
+      makeTable({ sqlName: "partnerUsers", prismaModelName: "User" }),
+    ]);
 
     const results = searchTables(schema, "user");
 
@@ -89,7 +101,10 @@ describe("searchTables", () => {
 
   it("ranks exact matches before partial matches", () => {
     const schema = makeSchema([
-      makeTable({ sqlName: "campaign_creators", prismaModelName: "CampaignCreator" }),
+      makeTable({
+        sqlName: "campaign_creators",
+        prismaModelName: "CampaignCreator",
+      }),
       makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
     ]);
 
@@ -101,7 +116,9 @@ describe("searchTables", () => {
   });
 
   it("returns empty array when no match", () => {
-    const schema = makeSchema([makeTable({ sqlName: "creators", prismaModelName: "Creator" })]);
+    const schema = makeSchema([
+      makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
+    ]);
 
     const results = searchTables(schema, "nonexistent");
 
@@ -123,7 +140,10 @@ describe("searchTables", () => {
 
   it("matches on Prisma model name for tables with model mappings", () => {
     const schema = makeSchema([
-      makeTable({ sqlName: "collaborations", prismaModelName: "Collaboration" }),
+      makeTable({
+        sqlName: "collaborations",
+        prismaModelName: "Collaboration",
+      }),
       makeTable({ sqlName: "creators", prismaModelName: "Creator" }),
     ]);
 
@@ -162,10 +182,22 @@ describe("formatSearchResults", () => {
             isNullable: true,
           }),
         ],
-        outgoingFks: [{ toTable: "creators", toColumn: "id", viaColumn: "creatorId" }],
+        outgoingFks: [
+          { toTable: "creators", toColumn: "id", viaColumn: "creatorId" },
+        ],
         incomingFks: [
-          { fromTable: "invoices", fromColumn: "collaborationId" },
-          { fromTable: "messages", fromColumn: "collaborationId" },
+          {
+            fromTable: "invoices",
+            fromColumn: "collaborationId",
+            constraintName: "invoices_collaborationId_fkey",
+            isUnique: false,
+          },
+          {
+            fromTable: "messages",
+            fromColumn: "collaborationId",
+            constraintName: "messages_collaborationId_fkey",
+            isUnique: false,
+          },
         ],
       }),
     ];
@@ -187,12 +219,181 @@ describe("formatSearchResults", () => {
     expect(output).toContain("messages");
   });
 
+  it("annotates a unique incoming FK as [1:1] and omits the fan-out warning", () => {
+    const tables = [
+      makeTable({
+        sqlName: "parents",
+        incomingFks: [
+          {
+            fromTable: "children",
+            fromColumn: "parentId",
+            constraintName: "children_parentId_fkey",
+            isUnique: true,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    expect(output).toContain("<- children via parentId [1:1]");
+    expect(output).not.toContain("[1:many]");
+    expect(output).not.toContain("fan-out");
+  });
+
+  it("annotates a non-unique incoming FK as [1:many] and warns about fan-out", () => {
+    const tables = [
+      makeTable({
+        sqlName: "parents",
+        incomingFks: [
+          {
+            fromTable: "children",
+            fromColumn: "parentId",
+            constraintName: "children_parentId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    expect(output).toContain("<- children via parentId [1:many]");
+    expect(output).toContain("fan-out");
+  });
+
+  it("renders a composite FK as one join path over all its columns", () => {
+    const tables = [
+      makeTable({
+        sqlName: "comp_parent",
+        incomingFks: [
+          {
+            fromTable: "comp_child",
+            fromColumn: "pa",
+            constraintName: "comp_child_pa_pb_fkey",
+            isUnique: true,
+          },
+          {
+            fromTable: "comp_child",
+            fromColumn: "pb",
+            constraintName: "comp_child_pa_pb_fkey",
+            isUnique: true,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    // One relationship joined on both columns. Two separate arrows would describe join
+    // paths that do not exist, and a model following them would omit the second column.
+    expect(output).toContain("<- comp_child via (pa, pb) [1:1]");
+    expect(output).not.toContain("via pa [");
+    expect(output).not.toContain("via pb [");
+  });
+
+  it("keeps FKs from the same table apart when they are separate constraints", () => {
+    const tables = [
+      makeTable({
+        sqlName: "users",
+        incomingFks: [
+          {
+            fromTable: "messages",
+            fromColumn: "senderId",
+            constraintName: "messages_senderId_fkey",
+            isUnique: false,
+          },
+          {
+            fromTable: "messages",
+            fromColumn: "recipientId",
+            constraintName: "messages_recipientId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    expect(output).toContain("<- messages via senderId [1:many]");
+    expect(output).toContain("<- messages via recipientId [1:many]");
+  });
+
+  it("omits the cardinality tag when uniqueness is unknown", () => {
+    const tables = [
+      makeTable({
+        sqlName: "parents",
+        incomingFks: [
+          {
+            fromTable: "children",
+            fromColumn: "parentId",
+            constraintName: "children_parentId_fkey",
+            isUnique: null,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    // Silence is correct here. Claiming 1:many would be a guess, and it would also drag in
+    // a fan-out warning for a relationship that may well be 1:1.
+    expect(output).toContain("<- children via parentId");
+    expect(output).not.toContain("[1:1]");
+    expect(output).not.toContain("[1:many]");
+    expect(output).not.toContain("fan-out");
+  });
+
+  it("emits the fan-out warning once for the whole response", () => {
+    const tables = [
+      makeTable({
+        sqlName: "parents",
+        incomingFks: [
+          {
+            fromTable: "children",
+            fromColumn: "parentId",
+            constraintName: "children_parentId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+      makeTable({
+        sqlName: "others",
+        incomingFks: [
+          {
+            fromTable: "otherChildren",
+            fromColumn: "otherId",
+            constraintName: "otherChildren_otherId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+      makeTable({
+        sqlName: "thirds",
+        incomingFks: [
+          {
+            fromTable: "thirdChildren",
+            fromColumn: "thirdId",
+            constraintName: "thirdChildren_thirdId_fkey",
+            isUnique: false,
+          },
+        ],
+      }),
+    ];
+
+    const output = formatSearchResults(tables);
+
+    expect(output.split("will duplicate rows on JOIN")).toHaveLength(2);
+  });
+
   it("shows 'no Prisma model' for unmapped tables", () => {
     const tables = [
       makeTable({
         sqlName: "_prisma_migrations",
         prismaModelName: null,
-        columns: [makeColumn({ sqlName: "id", dataType: "integer", udtName: "int4" })],
+        columns: [
+          makeColumn({ sqlName: "id", dataType: "integer", udtName: "int4" }),
+        ],
       }),
     ];
 
@@ -218,19 +419,78 @@ describe("formatSearchResults", () => {
 
     const enumResolver = (udtName: string) => {
       if (udtName === "CollaborationStatus") {
-        return [
-          { label: "DRAFT", dbValue: "DRAFT" },
-          { label: "ACTIVE", dbValue: "ACTIVE" },
-          { label: "COMPLETED", dbValue: "completed" },
-        ];
+        return {
+          values: [
+            { label: "DRAFT", dbValue: "DRAFT" },
+            { label: "ACTIVE", dbValue: "ACTIVE" },
+            { label: "COMPLETED", dbValue: "completed" },
+          ],
+          isDbFallback: false,
+        };
       }
       return null;
     };
 
-    const output = formatSearchResults(tables, enumResolver);
+    const output = formatSearchResults(tables, { enumResolver });
 
     expect(output).toContain("enum CollaborationStatus:");
     expect(output).toContain("DRAFT, ACTIVE, completed");
+  });
+
+  it("caps huge DB-fallback enums to a sample plus total count", () => {
+    const tables = [
+      makeTable({
+        sqlName: "creators",
+        columns: [
+          makeColumn({
+            sqlName: "country",
+            dataType: "USER-DEFINED",
+            udtName: "Country",
+          }),
+        ],
+      }),
+    ];
+
+    const values = Array.from({ length: 245 }, (_, i) => {
+      const label = `C${String(i).padStart(3, "0")}`;
+      return { label, dbValue: label };
+    });
+    const enumResolver = () => ({ values, isDbFallback: true });
+
+    const output = formatSearchResults(tables, { enumResolver });
+
+    expect(output).toContain(
+      "enum Country: C000, C001, C002, C003, C004, C005, C006, C007, … (245 values total)"
+    );
+    expect(output).not.toContain("C008");
+  });
+
+  it("renders a huge Prisma-mapped enum in full, without truncation", () => {
+    const tables = [
+      makeTable({
+        sqlName: "messages",
+        columns: [
+          makeColumn({
+            sqlName: "type",
+            dataType: "USER-DEFINED",
+            udtName: "MessageType",
+          }),
+        ],
+      }),
+    ];
+
+    const values = Array.from({ length: 45 }, (_, i) => {
+      const label = `TYPE_${String(i).padStart(3, "0")}`;
+      return { label, dbValue: label };
+    });
+    const enumResolver = () => ({ values, isDbFallback: false });
+
+    const output = formatSearchResults(tables, { enumResolver });
+
+    expect(output).toContain(
+      `enum MessageType: ${values.map((v) => v.dbValue).join(", ")}`
+    );
+    expect(output).not.toContain("values total");
   });
 
   it("returns 'No matching tables found.' when no tables", () => {
@@ -258,5 +518,92 @@ describe("formatSearchResults", () => {
     const output = formatSearchResults(tables);
 
     expect(output).toContain("(Prisma: legacyId)");
+  });
+
+  describe("hasPrismaMapping: false", () => {
+    it("omits the (no Prisma model) suffix that every table would otherwise carry", () => {
+      const tables = [
+        makeTable({
+          sqlName: "_prisma_migrations",
+          prismaModelName: null,
+          columns: [makeColumn({ sqlName: "id", dataType: "integer" })],
+        }),
+      ];
+
+      const output = formatSearchResults(tables, { hasPrismaMapping: false });
+
+      expect(output).toContain("_prisma_migrations\n");
+      expect(output).not.toContain("(no Prisma model)");
+    });
+
+    it("emits no Prisma text at all across headers and columns", () => {
+      const tables = [
+        makeTable({
+          sqlName: "creators",
+          prismaModelName: "Creator",
+          columns: [
+            makeColumn({ sqlName: "id", dataType: "text" }),
+            makeColumn({
+              sqlName: "legacy_id",
+              dataType: "text",
+              prismaFieldName: "legacyId",
+            }),
+          ],
+        }),
+      ];
+
+      const output = formatSearchResults(tables, { hasPrismaMapping: false });
+
+      expect(output).toContain("creators\n");
+      expect(output).not.toMatch(/prisma/i);
+    });
+
+    it("still emits PK, columns, enums, and FK sections", () => {
+      const tables = [
+        makeTable({
+          sqlName: "collaborations",
+          prismaModelName: "Collaboration",
+          primaryKeys: ["id"],
+          columns: [
+            makeColumn({ sqlName: "id", dataType: "uuid", isPrimaryKey: true }),
+            makeColumn({
+              sqlName: "status",
+              dataType: "USER-DEFINED",
+              udtName: "CollaborationStatus",
+            }),
+          ],
+          outgoingFks: [
+            { toTable: "creators", toColumn: "id", viaColumn: "creatorId" },
+          ],
+          incomingFks: [
+            {
+              fromTable: "invoices",
+              fromColumn: "collaborationId",
+              constraintName: "invoices_collaborationId_fkey",
+              isUnique: false,
+            },
+          ],
+        }),
+      ];
+
+      const enumResolver = (udt: string) =>
+        udt === "CollaborationStatus"
+          ? {
+              values: [{ label: "DRAFT", dbValue: "DRAFT" }],
+              isDbFallback: false,
+            }
+          : null;
+
+      const output = formatSearchResults(tables, {
+        enumResolver,
+        hasPrismaMapping: false,
+      });
+
+      expect(output).toContain("PK: id");
+      expect(output).toContain("[PK]");
+      expect(output).toContain("enum CollaborationStatus: DRAFT");
+      expect(output).toContain("FK out: -> creators.id via creatorId");
+      expect(output).toContain("FK in:  <- invoices");
+    });
   });
 });

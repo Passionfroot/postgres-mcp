@@ -21,13 +21,38 @@ function isEnoent(err: unknown) {
 
 export class SchemaCache {
   private cache = new Map<string, MergedSchema>();
+  /**
+   * introspectDatabase is awaited between the cache miss and the cache.set, so concurrent first
+   * calls for the same database each ran a full introspection. Sharing the in-flight promise makes
+   * it exactly one, and matters most under the HTTP transport where concurrent clients are normal.
+   */
+  private introspecting = new Map<string, Promise<MergedSchema>>();
 
   constructor(private prismaMapping: PrismaMapping) {}
+
+  /**
+   * False when no Prisma schema was configured (or it parsed to nothing). Callers use this to
+   * suppress Prisma annotations and Prisma-specific wording that would be noise without a mapping.
+   */
+  get hasPrismaMapping() {
+    return this.prismaMapping.models.length > 0;
+  }
 
   async get(database: string, pool: pg.Pool, options?: IntrospectOptions): Promise<MergedSchema> {
     const cached = this.cache.get(database);
     if (cached) return cached;
 
+    const inflight = this.introspecting.get(database);
+    if (inflight) return inflight;
+
+    const run = this.introspect(database, pool, options).finally(() =>
+      this.introspecting.delete(database)
+    );
+    this.introspecting.set(database, run);
+    return run;
+  }
+
+  private async introspect(database: string, pool: pg.Pool, options?: IntrospectOptions) {
     logger.debug(`Cache miss for "${database}", introspecting...`);
     const dbMetadata = await introspectDatabase(pool, options);
     const merged = mergeSchemas(this.prismaMapping, dbMetadata);

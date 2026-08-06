@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  // The base config excludes test/, and an inherited exclude wins over this file's include.
+  "exclude": ["node_modules", "dist"]
+}
