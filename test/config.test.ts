@@ -170,6 +170,60 @@ id = "test"
     expect(() => loadConfig(writeTempToml(toml))).toThrow("Invalid config");
   });
 
+  // Zod's error output is what a client actually sees. A major zod bump can change issue shape or
+  // message wording without any TypeScript or existing-test breakage, so these pin the exact text.
+  describe("error message shape", () => {
+    it("keeps the custom message for an empty required string, not a generic type error", () => {
+      const toml = `
+[[sources]]
+id = ""
+dsn = "postgres://localhost/db"
+`;
+      expect(() => loadConfig(writeTempToml(toml))).toThrow(
+        "sources.0.id: Source id is required"
+      );
+    });
+
+    it("reports a clear path and reason for a wrong-typed field, not a garbled dump", () => {
+      const toml = `
+[[sources]]
+id = "test"
+dsn = "postgres://localhost/db"
+max_rows = "not-a-number"
+`;
+      let error: Error | undefined;
+      try {
+        loadConfig(writeTempToml(toml));
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toContain("sources.0.max_rows");
+      expect(error?.message).not.toContain("[object Object]");
+      expect(error?.message).not.toContain("undefined");
+    });
+
+    it("reports the nested key path for an invalid session_vars value", () => {
+      const toml = `
+[[sources]]
+id = "test"
+dsn = "postgres://localhost/db"
+session_vars = { role = 5 }
+`;
+      let error: Error | undefined;
+      try {
+        loadConfig(writeTempToml(toml));
+      } catch (err) {
+        error = err as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toContain("sources.0.session_vars.role");
+      expect(error?.message).not.toContain("[object Object]");
+    });
+  });
+
   it("converts snake_case TOML keys to camelCase in Config", () => {
     const toml = `
 [[sources]]
