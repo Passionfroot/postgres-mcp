@@ -64,6 +64,45 @@ Set `pool_max` explicitly if you want a different ceiling. Sizing it below the n
 
 A source with `session_vars` pins one tenant's identity, such as `app.partner_id`, for the life of the process, and RLS is the only thing enforcing that boundary. One server shared across clients cannot honour a per-process pin, so `--http` refuses to start when any source sets `session_vars`. Use stdio for those.
 
+### Running `--http` as a daemon
+
+`--http` is a long-lived process: start it under whatever supervises long-lived processes on your machine, not in a terminal tab you'll eventually close.
+
+On macOS, a launchd agent. `~/Library/LaunchAgents/com.example.mcp.postgres.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.mcp.postgres</string>
+  <key>ProgramArguments</key>
+  <array><string>/path/to/postgres-mcp-daemon.sh</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/path/to/mcp-postgres.log</string>
+  <key>StandardErrorPath</key><string>/path/to/mcp-postgres.log</string>
+</dict>
+</plist>
+```
+
+`RunAtLoad` starts it on login, `KeepAlive` restarts it if it exits (crash or otherwise), `ThrottleInterval` is the minimum seconds between restarts so a crash loop doesn't spin. A plist is plain text on disk, so it shouldn't contain a token or DSN directly — point it at a wrapper script that resolves secrets at launch instead (see [Secrets](#secrets) below):
+
+```bash
+#!/bin/sh
+# postgres-mcp-daemon.sh
+set -e
+exec op run --env-file="$HOME/.config/postgres-mcp/secrets.env" -- \
+  node /path/to/postgres-mcp/dist/index.js \
+  "$HOME/.config/postgres-mcp/postgres-mcp.toml" \
+  --http --port 7803 --token-file "$HOME/.config/postgres-mcp/http-token"
+```
+
+`launchctl load ~/Library/LaunchAgents/com.example.mcp.postgres.plist` registers it and starts it across reboots. After rebuilding, `launchctl kickstart -k gui/$(id -u)/com.example.mcp.postgres` restarts the process itself; a client that reopens its own connection to the old process will not see the new build until the process restarts. On Linux, a systemd user unit with `Restart=on-failure` and `WantedBy=default.target` covers the same ground.
+
+Each teammate still points their own client at the shared server and needs the token — see the `.mcp.json` example in Setup step 2 below.
+
 ## Setup
 
 ### 1. Create a config file
@@ -91,6 +130,18 @@ allow_multi_statements = true
 
 See [`postgres-mcp.toml.example`](postgres-mcp.toml.example) for the full reference.
 
+#### Secrets
+
+The server has no secrets manager integration built in — `$VAR` and `${VAR}` in `dsn` (or anywhere else in the TOML) are expanded from the process environment at startup, so where those values actually come from is up to whatever launches the server. Resolve them there; don't write a real password into the TOML.
+
+With 1Password, wrap the launch command in `op run` rather than exporting values by hand:
+
+```bash
+op run --env-file=secrets.env -- node dist/index.js postgres-mcp.toml
+```
+
+`secrets.env` holds `op://` references, not values — `DB_USER=op://vault/item/username`, `DB_PASS=op://vault/item/password` — and `op run` resolves them into the child process's environment for the life of that process without ever writing them to disk. Any other way of populating the environment before the server starts works the same way; `op run` is one option, not a requirement of the server itself.
+
 ### 2. Add to `.mcp.json`
 
 ```json
@@ -106,6 +157,24 @@ See [`postgres-mcp.toml.example`](postgres-mcp.toml.example) for the full refere
 ```
 
 Restart Claude Code and the `mcp__postgres__*` tools will be available.
+
+#### Connecting to a shared `--http` server
+
+If someone already runs the server as a daemon (see [Running `--http` as a daemon](#running---http-as-a-daemon) above), point your client at it instead of spawning your own stdio process:
+
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "type": "http",
+      "url": "http://127.0.0.1:7803/mcp",
+      "headers": { "Authorization": "Bearer ${POSTGRES_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+Claude Code expands `${VAR}` in `.mcp.json` the same way the server expands it in the TOML, so the token itself doesn't need to be written into the file either. Omit `headers` if the server was started without a token (loopback-only, trusted-network use).
 
 ### 3. Add a skill (recommended)
 
