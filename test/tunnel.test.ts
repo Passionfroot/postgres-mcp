@@ -39,7 +39,7 @@ vi.mock("ssh2", async () => {
 });
 
 vi.mock("node:net", async (orig) => {
-  const actual = await orig<typeof import("node:net")>();
+  const actual = await orig<typeof import("node:net") & { default: typeof import("node:net") }>();
   const { EventEmitter: EE } = await import("node:events");
   class FakeServer extends EE {
     listen(_port: number, _host: string, cb: () => void) {
@@ -66,7 +66,7 @@ vi.mock("node:net", async (orig) => {
 });
 
 vi.mock("node:fs", async (orig) => {
-  const actual = await orig<typeof import("node:fs")>();
+  const actual = await orig<typeof import("node:fs") & { default: typeof import("node:fs") }>();
   const readFileSync = () => Buffer.from("fake-key");
   return {
     ...actual,

@@ -1,8 +1,19 @@
 import pg from "pg";
 
-import type { DbColumn, DbEnumValue, DbForeignKey, DbMetadata, DbPrimaryKey } from "./types.js";
+import type {
+  DbColumn,
+  DbEnumValue,
+  DbForeignKey,
+  DbMetadata,
+  DbPrimaryKey,
+  DbUniqueColumnSet,
+} from "./types.js";
 
-import { assertSafeGucName, escapeIdentifier, escapeLiteral } from "../sql-helpers.js";
+import {
+  assertSafeGucName,
+  escapeIdentifier,
+  escapeLiteral,
+} from "../sql-helpers.js";
 import { logger } from "../logger.js";
 
 /**
@@ -37,17 +48,83 @@ WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
 ORDER BY tc.table_name, kcu.ordinal_position
 `;
 
+/**
+ * Use pg_constraint instead of information_schema for FK discovery. The information_schema
+ * views (constraint_column_usage) require ownership or REFERENCES privilege on the referenced
+ * table, so roles with only column-level SELECT grants (like zest_mcp_reader) see zero FKs.
+ * pg_constraint is visible to all roles and filtered by has_column_privilege on both the FK
+ * column and the referenced column, so a FK is omitted rather than erroring when the role
+ * lacks privilege on either side.
+ *
+ * Both sides are constrained to schema 'public'. Only relnames are returned, so a FK pointing
+ * at another schema would otherwise be reported against the same-named public table.
+ *
+ * conname is returned so composite FKs stay grouped: a 2-column FK is two rows here, and
+ * without the constraint identity they are indistinguishable from two separate single-column
+ * FKs between the same pair of tables.
+ */
 const FOREIGN_KEYS_QUERY = `
-SELECT kcu.table_name AS from_table, kcu.column_name AS from_column,
-       ccu.table_name AS to_table, ccu.column_name AS to_column
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-JOIN information_schema.constraint_column_usage ccu
-  ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
-WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
-  AND has_column_privilege(format('%I.%I', tc.table_schema, kcu.table_name), kcu.column_name, 'SELECT')
-ORDER BY kcu.table_name, kcu.column_name
+SELECT
+  con.conname AS constraint_name,
+  rel.relname AS from_table,
+  a.attname AS from_column,
+  frel.relname AS to_table,
+  af.attname AS to_column
+FROM pg_constraint con
+JOIN pg_class rel ON rel.oid = con.conrelid
+JOIN pg_class frel ON frel.oid = con.confrelid
+JOIN pg_namespace n ON n.oid = con.connamespace
+JOIN pg_namespace fn ON fn.oid = frel.relnamespace
+JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(conkey, confkey, ord) ON true
+JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = cols.conkey
+JOIN pg_attribute af ON af.attrelid = con.confrelid AND af.attnum = cols.confkey
+WHERE con.contype = 'f' AND n.nspname = 'public' AND fn.nspname = 'public'
+  AND has_column_privilege(con.conrelid, a.attnum, 'SELECT')
+  AND has_column_privilege(con.confrelid, af.attnum, 'SELECT')
+ORDER BY from_table, con.conname, cols.ord
+`;
+
+/**
+ * Enforced uniqueness, one row per unique index with its ordered key columns. Used to
+ * determine FK cardinality: if the FK's column set is unique the relationship is 1:1,
+ * otherwise 1:many. Composite FKs need the whole set, so this returns sets rather than
+ * single columns.
+ *
+ * Sourced from pg_index, not pg_constraint: Prisma emits @unique as a UNIQUE INDEX rather
+ * than a UNIQUE constraint, so constraint-only discovery misses every Prisma 1:1 relation.
+ * pg_index covers both (PKs and UNIQUE constraints are backed by unique indexes too).
+ *
+ * Only indexes that actually enforce uniqueness over a plain column set qualify:
+ * - indisvalid AND indislive: a failed CREATE UNIQUE INDEX CONCURRENTLY leaves indisunique
+ *   set on an index that enforces nothing, so duplicates can exist despite the flag.
+ * - indpred IS NULL: a partial index only constrains the rows matching its predicate.
+ * - all key attnums <> 0: an expression index constrains the expression, not the column.
+ *
+ * Key columns are indkey[0 .. indnkeyatts-1]. indnatts also counts INCLUDE columns (PG11+),
+ * which are payload only and do not widen the uniqueness guarantee.
+ *
+ * attname is cast to text before aggregating: node-postgres has no parser for name[], and
+ * returns it as the raw literal string "{a,b}" instead of an array.
+ */
+const UNIQUE_COLUMN_SETS_QUERY = `
+SELECT
+  rel.relname AS table_name,
+  keys.column_names
+FROM pg_index idx
+JOIN pg_class rel ON rel.oid = idx.indrelid
+JOIN pg_namespace n ON n.oid = rel.relnamespace
+JOIN LATERAL (
+  SELECT array_agg(a.attname::text ORDER BY k.ord) AS column_names,
+         bool_and(k.attnum <> 0) AS all_plain_columns
+  FROM unnest(idx.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+  LEFT JOIN pg_attribute a ON a.attrelid = idx.indrelid AND a.attnum = k.attnum
+  WHERE k.ord <= idx.indnkeyatts
+) keys ON true
+WHERE idx.indisunique AND idx.indisvalid AND idx.indislive
+  AND idx.indpred IS NULL
+  AND keys.all_plain_columns
+  AND n.nspname = 'public'
+ORDER BY table_name, keys.column_names
 `;
 
 const ENUM_VALUES_QUERY = `
@@ -76,6 +153,7 @@ interface PkRow {
 }
 
 interface FkRow {
+  constraint_name: string;
   from_table: string;
   from_column: string;
   to_table: string;
@@ -86,6 +164,11 @@ interface EnumRow {
   enum_name: string;
   enum_value: string;
   sort_order: number;
+}
+
+interface UniqueColumnSetRow {
+  table_name: string;
+  column_names: string[];
 }
 
 export interface IntrospectOptions {
@@ -112,23 +195,32 @@ export async function introspectDatabase(
     return introspectWithSession(pool, options!);
   }
 
-  // pool.query() acquires, runs, and releases a connection per call. Firing all four in parallel
-  // against the default pool_max of 1 queues three of them behind connectionTimeoutMillis instead
+  // pool.query() acquires, runs, and releases a connection per call. Firing all five in parallel
+  // against the default pool_max of 1 queues four of them behind connectionTimeoutMillis instead
   // of running them one after another on the connection that's already idle, so a cold-cache call
   // can fail against a perfectly healthy database. Run them on a single acquired client instead.
   //
   // They must be sequential awaits, not Promise.all on that one client: pg arms each query's
   // client-side query_timeout the moment .query() is called, not when it actually starts executing,
-  // so four queued-but-not-yet-running queries fired via Promise.all still race the same clock and
-  // the later ones can time out before pg has even sent them.
+  // so queued-but-not-yet-running queries fired via Promise.all still race the same clock and the
+  // later ones can time out before pg has even sent them.
   const client = await pool.connect();
   try {
     const columnsResult = await client.query<ColumnRow>(COLUMNS_QUERY);
     const pksResult = await client.query<PkRow>(PRIMARY_KEYS_QUERY);
     const fksResult = await client.query<FkRow>(FOREIGN_KEYS_QUERY);
     const enumsResult = await client.query<EnumRow>(ENUM_VALUES_QUERY);
+    const uniqueResult = await client.query<UniqueColumnSetRow>(
+      UNIQUE_COLUMN_SETS_QUERY
+    );
 
-    return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows);
+    return buildMetadata(
+      columnsResult.rows,
+      pksResult.rows,
+      fksResult.rows,
+      enumsResult.rows,
+      uniqueResult.rows
+    );
   } finally {
     client.release();
   }
@@ -158,14 +250,23 @@ async function introspectWithSession(
 
     // Sequential, not Promise.all: see introspectDatabase above -- pg arms each query's
     // client-side query_timeout when .query() is called, not when it starts executing, so firing
-    // all four at once on one client races the same clock as the earlier queries still ahead of
+    // all five at once on one client races the same clock as the earlier queries still ahead of
     // them in the connection's queue.
     const columnsResult = await client.query<ColumnRow>(COLUMNS_QUERY);
     const pksResult = await client.query<PkRow>(PRIMARY_KEYS_QUERY);
     const fksResult = await client.query<FkRow>(FOREIGN_KEYS_QUERY);
     const enumsResult = await client.query<EnumRow>(ENUM_VALUES_QUERY);
+    const uniqueResult = await client.query<UniqueColumnSetRow>(
+      UNIQUE_COLUMN_SETS_QUERY
+    );
 
-    return buildMetadata(columnsResult.rows, pksResult.rows, fksResult.rows, enumsResult.rows);
+    return buildMetadata(
+      columnsResult.rows,
+      pksResult.rows,
+      fksResult.rows,
+      enumsResult.rows,
+      uniqueResult.rows
+    );
   } catch (err: unknown) {
     // pg's client-side query_timeout rejects the caller but leaves the server still executing on
     // this connection, so it must not go back into the pool.
@@ -188,9 +289,12 @@ async function introspectWithSession(
       // caller: leaking a pinned app.partner_id across callers would defeat RLS.
       discardReason = "failed to reset introspection session state";
       logger.warn("Failed to reset RLS session state; discarding connection", {
-        error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        error:
+          cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
         role: options.role ?? "",
-        sessionVarKeys: options.sessionVars ? Object.keys(options.sessionVars).join(", ") : "",
+        sessionVarKeys: options.sessionVars
+          ? Object.keys(options.sessionVars).join(", ")
+          : "",
       });
     }
     client.release(discardReason ? new Error(discardReason) : undefined);
@@ -201,7 +305,8 @@ function buildMetadata(
   columnRows: ColumnRow[],
   pkRows: PkRow[],
   fkRows: FkRow[],
-  enumRows: EnumRow[]
+  enumRows: EnumRow[],
+  uniqueRows: UniqueColumnSetRow[]
 ): DbMetadata {
   const columns: DbColumn[] = columnRows.map((r) => ({
     tableName: r.table_name,
@@ -220,6 +325,7 @@ function buildMetadata(
   }));
 
   const foreignKeys: DbForeignKey[] = fkRows.map((r) => ({
+    constraintName: r.constraint_name ?? null,
     fromTable: r.from_table,
     fromColumn: r.from_column,
     toTable: r.to_table,
@@ -232,5 +338,25 @@ function buildMetadata(
     sortOrder: r.sort_order,
   }));
 
-  return { columns, primaryKeys, foreignKeys, enumValues };
+  const uniqueColumnSets: DbUniqueColumnSet[] = uniqueRows.map((r) => ({
+    tableName: r.table_name,
+    columnNames: r.column_names,
+  }));
+
+  // Single-column sets are the 1:1 signal for single-column FKs. Kept as a flat
+  // "table.column" set for consumers that only care about that case.
+  const uniqueColumns = new Set(
+    uniqueColumnSets
+      .filter((s) => s.columnNames.length === 1)
+      .map((s) => `${s.tableName}.${s.columnNames[0]}`)
+  );
+
+  return {
+    columns,
+    primaryKeys,
+    foreignKeys,
+    enumValues,
+    uniqueColumns,
+    uniqueColumnSets,
+  };
 }

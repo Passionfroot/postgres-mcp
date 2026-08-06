@@ -47,10 +47,21 @@ export interface DbPrimaryKey {
 }
 
 export interface DbForeignKey {
+  /**
+   * Constraint identity, so the columns of a composite FK stay grouped as one relationship.
+   * null for FKs derived from a Prisma schema without a matching database constraint.
+   */
+  constraintName: string | null;
   fromTable: string;
   fromColumn: string;
   toTable: string;
   toColumn: string;
+}
+
+/** One unique index, as its ordered list of key columns. */
+export interface DbUniqueColumnSet {
+  tableName: string;
+  columnNames: string[];
 }
 
 export interface DbEnumValue {
@@ -64,6 +75,15 @@ export interface DbMetadata {
   primaryKeys: DbPrimaryKey[];
   foreignKeys: DbForeignKey[];
   enumValues: DbEnumValue[];
+  /**
+   * "table.column" entries for columns that are unique on their own. Accepts an array as
+   * well as a Set: this interface is exported, and a Set does not survive a JSON round-trip.
+   * Undefined means uniqueness is unknown, which is not the same as "nothing is unique" —
+   * consumers must not treat it as an empty set.
+   */
+  uniqueColumns?: Set<string> | string[];
+  /** Full unique indexes, needed to decide cardinality for composite FKs. */
+  uniqueColumnSets?: DbUniqueColumnSet[];
 }
 
 export interface DriftWarning {
@@ -82,12 +102,25 @@ export interface MergedColumn {
   isPrimaryKey: boolean;
 }
 
+export interface MergedIncomingFk {
+  fromTable: string;
+  fromColumn: string;
+  /** Groups the columns of a composite FK. null when the FK has no constraint identity. */
+  constraintName: string | null;
+  /**
+   * Whether the referencing side is unique, so the join is 1:1. Same value on every column
+   * of a composite FK, since uniqueness is a property of the column set.
+   * null means unknown: render no cardinality rather than asserting one.
+   */
+  isUnique: boolean | null;
+}
+
 export interface MergedTable {
   sqlName: string;
   prismaModelName: string | null;
   columns: MergedColumn[];
   primaryKeys: string[];
-  incomingFks: { fromTable: string; fromColumn: string }[];
+  incomingFks: MergedIncomingFk[];
   outgoingFks: { toTable: string; toColumn: string; viaColumn: string }[];
   driftWarnings: DriftWarning[];
 }

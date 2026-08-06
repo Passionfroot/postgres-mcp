@@ -24,7 +24,10 @@ const localSource: SourceConfig = {
   maxRows: 100,
   timeout: 10,
   poolMax: 1,
+  poolMaxExplicit: false,
+  maxResponseBytes: 1_000_000,
   allowMultiStatements: false,
+  readOnlyQueries: false,
 };
 
 async function checkDbAvailable() {

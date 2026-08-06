@@ -14,6 +14,23 @@ jobs:
       matrix:
         node-version: [20, 22, 24]
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres_mcp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      POSTGRES_MCP_TEST_DSN: postgresql://postgres:postgres@localhost:5432/postgres_mcp_test
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,4 +44,6 @@ jobs:
 
       - run: npm ci
       - run: npm run build
+      - run: npm run typecheck:test
       - run: npm test -- run
+      - run: npm run intg-test
