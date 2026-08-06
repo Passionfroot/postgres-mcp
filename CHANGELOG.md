@@ -4,6 +4,8 @@
 
 ### Minor Changes
 
+- Add automatic expansion of `SELECT *` and `SELECT t.*` to the caller's actually-accessible columns, using the schema cache's privilege-filtered column list. On a source with column-level security, `SELECT * FROM creators` previously failed with `permission denied` on the first restricted column; it now runs as `SELECT "id", "displayName", ... FROM "creators"`, expanded to only the columns the role can read. Falls back to the original SQL unmodified when the query can't be parsed, isn't a single SELECT, or references a table not in the schema cache.
+
 - Suppress Prisma output automatically when no `prisma_schema_path` is configured, and fix the empty `schema://` resource.
 
   Previously the renderers annotated regardless of whether a mapping had been loaded, so a server with no `prisma_schema_path` tagged every table `(no Prisma model)`, advertised `search_objects` as searchable "by Prisma model name", and described `schema://` as showing Prisma model names — all of it noise for a consumer that only writes SQL.
@@ -43,6 +45,10 @@
 - Annotate incoming foreign keys in `search_objects` and `schema://` with join cardinality (`[1:1]` or `[1:many]`), and the columns they join on. A table with any `[1:many]` incoming FK gets a fan-out warning recommending a subquery, `LATERAL JOIN`, or `DISTINCT ON`. The foreign-key query that backs this is now ordered by constraint and declared column position instead of alphabetically, and checks `SELECT` privilege on the referenced column as well as the referencing one, so a restricted role (e.g. `zest_mcp_reader`) no longer gets a permission-denied error introspecting a table it can otherwise read.
 
 ### Patch Changes
+
+- Fix schema introspection returning columns the connected role cannot actually query. `information_schema.columns` returns every column the role has any privilege on, including columns visible only through an inherited REFERENCES grant from a foreign key, not just SELECT — so `search_objects` advertised columns that failed with `permission denied` when queried. Introspection now checks `has_column_privilege(..., 'SELECT')` (and `has_table_privilege` for the PK/FK queries), and applies a source's configured `role`/`session_vars` before introspecting, so the schema reflects the same effective permissions as query execution rather than the connecting role's raw grants.
+
+- Fix `timestamp` and `date` columns, including their array variants, coming back shifted by the server's local UTC offset. These types carry no time zone, but pg's default parser reads them as local time and JSON serialization re-emits that as a UTC instant, so a stored `2026-07-02 11:43:00` came back as `2026-07-02T09:43:00.000Z` on a UTC+2 machine, and plain dates could shift a whole calendar day. `timestamptz` was unaffected. Both types are now returned as the literal string PostgreSQL sent, with no time zone conversion applied.
 
 - Fix `executeQuery` throwing a `TypeError` on multi-statement result sets. node-postgres returns an array of results, one per statement, whenever the server executed more than one command; `executeQuery` read `.rows` off it as if it were a single result. It now returns the batch's last row-returning result, so `BEGIN; SELECT ...; COMMIT` and `SET x; SELECT y` come back with the SELECT rather than with the trailing `COMMIT` or the leading `SET`. `max_rows` is pushed onto that statement as a `LIMIT` where the batch survives a parse and re-print, so the server stops producing rows instead of sending them all across the wire to be sliced here.
 

@@ -99,7 +99,7 @@ exec op run --env-file="$HOME/.config/postgres-mcp/secrets.env" -- \
   --http --port 7803 --token-file "$HOME/.config/postgres-mcp/http-token"
 ```
 
-`launchctl load ~/Library/LaunchAgents/com.example.mcp.postgres.plist` registers it (also across reboots); after rebuilding the server, `launchctl kickstart -k gui/$(id -u)/com.example.mcp.postgres` force-restarts it so it picks up the new build — reconnecting a client (`/mcp` in Claude Code) only reopens the client's connection, it does not restart the server process. On Linux, a systemd user unit with `Restart=on-failure` and `WantedBy=default.target` covers the same ground.
+`launchctl load ~/Library/LaunchAgents/com.example.mcp.postgres.plist` registers it and starts it across reboots. After rebuilding, `launchctl kickstart -k gui/$(id -u)/com.example.mcp.postgres` restarts the process itself; a client that reopens its own connection to the old process will not see the new build until the process restarts. On Linux, a systemd user unit with `Restart=on-failure` and `WantedBy=default.target` covers the same ground.
 
 Each teammate still points their own client at the shared server and needs the token — see the `.mcp.json` example in Setup step 2 below.
 
