@@ -28,7 +28,7 @@
     "node-sql-parser": "^5.4.0",
     "pg": "^8.22.0",
     "postgres-array": "^3.0.4",
-    "smol-toml": "^1.6.1",
+    "smol-toml": "^1.7.1",
     "ssh2": "^1.17.0",
     "zod": "^4.4.3"
   },
