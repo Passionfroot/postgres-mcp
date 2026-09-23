@@ -3,12 +3,20 @@ import fs from "node:fs";
 export const DEFAULT_PORT = 7803;
 export const DEFAULT_HOST = "127.0.0.1";
 
+/**
+ * Holds a path, which is what a variable named after a config already means to anyone who has
+ * only ever passed this server a path. The TOML itself goes in CONFIG_TOML_ENV_VAR instead, so
+ * neither variable has to be guessed at from its value.
+ */
+export const CONFIG_PATH_ENV_VAR = "POSTGRES_MCP_CONFIG";
+export const CONFIG_TOML_ENV_VAR = "POSTGRES_MCP_CONFIG_TOML";
+
 export function printUsage() {
   console.error("Usage: postgres-mcp [config-file] [options]");
-  console.error("  config-file        Path to TOML configuration file. Omit it to configure");
-  console.error(`                     through ${CONFIG_ENV_VAR}, which holds the TOML itself,`);
-  console.error("                     for clients that can set an environment variable but");
-  console.error("                     have nowhere to put a file.");
+  console.error("  config-file        Path to TOML configuration file. Omit it and the config");
+  console.error(`                     comes from ${CONFIG_TOML_ENV_VAR}, which holds the TOML`);
+  console.error(`                     document itself, or from ${CONFIG_PATH_ENV_VAR}, which`);
+  console.error("                     holds a path. An argument wins over both.");
   console.error("");
   console.error("Options:");
   console.error("  --stdio            Serve over stdio, one process per client (default)");
@@ -25,11 +33,11 @@ export function printUsage() {
   console.error("a per-client one. Sources that do not set it get a larger default in HTTP mode.");
 }
 
-export const CONFIG_ENV_VAR = "POSTGRES_MCP_CONFIG";
+/** Where the config text comes from, resolved once so nothing downstream re-reads the environment. */
+export type ConfigSource = { kind: "file"; path: string } | { kind: "inline"; toml: string };
 
 export interface ParsedArgs {
-  /** Undefined when the config comes from POSTGRES_MCP_CONFIG instead of a file. */
-  configPath: string | undefined;
+  configSource: ConfigSource;
   useHttp: boolean;
   host: string;
   port: number;
@@ -60,13 +68,31 @@ export function parseArgs(argv: string[]): ParsedArgs | undefined {
     } else positional.push(arg);
   }
 
-  // A path wins over the environment: an explicit argument is the more deliberate of the two.
-  const configPath = positional[0];
-  if (!configPath && !process.env[CONFIG_ENV_VAR]?.trim()) return undefined;
+  const configSource = resolveConfigSource(positional[0]);
+  if (!configSource) return undefined;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     console.error(`Invalid port: ${port}`);
     return undefined;
   }
 
-  return { configPath, useHttp, host, port, token };
+  return { configSource, useHttp, host, port, token };
+}
+
+/**
+ * An argument wins over both variables, being the more deliberate of the two, and inline TOML wins
+ * over the path variable, since a TOML document cannot have been meant as a path. An argument that
+ * is present but empty (a wrapper interpolating an unset shell variable) counts as absent, the way
+ * it did when a missing path was the only thing that printed usage.
+ */
+function resolveConfigSource(positionalPath: string | undefined): ConfigSource | undefined {
+  const path = positionalPath?.trim();
+  if (path) return { kind: "file", path };
+
+  const toml = process.env[CONFIG_TOML_ENV_VAR]?.trim();
+  if (toml) return { kind: "inline", toml };
+
+  const pathFromEnv = process.env[CONFIG_PATH_ENV_VAR]?.trim();
+  if (pathFromEnv) return { kind: "file", path: pathFromEnv };
+
+  return undefined;
 }

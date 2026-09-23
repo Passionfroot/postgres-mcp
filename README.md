@@ -36,6 +36,8 @@ stdio is the default: one process per client, which is what the per-tenant setup
 | `--token <secret>` | none | Require `Authorization: Bearer <secret>`. `POSTGRES_MCP_TOKEN` |
 | `--token-file <path>` | none | Read the token from a file |
 
+The config comes from the positional `config-file` argument, or from `POSTGRES_MCP_CONFIG_TOML` (the TOML itself) or `POSTGRES_MCP_CONFIG` (a path) when that argument is omitted. See [No file to point at](#no-file-to-point-at).
+
 An unknown flag is warned about and ignored rather than refused, so a pinned consumer passing a flag an older build ignored still starts.
 
 ### What is shared, and what that costs
@@ -132,33 +134,28 @@ See [`postgres-mcp.toml.example`](postgres-mcp.toml.example) for the full refere
 
 #### No file to point at
 
-Some hosts let you set the start command and an environment variable but give you nowhere to put a
-file: a hosted agent sandbox, a container with no mounted volume. Set `POSTGRES_MCP_CONFIG` to the
-TOML itself and omit the path:
+`POSTGRES_MCP_CONFIG_TOML` holds the TOML document itself, not a path to one. Set it and omit the
+path argument, for a host that lets you set a start command and environment variables but gives you
+nowhere to write a file:
 
 ```bash
-POSTGRES_MCP_CONFIG='sources = [{ id = "staging", dsn = "${STAGING_DSN}", readonly = true, read_only_queries = true }]' \
+POSTGRES_MCP_CONFIG_TOML='sources = [{ id = "staging", dsn = "${STAGING_DSN}", readonly = true, read_only_queries = true }]' \
   npx -y @passionfroot/postgres-mcp
 ```
 
-TOML's inline-array form keeps that on one line, which matters because several of those hosts strip
-newlines out of a value. A config path passed as an argument wins over the variable, so a machine
-that has a file keeps using it.
+TOML's inline-array form keeps that on one line, which several such hosts need because they strip
+newlines out of a value.
 
-`$VAR` and `${VAR}` inside the config are still expanded from the environment at startup, so the DSN
-stays a separate variable and the config itself holds no password.
+`POSTGRES_MCP_CONFIG` holds a path, for the same case where the file exists but the command line is
+fixed. A path argument wins over both variables, and `POSTGRES_MCP_CONFIG_TOML` wins over
+`POSTGRES_MCP_CONFIG`.
 
-#### Secrets
+Starting with no path argument at all used to print usage and exit 1. It now starts if either
+variable is set, so a wrapper that loses its path argument comes up on whatever the environment
+holds rather than failing loudly. The startup log's first line names the config it loaded.
 
-The server has no secrets manager integration built in — `$VAR` and `${VAR}` in `dsn` (or anywhere else in the TOML) are expanded from the process environment at startup, so where those values actually come from is up to whatever launches the server. Resolve them there; don't write a real password into the TOML.
-
-With 1Password, wrap the launch command in `op run` rather than exporting values by hand:
-
-```bash
-op run --env-file=secrets.env -- node dist/index.js postgres-mcp.toml
-```
-
-`secrets.env` holds `op://` references, not values — `DB_USER=op://vault/item/username`, `DB_PASS=op://vault/item/password` — and `op run` resolves them into the child process's environment for the life of that process without ever writing them to disk. Any other way of populating the environment before the server starts works the same way; `op run` is one option, not a requirement of the server itself.
+`$VAR` and `${VAR}` in a `dsn` are still expanded from the environment at startup, so the password
+stays in its own variable and the config itself holds only the reference.
 
 ### 2. Add to `.mcp.json`
 

@@ -117,7 +117,9 @@ export function parseConfig(content: string, origin: string): Config {
     parsed = parseToml(content);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to parse TOML in "${origin}": ${message}`);
+    // smol-toml quotes the offending line back, which puts a dsn's password in the log of
+    // whatever started the server. Keep the reason and the position, drop the quoted source.
+    throw new Error(`Failed to parse TOML in "${origin}": ${message.split("\n")[0]}`);
   }
 
   const result = configSchema.safeParse(parsed);
@@ -128,13 +130,20 @@ export function parseConfig(content: string, origin: string): Config {
     throw new Error(`Invalid config in "${origin}":\n${issues}`);
   }
 
-  const sources = result.data.sources.map(toSourceConfig);
-  const prismaSchemaPath = result.data.prisma_schema_path
-    ? expandTilde(result.data.prisma_schema_path)
-    : undefined;
-  const auditLog = result.data.audit_log ? toAuditLogConfig(result.data.audit_log) : undefined;
+  try {
+    const sources = result.data.sources.map(toSourceConfig);
+    const prismaSchemaPath = result.data.prisma_schema_path
+      ? expandTilde(result.data.prisma_schema_path)
+      : undefined;
+    const auditLog = result.data.audit_log ? toAuditLogConfig(result.data.audit_log) : undefined;
 
-  return { sources, prismaSchemaPath, auditLog };
+    return { sources, prismaSchemaPath, auditLog };
+  } catch (err) {
+    // An unset ${VAR} in a dsn is the likeliest failure here, and its own message says nothing
+    // about which config referenced it.
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Invalid config in "${origin}": ${message}`);
+  }
 }
 
 export function loadConfig(filePath: string): Config {

@@ -3,7 +3,7 @@ process.env.NODE_NO_WARNINGS = "1";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-import { CONFIG_ENV_VAR, parseArgs, printUsage } from "./args.js";
+import { CONFIG_TOML_ENV_VAR, parseArgs, printUsage } from "./args.js";
 import { createAuditLog } from "./audit-log.js";
 import { applyHttpPoolDefaults, loadConfig, parseConfig } from "./config.js";
 import { ConnectionManager } from "./connections.js";
@@ -45,11 +45,14 @@ async function main() {
     process.exit(1);
   }
 
-  const configOrigin = args.configPath ?? CONFIG_ENV_VAR;
-  logger.info(`Loading config from ${configOrigin}`);
-  let config = args.configPath
-    ? loadConfig(args.configPath)
-    : parseConfig(process.env[CONFIG_ENV_VAR] ?? "", CONFIG_ENV_VAR);
+  const { configSource } = args;
+  logger.info(
+    `Loading config from ${configSource.kind === "file" ? configSource.path : CONFIG_TOML_ENV_VAR}`
+  );
+  let config =
+    configSource.kind === "file"
+      ? loadConfig(configSource.path)
+      : parseConfig(configSource.toml, CONFIG_TOML_ENV_VAR);
   logger.info(
     `Loaded ${config.sources.length} source(s): ${config.sources.map((s) => s.id).join(", ")}`
   );

@@ -4,7 +4,13 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_HOST, DEFAULT_PORT, parseArgs } from "../src/args.js";
+import {
+  CONFIG_PATH_ENV_VAR,
+  CONFIG_TOML_ENV_VAR,
+  DEFAULT_HOST,
+  DEFAULT_PORT,
+  parseArgs,
+} from "../src/args.js";
 
 beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -12,6 +18,7 @@ beforeEach(() => {
   delete process.env.POSTGRES_MCP_PORT;
   delete process.env.POSTGRES_MCP_TOKEN;
   delete process.env.POSTGRES_MCP_CONFIG;
+  delete process.env.POSTGRES_MCP_CONFIG_TOML;
 });
 
 afterEach(() => {
@@ -21,7 +28,7 @@ afterEach(() => {
 describe("parseArgs", () => {
   it("defaults to stdio on the default host and port", () => {
     expect(parseArgs(["cfg.toml"])).toEqual({
-      configPath: "cfg.toml",
+      configSource: { kind: "file", path: "cfg.toml" },
       useHttp: false,
       host: DEFAULT_HOST,
       port: DEFAULT_PORT,
@@ -31,7 +38,7 @@ describe("parseArgs", () => {
 
   it("reads the http flags", () => {
     expect(parseArgs(["cfg.toml", "--http", "--port", "9999", "--host", "::1", "--token", "s"])).toEqual({
-      configPath: "cfg.toml",
+      configSource: { kind: "file", path: "cfg.toml" },
       useHttp: true,
       host: "::1",
       port: 9999,
@@ -45,7 +52,7 @@ describe("parseArgs", () => {
     const args = parseArgs(["cfg.toml", "--verbose"]);
 
     expect(args).toBeDefined();
-    expect(args?.configPath).toBe("cfg.toml");
+    expect(args?.configSource).toEqual({ kind: "file", path: "cfg.toml" });
   });
 
   it("still refuses a missing config path, --help and a bad port", () => {
@@ -67,35 +74,47 @@ describe("parseArgs", () => {
   });
 });
 
-describe("parseArgs with POSTGRES_MCP_CONFIG", () => {
-  it("accepts no config path when the config is in the environment", () => {
-    process.env.POSTGRES_MCP_CONFIG = '[[sources]]\nid = "s"\ndsn = "postgres://h/d"';
-    expect(parseArgs([])).toEqual({
-      configPath: undefined,
-      useHttp: false,
-      host: DEFAULT_HOST,
-      port: DEFAULT_PORT,
-      token: undefined,
-    });
+const TOML = 'sources = [{ id = "s", dsn = "postgres://h/d" }]';
+
+describe("parseArgs config source", () => {
+  it("takes a positional path as a file source", () => {
+    expect(parseArgs(["cfg.toml"])?.configSource).toEqual({ kind: "file", path: "cfg.toml" });
   });
 
-  it("still takes a config path over the environment, so an explicit file wins", () => {
-    process.env.POSTGRES_MCP_CONFIG = '[[sources]]\nid = "s"\ndsn = "postgres://h/d"';
-    expect(parseArgs(["cfg.toml"])?.configPath).toBe("cfg.toml");
+  it(`reads the TOML itself out of ${CONFIG_TOML_ENV_VAR}`, () => {
+    process.env[CONFIG_TOML_ENV_VAR] = TOML;
+    expect(parseArgs([])?.configSource).toEqual({ kind: "inline", toml: TOML });
   });
 
-  it("rejects an empty POSTGRES_MCP_CONFIG rather than starting with no sources", () => {
-    process.env.POSTGRES_MCP_CONFIG = "   ";
+  it(`reads a path out of ${CONFIG_PATH_ENV_VAR}, which named a path before it named anything here`, () => {
+    process.env[CONFIG_PATH_ENV_VAR] = "/etc/postgres-mcp.toml";
+    expect(parseArgs([])?.configSource).toEqual({ kind: "file", path: "/etc/postgres-mcp.toml" });
+  });
+
+  it("takes the positional path over either variable", () => {
+    process.env[CONFIG_TOML_ENV_VAR] = TOML;
+    process.env[CONFIG_PATH_ENV_VAR] = "/etc/postgres-mcp.toml";
+    expect(parseArgs(["cfg.toml"])?.configSource).toEqual({ kind: "file", path: "cfg.toml" });
+  });
+
+  it("takes the inline TOML over the path variable, since it cannot have been meant as a path", () => {
+    process.env[CONFIG_TOML_ENV_VAR] = TOML;
+    process.env[CONFIG_PATH_ENV_VAR] = "/etc/postgres-mcp.toml";
+    expect(parseArgs([])?.configSource).toEqual({ kind: "inline", toml: TOML });
+  });
+
+  it("ignores a whitespace-only variable rather than starting with no sources", () => {
+    process.env[CONFIG_TOML_ENV_VAR] = "   ";
+    process.env[CONFIG_PATH_ENV_VAR] = "  ";
     expect(parseArgs([])).toBeUndefined();
   });
 
   it("reads the http flags with no positional argument", () => {
-    process.env.POSTGRES_MCP_CONFIG = '[[sources]]\nid = "s"\ndsn = "postgres://h/d"';
+    process.env[CONFIG_TOML_ENV_VAR] = TOML;
     expect(parseArgs(["--http", "--port", "9999"])).toMatchObject({
-      configPath: undefined,
+      configSource: { kind: "inline", toml: TOML },
       useHttp: true,
       port: 9999,
     });
   });
 });
-

@@ -451,7 +451,7 @@ id = "staging"
 dsn = "postgres://user:pass@host:5432/db"
 readonly = true
 `,
-      "POSTGRES_MCP_CONFIG"
+      "POSTGRES_MCP_CONFIG_TOML"
     );
     expect(config.sources).toHaveLength(1);
     expect(config.sources[0].id).toBe("staging");
@@ -485,9 +485,41 @@ dsn = "\${TEST_PARSE_CONFIG_DSN}"
   });
 
   it("names the origin in a parse error, so the message points at the env var not a path", () => {
-    expect(() => parseConfig("this is not toml =", "POSTGRES_MCP_CONFIG")).toThrow(
-      /POSTGRES_MCP_CONFIG/
+    expect(() => parseConfig("this is not toml =", "POSTGRES_MCP_CONFIG_TOML")).toThrow(
+      /POSTGRES_MCP_CONFIG_TOML/
     );
+  });
+
+  it("keeps the offending config out of a parse error, since an inline config can hold a password", () => {
+    const withPassword = 'sources = [{ id = "s", dsn = "postgres://u:hunter2@h/d" }';
+
+    expect(() => parseConfig(withPassword, "POSTGRES_MCP_CONFIG_TOML")).toThrow(
+      /POSTGRES_MCP_CONFIG_TOML/
+    );
+    try {
+      parseConfig(withPassword, "POSTGRES_MCP_CONFIG_TOML");
+    } catch (err) {
+      expect(String(err)).not.toContain("hunter2");
+    }
+  });
+
+  it("keeps the file's own content out of a parse error too", () => {
+    const filePath = writeTempToml('sources = [{ id = "s", dsn = "postgres://u:hunter2@h/d" }');
+
+    try {
+      loadConfig(filePath);
+    } catch (err) {
+      expect(String(err)).not.toContain("hunter2");
+      expect(String(err)).toContain(filePath);
+    }
+  });
+
+  it("names the origin when an env var referenced by the config is unset", () => {
+    delete process.env.PF_DEFINITELY_UNSET;
+
+    expect(() =>
+      parseConfig('sources = [{ id = "s", dsn = "${PF_DEFINITELY_UNSET}" }]', "POSTGRES_MCP_CONFIG_TOML")
+    ).toThrow(/POSTGRES_MCP_CONFIG_TOML/);
   });
 
   it("names the origin when the config has no sources", () => {
