@@ -109,6 +109,10 @@ describe("parseArgs config source", () => {
     expect(parseArgs([])).toBeUndefined();
   });
 
+  it("ignores a whitespace-only argument, which is a wrapper interpolating an unset variable", () => {
+    expect(parseArgs(["   "])).toBeUndefined();
+  });
+
   it("reads the http flags with no positional argument", () => {
     process.env[CONFIG_TOML_ENV_VAR] = TOML;
     expect(parseArgs(["--http", "--port", "9999"])).toMatchObject({

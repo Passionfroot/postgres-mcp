@@ -4,7 +4,10 @@ import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
 
+import type { ConfigSource } from "./args.js";
 import type { AuditLogConfig, Config, SourceConfig } from "./types.js";
+
+import { CONFIG_TOML_ENV_VAR } from "./args.js";
 
 import { logger } from "./logger.js";
 
@@ -183,3 +186,15 @@ export function applyHttpPoolDefaults(config: Config): Config {
 
   return { ...config, sources };
 }
+
+/** What a message about this config should call it: the file it came from, or the variable. */
+export function configOrigin(source: ConfigSource): string {
+  return source.kind === "file" ? source.path : CONFIG_TOML_ENV_VAR;
+}
+
+export function loadFromSource(source: ConfigSource): Config {
+  return source.kind === "file"
+    ? loadConfig(source.path)
+    : parseConfig(source.toml, CONFIG_TOML_ENV_VAR);
+}
+

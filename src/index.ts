@@ -3,9 +3,9 @@ process.env.NODE_NO_WARNINGS = "1";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-import { CONFIG_TOML_ENV_VAR, parseArgs, printUsage } from "./args.js";
+import { parseArgs, printUsage } from "./args.js";
 import { createAuditLog } from "./audit-log.js";
-import { applyHttpPoolDefaults, loadConfig, parseConfig } from "./config.js";
+import { applyHttpPoolDefaults, configOrigin, loadFromSource } from "./config.js";
 import { ConnectionManager } from "./connections.js";
 import { startHttpServer } from "./http.js";
 import { logger } from "./logger.js";
@@ -45,14 +45,8 @@ async function main() {
     process.exit(1);
   }
 
-  const { configSource } = args;
-  logger.info(
-    `Loading config from ${configSource.kind === "file" ? configSource.path : CONFIG_TOML_ENV_VAR}`
-  );
-  let config =
-    configSource.kind === "file"
-      ? loadConfig(configSource.path)
-      : parseConfig(configSource.toml, CONFIG_TOML_ENV_VAR);
+  logger.info(`Loading config from ${configOrigin(args.configSource)}`);
+  let config = loadFromSource(args.configSource);
   logger.info(
     `Loaded ${config.sources.length} source(s): ${config.sources.map((s) => s.id).join(", ")}`
   );

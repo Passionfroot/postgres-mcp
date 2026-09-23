@@ -6,7 +6,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   HTTP_DEFAULT_POOL_MAX,
   applyHttpPoolDefaults,
+  configOrigin,
   loadConfig,
+  loadFromSource,
   parseConfig,
 } from "../src/config.js";
 
@@ -528,3 +530,62 @@ dsn = "\${TEST_PARSE_CONFIG_DSN}"
     );
   });
 });
+
+describe("tilde expansion outside a source", () => {
+  it("expands ~ in audit_log.log_file, so the log does not land in a literal ~ directory", () => {
+    const config = parseConfig(
+      `[[sources]]
+id = "s"
+dsn = "postgres://h/d"
+
+[audit_log]
+log_file = "~/logs/pg.log"
+`,
+      "POSTGRES_MCP_CONFIG_TOML"
+    );
+
+    expect(config.auditLog?.logFile).not.toContain("~");
+    expect(config.auditLog?.logFile).toContain("logs/pg.log");
+  });
+
+  it("expands ~ in prisma_schema_path", () => {
+    const config = parseConfig(
+      `prisma_schema_path = "~/app/schema.prisma"
+
+[[sources]]
+id = "s"
+dsn = "postgres://h/d"
+`,
+      "POSTGRES_MCP_CONFIG_TOML"
+    );
+
+    expect(config.prismaSchemaPath).not.toContain("~");
+    expect(config.prismaSchemaPath).toContain("app/schema.prisma");
+  });
+});
+
+describe("loadFromSource", () => {
+  const INLINE = 'sources = [{ id = "from-inline", dsn = "postgres://h/d" }]';
+
+  it("reads a file source off disk", () => {
+    const filePath = writeTempToml('sources = [{ id = "from-file", dsn = "postgres://h/d" }]');
+
+    expect(loadFromSource({ kind: "file", path: filePath }).sources[0].id).toBe("from-file");
+  });
+
+  it("parses an inline source without touching the filesystem", () => {
+    expect(loadFromSource({ kind: "inline", toml: INLINE }).sources[0].id).toBe("from-inline");
+  });
+
+  it("does not hand a file source's path to the TOML parser", () => {
+    const filePath = writeTempToml('sources = [{ id = "from-file", dsn = "postgres://h/d" }]');
+
+    expect(() => loadFromSource({ kind: "inline", toml: filePath })).toThrow(/Failed to parse TOML/);
+  });
+
+  it("names the config a message should point at", () => {
+    expect(configOrigin({ kind: "file", path: "/etc/pg.toml" })).toBe("/etc/pg.toml");
+    expect(configOrigin({ kind: "inline", toml: INLINE })).toBe("POSTGRES_MCP_CONFIG_TOML");
+  });
+});
+
