@@ -130,6 +130,24 @@ allow_multi_statements = true
 
 See [`postgres-mcp.toml.example`](postgres-mcp.toml.example) for the full reference.
 
+#### No file to point at
+
+Some hosts let you set the start command and an environment variable but give you nowhere to put a
+file: a hosted agent sandbox, a container with no mounted volume. Set `POSTGRES_MCP_CONFIG` to the
+TOML itself and omit the path:
+
+```bash
+POSTGRES_MCP_CONFIG='sources = [{ id = "staging", dsn = "${STAGING_DSN}", readonly = true, read_only_queries = true }]' \
+  npx -y @passionfroot/postgres-mcp
+```
+
+TOML's inline-array form keeps that on one line, which matters because several of those hosts strip
+newlines out of a value. A config path passed as an argument wins over the variable, so a machine
+that has a file keeps using it.
+
+`$VAR` and `${VAR}` inside the config are still expanded from the environment at startup, so the DSN
+stays a separate variable and the config itself holds no password.
+
 #### Secrets
 
 The server has no secrets manager integration built in — `$VAR` and `${VAR}` in `dsn` (or anywhere else in the TOML) are expanded from the process environment at startup, so where those values actually come from is up to whatever launches the server. Resolve them there; don't write a real password into the TOML.

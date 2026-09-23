@@ -11,6 +11,7 @@ beforeEach(() => {
   delete process.env.POSTGRES_MCP_HOST;
   delete process.env.POSTGRES_MCP_PORT;
   delete process.env.POSTGRES_MCP_TOKEN;
+  delete process.env.POSTGRES_MCP_CONFIG;
 });
 
 afterEach(() => {
@@ -65,3 +66,36 @@ describe("parseArgs", () => {
     }
   });
 });
+
+describe("parseArgs with POSTGRES_MCP_CONFIG", () => {
+  it("accepts no config path when the config is in the environment", () => {
+    process.env.POSTGRES_MCP_CONFIG = '[[sources]]\nid = "s"\ndsn = "postgres://h/d"';
+    expect(parseArgs([])).toEqual({
+      configPath: undefined,
+      useHttp: false,
+      host: DEFAULT_HOST,
+      port: DEFAULT_PORT,
+      token: undefined,
+    });
+  });
+
+  it("still takes a config path over the environment, so an explicit file wins", () => {
+    process.env.POSTGRES_MCP_CONFIG = '[[sources]]\nid = "s"\ndsn = "postgres://h/d"';
+    expect(parseArgs(["cfg.toml"])?.configPath).toBe("cfg.toml");
+  });
+
+  it("rejects an empty POSTGRES_MCP_CONFIG rather than starting with no sources", () => {
+    process.env.POSTGRES_MCP_CONFIG = "   ";
+    expect(parseArgs([])).toBeUndefined();
+  });
+
+  it("reads the http flags with no positional argument", () => {
+    process.env.POSTGRES_MCP_CONFIG = '[[sources]]\nid = "s"\ndsn = "postgres://h/d"';
+    expect(parseArgs(["--http", "--port", "9999"])).toMatchObject({
+      configPath: undefined,
+      useHttp: true,
+      port: 9999,
+    });
+  });
+});
+

@@ -3,9 +3,9 @@ process.env.NODE_NO_WARNINGS = "1";
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-import { parseArgs, printUsage } from "./args.js";
+import { CONFIG_ENV_VAR, parseArgs, printUsage } from "./args.js";
 import { createAuditLog } from "./audit-log.js";
-import { applyHttpPoolDefaults, loadConfig } from "./config.js";
+import { applyHttpPoolDefaults, loadConfig, parseConfig } from "./config.js";
 import { ConnectionManager } from "./connections.js";
 import { startHttpServer } from "./http.js";
 import { logger } from "./logger.js";
@@ -45,8 +45,11 @@ async function main() {
     process.exit(1);
   }
 
-  logger.info(`Loading config from ${args.configPath}`);
-  let config = loadConfig(args.configPath);
+  const configOrigin = args.configPath ?? CONFIG_ENV_VAR;
+  logger.info(`Loading config from ${configOrigin}`);
+  let config = args.configPath
+    ? loadConfig(args.configPath)
+    : parseConfig(process.env[CONFIG_ENV_VAR] ?? "", CONFIG_ENV_VAR);
   logger.info(
     `Loaded ${config.sources.length} source(s): ${config.sources.map((s) => s.id).join(", ")}`
   );

@@ -106,21 +106,18 @@ function toAuditLogConfig(raw: z.infer<typeof auditLogSchema>): AuditLogConfig {
   };
 }
 
-export function loadConfig(filePath: string): Config {
-  let content: string;
-  try {
-    content = fs.readFileSync(filePath, "utf-8");
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to read config file "${filePath}": ${message}`);
-  }
-
+/**
+ * Parses config text that is already in hand. `origin` is whatever the caller wants named in an
+ * error message, a file path or an env var, since the reader has no other way to tell where a
+ * broken config came from.
+ */
+export function parseConfig(content: string, origin: string): Config {
   let parsed: unknown;
   try {
     parsed = parseToml(content);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to parse TOML in "${filePath}": ${message}`);
+    throw new Error(`Failed to parse TOML in "${origin}": ${message}`);
   }
 
   const result = configSchema.safeParse(parsed);
@@ -128,7 +125,7 @@ export function loadConfig(filePath: string): Config {
     const issues = result.error.issues
       .map((i) => `  - ${i.path.join(".")}: ${i.message}`)
       .join("\n");
-    throw new Error(`Invalid config in "${filePath}":\n${issues}`);
+    throw new Error(`Invalid config in "${origin}":\n${issues}`);
   }
 
   const sources = result.data.sources.map(toSourceConfig);
@@ -138,6 +135,18 @@ export function loadConfig(filePath: string): Config {
   const auditLog = result.data.audit_log ? toAuditLogConfig(result.data.audit_log) : undefined;
 
   return { sources, prismaSchemaPath, auditLog };
+}
+
+export function loadConfig(filePath: string): Config {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, "utf-8");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to read config file "${filePath}": ${message}`);
+  }
+
+  return parseConfig(content, filePath);
 }
 
 /**

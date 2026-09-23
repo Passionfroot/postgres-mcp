@@ -4,8 +4,11 @@ export const DEFAULT_PORT = 7803;
 export const DEFAULT_HOST = "127.0.0.1";
 
 export function printUsage() {
-  console.error("Usage: postgres-mcp <config-file> [options]");
-  console.error("  config-file        Path to TOML configuration file");
+  console.error("Usage: postgres-mcp [config-file] [options]");
+  console.error("  config-file        Path to TOML configuration file. Omit it to configure");
+  console.error(`                     through ${CONFIG_ENV_VAR}, which holds the TOML itself,`);
+  console.error("                     for clients that can set an environment variable but");
+  console.error("                     have nowhere to put a file.");
   console.error("");
   console.error("Options:");
   console.error("  --stdio            Serve over stdio, one process per client (default)");
@@ -22,8 +25,11 @@ export function printUsage() {
   console.error("a per-client one. Sources that do not set it get a larger default in HTTP mode.");
 }
 
+export const CONFIG_ENV_VAR = "POSTGRES_MCP_CONFIG";
+
 export interface ParsedArgs {
-  configPath: string;
+  /** Undefined when the config comes from POSTGRES_MCP_CONFIG instead of a file. */
+  configPath: string | undefined;
   useHttp: boolean;
   host: string;
   port: number;
@@ -54,8 +60,9 @@ export function parseArgs(argv: string[]): ParsedArgs | undefined {
     } else positional.push(arg);
   }
 
+  // A path wins over the environment: an explicit argument is the more deliberate of the two.
   const configPath = positional[0];
-  if (!configPath) return undefined;
+  if (!configPath && !process.env[CONFIG_ENV_VAR]?.trim()) return undefined;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     console.error(`Invalid port: ${port}`);
     return undefined;

@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { HTTP_DEFAULT_POOL_MAX, applyHttpPoolDefaults, loadConfig } from "../src/config.js";
+import {
+  HTTP_DEFAULT_POOL_MAX,
+  applyHttpPoolDefaults,
+  loadConfig,
+  parseConfig,
+} from "../src/config.js";
 
 const tmpDir = os.tmpdir();
 const createdFiles: string[] = [];
@@ -435,5 +440,59 @@ max_response_bytes = 250000
     const config = loadConfig(writeTempToml(toml));
 
     expect(config.sources[0].maxResponseBytes).toBe(250_000);
+  });
+});
+
+describe("parseConfig", () => {
+  it("parses TOML held in a string, so a client with nowhere to write a file can still configure", () => {
+    const config = parseConfig(
+      `[[sources]]
+id = "staging"
+dsn = "postgres://user:pass@host:5432/db"
+readonly = true
+`,
+      "POSTGRES_MCP_CONFIG"
+    );
+    expect(config.sources).toHaveLength(1);
+    expect(config.sources[0].id).toBe("staging");
+    expect(config.sources[0].readonly).toBe(true);
+  });
+
+  it("expands env vars in a dsn the same way a file-based config does", () => {
+    process.env.TEST_PARSE_CONFIG_DSN = "postgres://user:pass@host:5432/db";
+    try {
+      const config = parseConfig(
+        `[[sources]]
+id = "staging"
+dsn = "\${TEST_PARSE_CONFIG_DSN}"
+`,
+        "POSTGRES_MCP_CONFIG"
+      );
+      expect(config.sources[0].dsn).toBe("postgres://user:pass@host:5432/db");
+    } finally {
+      delete process.env.TEST_PARSE_CONFIG_DSN;
+    }
+  });
+
+  it("parses the one-line inline-array form, which is what fits in an env var that cannot hold newlines", () => {
+    const config = parseConfig(
+      'sources = [{ id = "staging", dsn = "postgres://user:pass@host:5432/db", readonly = true }]',
+      "POSTGRES_MCP_CONFIG"
+    );
+    expect(config.sources).toHaveLength(1);
+    expect(config.sources[0].id).toBe("staging");
+    expect(config.sources[0].readonly).toBe(true);
+  });
+
+  it("names the origin in a parse error, so the message points at the env var not a path", () => {
+    expect(() => parseConfig("this is not toml =", "POSTGRES_MCP_CONFIG")).toThrow(
+      /POSTGRES_MCP_CONFIG/
+    );
+  });
+
+  it("names the origin when the config has no sources", () => {
+    expect(() => parseConfig('prisma_schema_path = "x"', "POSTGRES_MCP_CONFIG")).toThrow(
+      /POSTGRES_MCP_CONFIG/
+    );
   });
 });
