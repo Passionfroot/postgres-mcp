@@ -197,4 +197,3 @@ export function loadFromSource(source: ConfigSource): Config {
     ? loadConfig(source.path)
     : parseConfig(source.toml, CONFIG_TOML_ENV_VAR);
 }
-
