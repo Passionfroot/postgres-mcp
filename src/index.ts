@@ -5,7 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 
 import { parseArgs, printUsage } from "./args.js";
 import { createAuditLog } from "./audit-log.js";
-import { applyHttpPoolDefaults, loadConfig } from "./config.js";
+import { applyHttpPoolDefaults, configOrigin, loadFromSource } from "./config.js";
 import { ConnectionManager } from "./connections.js";
 import { startHttpServer } from "./http.js";
 import { logger } from "./logger.js";
@@ -45,8 +45,8 @@ async function main() {
     process.exit(1);
   }
 
-  logger.info(`Loading config from ${args.configPath}`);
-  let config = loadConfig(args.configPath);
+  logger.info(`Loading config from ${configOrigin(args.configSource)}`);
+  let config = loadFromSource(args.configSource);
   logger.info(
     `Loaded ${config.sources.length} source(s): ${config.sources.map((s) => s.id).join(", ")}`
   );

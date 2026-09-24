@@ -3,9 +3,17 @@ import fs from "node:fs";
 export const DEFAULT_PORT = 7803;
 export const DEFAULT_HOST = "127.0.0.1";
 
+/** A path, which is what a variable named after a config already means to anyone passing one. */
+export const CONFIG_PATH_ENV_VAR = "POSTGRES_MCP_CONFIG";
+/** One connection string, for a host that has nowhere to put a file. */
+export const DSN_ENV_VAR = "POSTGRES_MCP_DSN";
+
 export function printUsage() {
-  console.error("Usage: postgres-mcp <config-file> [options]");
-  console.error("  config-file        Path to TOML configuration file");
+  console.error("Usage: postgres-mcp [config-file] [options]");
+  console.error("  config-file        Path to TOML configuration file. Omit it and the config");
+  console.error(`                     comes from ${DSN_ENV_VAR}, one read-only connection`);
+  console.error(`                     string, or from ${CONFIG_PATH_ENV_VAR}, a path.`);
+  console.error("                     An argument wins over both.");
   console.error("");
   console.error("Options:");
   console.error("  --stdio            Serve over stdio, one process per client (default)");
@@ -22,8 +30,11 @@ export function printUsage() {
   console.error("a per-client one. Sources that do not set it get a larger default in HTTP mode.");
 }
 
+/** Where the config text comes from, resolved once so nothing downstream re-reads the environment. */
+export type ConfigSource = { kind: "file"; path: string } | { kind: "dsn"; dsn: string };
+
 export interface ParsedArgs {
-  configPath: string;
+  configSource: ConfigSource;
   useHttp: boolean;
   host: string;
   port: number;
@@ -54,12 +65,31 @@ export function parseArgs(argv: string[]): ParsedArgs | undefined {
     } else positional.push(arg);
   }
 
-  const configPath = positional[0];
-  if (!configPath) return undefined;
+  const configSource = resolveConfigSource(positional[0]);
+  if (!configSource) return undefined;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     console.error(`Invalid port: ${port}`);
     return undefined;
   }
 
-  return { configPath, useHttp, host, port, token };
+  return { configSource, useHttp, host, port, token };
+}
+
+/**
+ * An argument wins over both variables, being the most deliberate of the three, and a connection
+ * string wins over the path variable, which a shell profile may have exported for every process.
+ * An argument that is present but empty (a wrapper interpolating an unset shell variable) counts
+ * as absent, the way it did when a missing path was the only thing that printed usage.
+ */
+function resolveConfigSource(positionalPath: string | undefined): ConfigSource | undefined {
+  const path = positionalPath?.trim();
+  if (path) return { kind: "file", path };
+
+  const dsn = process.env[DSN_ENV_VAR]?.trim();
+  if (dsn) return { kind: "dsn", dsn };
+
+  const pathFromEnv = process.env[CONFIG_PATH_ENV_VAR]?.trim();
+  if (pathFromEnv) return { kind: "file", path: pathFromEnv };
+
+  return undefined;
 }

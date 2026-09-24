@@ -3,7 +3,16 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { HTTP_DEFAULT_POOL_MAX, applyHttpPoolDefaults, loadConfig } from "../src/config.js";
+import {
+  HTTP_DEFAULT_POOL_MAX,
+  applyHttpPoolDefaults,
+  DSN_SOURCE_ID,
+  configFromDsn,
+  configOrigin,
+  loadConfig,
+  loadFromSource,
+  parseConfig,
+} from "../src/config.js";
 
 const tmpDir = os.tmpdir();
 const createdFiles: string[] = [];
@@ -435,5 +444,174 @@ max_response_bytes = 250000
     const config = loadConfig(writeTempToml(toml));
 
     expect(config.sources[0].maxResponseBytes).toBe(250_000);
+  });
+});
+
+describe("parseConfig", () => {
+  it("parses TOML held in a string, so a client with nowhere to write a file can still configure", () => {
+    const config = parseConfig(
+      `[[sources]]
+id = "staging"
+dsn = "postgres://user:pass@host:5432/db"
+readonly = true
+`,
+      "POSTGRES_MCP_CONFIG"
+    );
+    expect(config.sources).toHaveLength(1);
+    expect(config.sources[0].id).toBe("staging");
+    expect(config.sources[0].readonly).toBe(true);
+  });
+
+  it("expands env vars in a dsn the same way a file-based config does", () => {
+    process.env.TEST_PARSE_CONFIG_DSN = "postgres://user:pass@host:5432/db";
+    try {
+      const config = parseConfig(
+        `[[sources]]
+id = "staging"
+dsn = "\${TEST_PARSE_CONFIG_DSN}"
+`,
+        "POSTGRES_MCP_CONFIG"
+      );
+      expect(config.sources[0].dsn).toBe("postgres://user:pass@host:5432/db");
+    } finally {
+      delete process.env.TEST_PARSE_CONFIG_DSN;
+    }
+  });
+
+  it("parses the one-line inline-array form, which is what fits in an env var that cannot hold newlines", () => {
+    const config = parseConfig(
+      'sources = [{ id = "staging", dsn = "postgres://user:pass@host:5432/db", readonly = true }]',
+      "POSTGRES_MCP_CONFIG"
+    );
+    expect(config.sources).toHaveLength(1);
+    expect(config.sources[0].id).toBe("staging");
+    expect(config.sources[0].readonly).toBe(true);
+  });
+
+  it("names the origin in a parse error, so the message points at the env var not a path", () => {
+    expect(() => parseConfig("this is not toml =", "POSTGRES_MCP_CONFIG")).toThrow(
+      /POSTGRES_MCP_CONFIG/
+    );
+  });
+
+  it("keeps the offending config out of a parse error, since an inline config can hold a password", () => {
+    const withPassword = 'sources = [{ id = "s", dsn = "postgres://u:hunter2@h/d" }';
+
+    expect(() => parseConfig(withPassword, "POSTGRES_MCP_CONFIG")).toThrow(
+      /POSTGRES_MCP_CONFIG/
+    );
+    try {
+      parseConfig(withPassword, "POSTGRES_MCP_CONFIG");
+    } catch (err) {
+      expect(String(err)).not.toContain("hunter2");
+    }
+  });
+
+  it("keeps the file's own content out of a parse error too", () => {
+    const filePath = writeTempToml('sources = [{ id = "s", dsn = "postgres://u:hunter2@h/d" }');
+
+    try {
+      loadConfig(filePath);
+    } catch (err) {
+      expect(String(err)).not.toContain("hunter2");
+      expect(String(err)).toContain(filePath);
+    }
+  });
+
+  it("names the origin when an env var referenced by the config is unset", () => {
+    delete process.env.PF_DEFINITELY_UNSET;
+
+    expect(() =>
+      parseConfig('sources = [{ id = "s", dsn = "${PF_DEFINITELY_UNSET}" }]', "POSTGRES_MCP_CONFIG")
+    ).toThrow(/POSTGRES_MCP_CONFIG/);
+  });
+
+  it("names the origin when the config has no sources", () => {
+    expect(() => parseConfig('prisma_schema_path = "x"', "POSTGRES_MCP_CONFIG")).toThrow(
+      /POSTGRES_MCP_CONFIG/
+    );
+  });
+});
+
+describe("tilde expansion outside a source", () => {
+  it("expands ~ in audit_log.log_file, so the log does not land in a literal ~ directory", () => {
+    const config = parseConfig(
+      `[[sources]]
+id = "s"
+dsn = "postgres://h/d"
+
+[audit_log]
+log_file = "~/logs/pg.log"
+`,
+      "POSTGRES_MCP_CONFIG"
+    );
+
+    expect(config.auditLog?.logFile).not.toContain("~");
+    expect(config.auditLog?.logFile).toContain("logs/pg.log");
+  });
+
+  it("expands ~ in prisma_schema_path", () => {
+    const config = parseConfig(
+      `prisma_schema_path = "~/app/schema.prisma"
+
+[[sources]]
+id = "s"
+dsn = "postgres://h/d"
+`,
+      "POSTGRES_MCP_CONFIG"
+    );
+
+    expect(config.prismaSchemaPath).not.toContain("~");
+    expect(config.prismaSchemaPath).toContain("app/schema.prisma");
+  });
+});
+
+describe("configFromDsn", () => {
+  it("builds a single read-only source, since a connection string in the environment is a read path", () => {
+    const config = configFromDsn("postgres://user:pass@host:5432/db");
+
+    expect(config.sources).toHaveLength(1);
+    expect(config.sources[0].id).toBe(DSN_SOURCE_ID);
+    expect(config.sources[0].readonly).toBe(true);
+    expect(config.sources[0].readOnlyQueries).toBe(true);
+    expect(config.prismaSchemaPath).toBeUndefined();
+  });
+
+  it("keeps the connection string literal, so a password holding $ survives", () => {
+    const dsn = "postgres://user:pa$$word@host:5432/db";
+
+    expect(configFromDsn(dsn).sources[0].dsn).toBe(dsn);
+  });
+
+  it("does not expand a ${VAR} in the connection string, which is already a value not a reference", () => {
+    process.env.PF_DSN_SHOULD_NOT_EXPAND = "postgres://expanded/db";
+    try {
+      const dsn = "postgres://user:${PF_DSN_SHOULD_NOT_EXPAND}@host:5432/db";
+
+      expect(configFromDsn(dsn).sources[0].dsn).toBe(dsn);
+    } finally {
+      delete process.env.PF_DSN_SHOULD_NOT_EXPAND;
+    }
+  });
+
+  it("refuses an empty connection string rather than starting with a broken source", () => {
+    expect(() => configFromDsn("")).toThrow(/POSTGRES_MCP_DSN/);
+  });
+});
+
+describe("loadFromSource", () => {
+  it("reads a file source off disk", () => {
+    const filePath = writeTempToml('sources = [{ id = "from-file", dsn = "postgres://h/d" }]');
+
+    expect(loadFromSource({ kind: "file", path: filePath }).sources[0].id).toBe("from-file");
+  });
+
+  it("builds a dsn source without touching the filesystem", () => {
+    expect(loadFromSource({ kind: "dsn", dsn: "postgres://h/d" }).sources[0].id).toBe(DSN_SOURCE_ID);
+  });
+
+  it("names the config a message should point at", () => {
+    expect(configOrigin({ kind: "file", path: "/etc/pg.toml" })).toBe("/etc/pg.toml");
+    expect(configOrigin({ kind: "dsn", dsn: "postgres://h/d" })).toBe("POSTGRES_MCP_DSN");
   });
 });

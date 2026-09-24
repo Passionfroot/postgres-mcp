@@ -4,7 +4,10 @@ import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
 
+import type { ConfigSource } from "./args.js";
 import type { AuditLogConfig, Config, SourceConfig } from "./types.js";
+
+import { DSN_ENV_VAR } from "./args.js";
 
 import { logger } from "./logger.js";
 
@@ -70,8 +73,16 @@ export function expandTilde(filePath: string): string {
   return filePath;
 }
 
-function toSourceConfig(raw: z.infer<typeof sourceConfigSchema>): SourceConfig {
-  const dsn = expandEnvVars(raw.dsn);
+/**
+ * `expand` is off for a source built from POSTGRES_MCP_DSN: that value came out of the environment
+ * already, so expanding it against the environment again is circular, and it would break a
+ * password holding a literal $.
+ */
+function toSourceConfig(
+  raw: z.infer<typeof sourceConfigSchema>,
+  { expand = true }: { expand?: boolean } = {}
+): SourceConfig {
+  const dsn = expand ? expandEnvVars(raw.dsn) : raw.dsn;
   const sshKey = raw.ssh_key ? expandTilde(raw.ssh_key) : undefined;
 
   const sessionVars = raw.session_vars
@@ -106,6 +117,46 @@ function toAuditLogConfig(raw: z.infer<typeof auditLogSchema>): AuditLogConfig {
   };
 }
 
+/**
+ * Parses config text that is already in hand. `origin` is whatever the caller wants named in an
+ * error message, a file path or an env var, since the reader has no other way to tell where a
+ * broken config came from.
+ */
+export function parseConfig(content: string, origin: string): Config {
+  let parsed: unknown;
+  try {
+    parsed = parseToml(content);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // smol-toml quotes the offending line back, which puts a dsn's password in the log of
+    // whatever started the server. Keep the reason and the position, drop the quoted source.
+    throw new Error(`Failed to parse TOML in "${origin}": ${message.split("\n")[0]}`);
+  }
+
+  const result = configSchema.safeParse(parsed);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map((i) => `  - ${i.path.join(".")}: ${i.message}`)
+      .join("\n");
+    throw new Error(`Invalid config in "${origin}":\n${issues}`);
+  }
+
+  try {
+    const sources = result.data.sources.map((source) => toSourceConfig(source));
+    const prismaSchemaPath = result.data.prisma_schema_path
+      ? expandTilde(result.data.prisma_schema_path)
+      : undefined;
+    const auditLog = result.data.audit_log ? toAuditLogConfig(result.data.audit_log) : undefined;
+
+    return { sources, prismaSchemaPath, auditLog };
+  } catch (err) {
+    // An unset ${VAR} in a dsn is the likeliest failure here, and its own message says nothing
+    // about which config referenced it.
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Invalid config in "${origin}": ${message}`);
+  }
+}
+
 export function loadConfig(filePath: string): Config {
   let content: string;
   try {
@@ -115,29 +166,7 @@ export function loadConfig(filePath: string): Config {
     throw new Error(`Failed to read config file "${filePath}": ${message}`);
   }
 
-  let parsed: unknown;
-  try {
-    parsed = parseToml(content);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to parse TOML in "${filePath}": ${message}`);
-  }
-
-  const result = configSchema.safeParse(parsed);
-  if (!result.success) {
-    const issues = result.error.issues
-      .map((i) => `  - ${i.path.join(".")}: ${i.message}`)
-      .join("\n");
-    throw new Error(`Invalid config in "${filePath}":\n${issues}`);
-  }
-
-  const sources = result.data.sources.map(toSourceConfig);
-  const prismaSchemaPath = result.data.prisma_schema_path
-    ? expandTilde(result.data.prisma_schema_path)
-    : undefined;
-  const auditLog = result.data.audit_log ? toAuditLogConfig(result.data.audit_log) : undefined;
-
-  return { sources, prismaSchemaPath, auditLog };
+  return parseConfig(content, filePath);
 }
 
 /**
@@ -164,4 +193,36 @@ export function applyHttpPoolDefaults(config: Config): Config {
   });
 
   return { ...config, sources };
+}
+
+/** The id of the one source a connection string builds. A named source needs a config file. */
+export const DSN_SOURCE_ID = "db";
+
+/**
+ * A whole config from one connection string, for a host that can set an environment variable but
+ * has nowhere to write a file. Read-only on both levels: a single source configured this way is a
+ * read path, and anything that needs to write says so in a file.
+ */
+export function configFromDsn(dsn: string): Config {
+  if (!dsn.trim()) {
+    throw new Error(`${DSN_ENV_VAR} is empty. It must hold one postgres:// connection string.`);
+  }
+
+  const raw = sourceConfigSchema.parse({
+    id: DSN_SOURCE_ID,
+    dsn,
+    readonly: true,
+    read_only_queries: true,
+  });
+
+  return { sources: [toSourceConfig(raw, { expand: false })] };
+}
+
+/** What a message about this config should call it: the file it came from, or the variable. */
+export function configOrigin(source: ConfigSource): string {
+  return source.kind === "file" ? source.path : DSN_ENV_VAR;
+}
+
+export function loadFromSource(source: ConfigSource): Config {
+  return source.kind === "file" ? loadConfig(source.path) : configFromDsn(source.dsn);
 }

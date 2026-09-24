@@ -4,13 +4,21 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_HOST, DEFAULT_PORT, parseArgs } from "../src/args.js";
+import {
+  CONFIG_PATH_ENV_VAR,
+  DSN_ENV_VAR,
+  DEFAULT_HOST,
+  DEFAULT_PORT,
+  parseArgs,
+} from "../src/args.js";
 
 beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   delete process.env.POSTGRES_MCP_HOST;
   delete process.env.POSTGRES_MCP_PORT;
   delete process.env.POSTGRES_MCP_TOKEN;
+  delete process.env.POSTGRES_MCP_CONFIG;
+  delete process.env.POSTGRES_MCP_DSN;
 });
 
 afterEach(() => {
@@ -20,7 +28,7 @@ afterEach(() => {
 describe("parseArgs", () => {
   it("defaults to stdio on the default host and port", () => {
     expect(parseArgs(["cfg.toml"])).toEqual({
-      configPath: "cfg.toml",
+      configSource: { kind: "file", path: "cfg.toml" },
       useHttp: false,
       host: DEFAULT_HOST,
       port: DEFAULT_PORT,
@@ -30,7 +38,7 @@ describe("parseArgs", () => {
 
   it("reads the http flags", () => {
     expect(parseArgs(["cfg.toml", "--http", "--port", "9999", "--host", "::1", "--token", "s"])).toEqual({
-      configPath: "cfg.toml",
+      configSource: { kind: "file", path: "cfg.toml" },
       useHttp: true,
       host: "::1",
       port: 9999,
@@ -44,7 +52,7 @@ describe("parseArgs", () => {
     const args = parseArgs(["cfg.toml", "--verbose"]);
 
     expect(args).toBeDefined();
-    expect(args?.configPath).toBe("cfg.toml");
+    expect(args?.configSource).toEqual({ kind: "file", path: "cfg.toml" });
   });
 
   it("still refuses a missing config path, --help and a bad port", () => {
@@ -63,5 +71,54 @@ describe("parseArgs", () => {
     } finally {
       fs.unlinkSync(file);
     }
+  });
+});
+
+const DSN = "postgres://h/d";
+
+describe("parseArgs config source", () => {
+  it("takes a positional path as a file source", () => {
+    expect(parseArgs(["cfg.toml"])?.configSource).toEqual({ kind: "file", path: "cfg.toml" });
+  });
+
+  it(`takes a single connection string out of ${DSN_ENV_VAR}`, () => {
+    process.env[DSN_ENV_VAR] = DSN;
+    expect(parseArgs([])?.configSource).toEqual({ kind: "dsn", dsn: DSN });
+  });
+
+  it(`reads a path out of ${CONFIG_PATH_ENV_VAR}, which named a path before it named anything here`, () => {
+    process.env[CONFIG_PATH_ENV_VAR] = "/etc/postgres-mcp.toml";
+    expect(parseArgs([])?.configSource).toEqual({ kind: "file", path: "/etc/postgres-mcp.toml" });
+  });
+
+  it("takes the positional path over either variable", () => {
+    process.env[DSN_ENV_VAR] = DSN;
+    process.env[CONFIG_PATH_ENV_VAR] = "/etc/postgres-mcp.toml";
+    expect(parseArgs(["cfg.toml"])?.configSource).toEqual({ kind: "file", path: "cfg.toml" });
+  });
+
+  it("takes the connection string over the path variable, which a shell profile may have set for everything", () => {
+    process.env[DSN_ENV_VAR] = DSN;
+    process.env[CONFIG_PATH_ENV_VAR] = "/etc/postgres-mcp.toml";
+    expect(parseArgs([])?.configSource).toEqual({ kind: "dsn", dsn: DSN });
+  });
+
+  it("ignores a whitespace-only variable rather than starting with no sources", () => {
+    process.env[DSN_ENV_VAR] = "   ";
+    process.env[CONFIG_PATH_ENV_VAR] = "  ";
+    expect(parseArgs([])).toBeUndefined();
+  });
+
+  it("ignores a whitespace-only argument, which is a wrapper interpolating an unset variable", () => {
+    expect(parseArgs(["   "])).toBeUndefined();
+  });
+
+  it("reads the http flags with no positional argument", () => {
+    process.env[DSN_ENV_VAR] = DSN;
+    expect(parseArgs(["--http", "--port", "9999"])).toMatchObject({
+      configSource: { kind: "dsn", dsn: DSN },
+      useHttp: true,
+      port: 9999,
+    });
   });
 });
