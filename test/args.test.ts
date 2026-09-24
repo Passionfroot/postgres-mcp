@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   CONFIG_PATH_ENV_VAR,
-  CONFIG_TOML_ENV_VAR,
+  DSN_ENV_VAR,
   DEFAULT_HOST,
   DEFAULT_PORT,
   parseArgs,
@@ -18,7 +18,7 @@ beforeEach(() => {
   delete process.env.POSTGRES_MCP_PORT;
   delete process.env.POSTGRES_MCP_TOKEN;
   delete process.env.POSTGRES_MCP_CONFIG;
-  delete process.env.POSTGRES_MCP_CONFIG_TOML;
+  delete process.env.POSTGRES_MCP_DSN;
 });
 
 afterEach(() => {
@@ -74,16 +74,16 @@ describe("parseArgs", () => {
   });
 });
 
-const TOML = 'sources = [{ id = "s", dsn = "postgres://h/d" }]';
+const DSN = "postgres://h/d";
 
 describe("parseArgs config source", () => {
   it("takes a positional path as a file source", () => {
     expect(parseArgs(["cfg.toml"])?.configSource).toEqual({ kind: "file", path: "cfg.toml" });
   });
 
-  it(`reads the TOML itself out of ${CONFIG_TOML_ENV_VAR}`, () => {
-    process.env[CONFIG_TOML_ENV_VAR] = TOML;
-    expect(parseArgs([])?.configSource).toEqual({ kind: "inline", toml: TOML });
+  it(`takes a single connection string out of ${DSN_ENV_VAR}`, () => {
+    process.env[DSN_ENV_VAR] = DSN;
+    expect(parseArgs([])?.configSource).toEqual({ kind: "dsn", dsn: DSN });
   });
 
   it(`reads a path out of ${CONFIG_PATH_ENV_VAR}, which named a path before it named anything here`, () => {
@@ -92,19 +92,19 @@ describe("parseArgs config source", () => {
   });
 
   it("takes the positional path over either variable", () => {
-    process.env[CONFIG_TOML_ENV_VAR] = TOML;
+    process.env[DSN_ENV_VAR] = DSN;
     process.env[CONFIG_PATH_ENV_VAR] = "/etc/postgres-mcp.toml";
     expect(parseArgs(["cfg.toml"])?.configSource).toEqual({ kind: "file", path: "cfg.toml" });
   });
 
-  it("takes the inline TOML over the path variable, since it cannot have been meant as a path", () => {
-    process.env[CONFIG_TOML_ENV_VAR] = TOML;
+  it("takes the connection string over the path variable, which a shell profile may have set for everything", () => {
+    process.env[DSN_ENV_VAR] = DSN;
     process.env[CONFIG_PATH_ENV_VAR] = "/etc/postgres-mcp.toml";
-    expect(parseArgs([])?.configSource).toEqual({ kind: "inline", toml: TOML });
+    expect(parseArgs([])?.configSource).toEqual({ kind: "dsn", dsn: DSN });
   });
 
   it("ignores a whitespace-only variable rather than starting with no sources", () => {
-    process.env[CONFIG_TOML_ENV_VAR] = "   ";
+    process.env[DSN_ENV_VAR] = "   ";
     process.env[CONFIG_PATH_ENV_VAR] = "  ";
     expect(parseArgs([])).toBeUndefined();
   });
@@ -114,9 +114,9 @@ describe("parseArgs config source", () => {
   });
 
   it("reads the http flags with no positional argument", () => {
-    process.env[CONFIG_TOML_ENV_VAR] = TOML;
+    process.env[DSN_ENV_VAR] = DSN;
     expect(parseArgs(["--http", "--port", "9999"])).toMatchObject({
-      configSource: { kind: "inline", toml: TOML },
+      configSource: { kind: "dsn", dsn: DSN },
       useHttp: true,
       port: 9999,
     });

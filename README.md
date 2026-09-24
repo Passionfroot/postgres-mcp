@@ -36,7 +36,7 @@ stdio is the default: one process per client, which is what the per-tenant setup
 | `--token <secret>` | none | Require `Authorization: Bearer <secret>`. `POSTGRES_MCP_TOKEN` |
 | `--token-file <path>` | none | Read the token from a file |
 
-The config comes from the positional `config-file` argument, or from `POSTGRES_MCP_CONFIG_TOML` (the TOML itself) or `POSTGRES_MCP_CONFIG` (a path) when that argument is omitted. See [No file to point at](#no-file-to-point-at).
+The config comes from the positional `config-file` argument, or when that is omitted from `POSTGRES_MCP_DSN` (one read-only connection string) or `POSTGRES_MCP_CONFIG` (a path). See [No file to point at](#no-file-to-point-at).
 
 An unknown flag is warned about and ignored rather than refused, so a pinned consumer passing a flag an older build ignored still starts.
 
@@ -134,28 +134,26 @@ See [`postgres-mcp.toml.example`](postgres-mcp.toml.example) for the full refere
 
 #### No file to point at
 
-`POSTGRES_MCP_CONFIG_TOML` holds the TOML document itself, not a path to one. Set it and omit the
-path argument, for a host that lets you set a start command and environment variables but gives you
-nowhere to write a file:
+A host that lets you set a start command and environment variables, but gives you nowhere to write
+a file, configures one database through `POSTGRES_MCP_DSN`:
 
 ```bash
-POSTGRES_MCP_CONFIG_TOML='sources = [{ id = "staging", dsn = "${STAGING_DSN}", readonly = true, read_only_queries = true }]' \
+POSTGRES_MCP_DSN='postgres://reader:...@host:5432/db?sslmode=require' \
   npx -y @passionfroot/postgres-mcp
 ```
 
-TOML's inline-array form keeps that on one line, which several such hosts need because they strip
-newlines out of a value.
+That builds a single source with the id `db`, `readonly` and `read_only_queries` both on. A source
+configured this way is a read path, and the value is used literally: `$VAR` is not expanded, since
+it came out of the environment already and a password may contain a `$`.
 
-`POSTGRES_MCP_CONFIG` holds a path, for the same case where the file exists but the command line is
-fixed. A path argument wins over both variables, and `POSTGRES_MCP_CONFIG_TOML` wins over
-`POSTGRES_MCP_CONFIG`.
+Anything beyond one read-only database — a second source, `max_rows`, an SSH tunnel, a named id —
+is what the config file is for. `POSTGRES_MCP_CONFIG` holds a path to one, for the same case where
+the file exists but the command line is fixed.
 
-Starting with no path argument at all used to print usage and exit 1. It now starts if either
-variable is set, so a wrapper that loses its path argument comes up on whatever the environment
-holds rather than failing loudly. The startup log's first line names the config it loaded.
-
-`$VAR` and `${VAR}` in a `dsn` are still expanded from the environment at startup, so the password
-stays in its own variable and the config itself holds only the reference.
+A path argument wins over both variables, and `POSTGRES_MCP_DSN` wins over `POSTGRES_MCP_CONFIG`,
+which a shell profile may have exported for every process. Starting with no path argument used to
+print usage and exit 1; it now starts if either variable is set, and the first line of the startup
+log names the config it loaded.
 
 ### 2. Add to `.mcp.json`
 
